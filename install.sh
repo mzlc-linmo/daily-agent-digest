@@ -32,25 +32,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 shell_quote() { printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/&'/"; }
 if [ ! -f "$ENV_FILE" ]; then
-  BASE_URL=${LLM_BASE_URL:-}; MODEL=${LLM_MODEL:-}; API_KEY=${LLM_API_KEY:-}
-  if { [ -z "$BASE_URL" ] || [ -z "$MODEL" ] || [ -z "$API_KEY" ]; } && { exec 3<>/dev/tty; } 2>/dev/null; then
+  BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com/v1}; MODEL=${LLM_MODEL:-deepseek-flash}; API_KEY=${LLM_API_KEY:-}
+  if [ -z "$API_KEY" ] && { exec 3<>/dev/tty; } 2>/dev/null; then
     tty_open=1
-    if [ -z "$BASE_URL" ]; then
-      printf 'OpenAI-compatible API base URL [https://api.deepseek.com/v1]: ' >&3
-      IFS= read -r input <&3 || input=; BASE_URL=${input:-https://api.deepseek.com/v1}
-    fi
-    if [ -z "$MODEL" ]; then
-      printf 'LLM model [deepseek-flash]: ' >&3
-      IFS= read -r input <&3 || input=; MODEL=${input:-deepseek-flash}
-    fi
-    if [ -z "$API_KEY" ]; then
-      printf 'LLM_API_KEY (input is hidden): ' >&3
-      oldstty=$(stty -g <&3 2>/dev/null || true); stty -echo <&3 2>/dev/null || true
-      IFS= read -r API_KEY <&3 || API_KEY=
-      printf '\n' >&3
-      [ -z "$oldstty" ] || stty "$oldstty" <&3 2>/dev/null || true
-      oldstty=
-    fi
+    printf 'LLM_API_KEY (input is hidden): ' >&3
+    oldstty=$(stty -g <&3 2>/dev/null || true); stty -echo <&3 2>/dev/null || true
+    IFS= read -r API_KEY <&3 || API_KEY=
+    printf '\n' >&3
+    [ -z "$oldstty" ] || stty "$oldstty" <&3 2>/dev/null || true
+    oldstty=
   fi
   BASE_URL=${BASE_URL:-https://api.deepseek.com/v1}; MODEL=${MODEL:-deepseek-flash}
   [ -n "$API_KEY" ] || { echo "LLM_API_KEY is required" >&2; exit 1; }
