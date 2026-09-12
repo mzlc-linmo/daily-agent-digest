@@ -134,14 +134,14 @@ def summarize(events, day):
                 for item in parsed.get('work_items',[])[:20]:
                     item['id']=hashlib.sha256((item.get('title','')+day).encode()).hexdigest()[:16]; item.setdefault('excluded',False); payload['work_items'].append(item)
                 payload['decisions']=parsed.get('decisions',[]); payload['blockers']=parsed.get('blockers',[]); payload['next_steps']=parsed.get('next_steps',[]); payload['coverage']['limitations'].append(f'LLM compacted {len(events)} events to {len(compact)} unique excerpts')
-        except Exception as exc: debug(f'LLM error: {type(exc).__name__}: {exc}'); payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
+        except Exception as exc: debug(f'LLM error: {type(exc).__name__}: {exc}'); payload['llm_error']=f'{type(exc).__name__}: {exc}'; payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
     return payload
 
 def generate(day=None, source_root=None):
     day=day or dt.datetime.now(TZ).date().isoformat(); root=Path(source_root or os.getenv('DIGEST_SOURCE_ROOT', str(Path.home()))); start,end=day_window(day); events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end)
     payload=summarize(events,day); previous=app_state(day); excluded={x['id'] for x in previous.get('work_items',[]) if x.get('excluded')}
     for item in payload['work_items']: item['excluded']=item['id'] in excluded
-    state={'schema_version':'1.1','release_version':RELEASE_VERSION,'date':day,'work_items':payload['work_items'],'generated_at':dt.datetime.now(TZ).isoformat(),'report_status':'ready','last_error':None,'reports':sorted(set(previous.get('reports',[])+[day]))}
+    failed=payload.get('llm_error'); state={'schema_version':'1.1','release_version':RELEASE_VERSION,'date':day,'work_items':payload['work_items'],'generated_at':dt.datetime.now(TZ).isoformat(),'report_status':'error' if failed else 'ready','last_error':failed,'reports':sorted(set(previous.get('reports',[])+[day]))}
     state['summary']=payload.get('summary',''); write_state(state)
     return state
 
