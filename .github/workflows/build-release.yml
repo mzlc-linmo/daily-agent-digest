@@ -3,38 +3,63 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.12'}
-      - run: python -m pip install --upgrade pyinstaller
-      - run: pyinstaller --onefile --name daily-agent-digest-macos-${{ matrix.arch }} daily_agent_digest.py
+      - run: python -m pip install pyinstaller==6.16.0
+      - name: Build and optionally sign
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+          SIGN_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/ci-build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: daily-agent-digest-macos-${{ matrix.arch }}
           path: dist/daily-agent-digest-macos-${{ matrix.arch }}
+          if-no-files-found: error
   release:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
-    permissions: {contents: write}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: {path: dist, merge-multiple: true}
-      - uses: softprops/action-gh-release@v2
-        with:
-          repository: mzlc-linmo/daily-agent-digest-distribution
-          token: ${{ secrets.DISTRIBUTION_REPO_TOKEN }}
-          tag_name: ${{ github.ref_name }}
-          files: dist/*
-          generate_release_notes: true
+      - name: Prepare distribution assets
+        run: |
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum daily-agent-digest-macos-* > SHA256SUMS
+      - name: Publish signed release or unsigned draft
+        env:
+          GH_TOKEN: ${{ secrets.DISTRIBUTION_REPO_TOKEN }}
+          GH_REPO: mzlc-linmo/daily-agent-digest-distribution
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_SIGNED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          BUILD_NUMBER: ${{ github.run_id }}
+        run: |
+          set -eu
+          if [ "$RELEASE_SIGNED" = true ]; then
+            gh release create "$RELEASE_REF" dist/* --title "$RELEASE_REF" --notes 'Developer ID signed and notarized macOS binaries. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
+          else
+            gh release create "ci-$BUILD_NUMBER" dist/* --draft --prerelease --title "CI verification $BUILD_NUMBER" --notes 'Unsigned build for private verification only. Not a public installable release. Run a version tag after configuring Apple signing secrets to publish.'
+          fi

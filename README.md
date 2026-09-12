@@ -13,7 +13,7 @@ From this directory:
 Or install directly on macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mzlc-linmo/daily-agent-digest/main/install.sh | sh
+curl -fsSL https://github.com/mzlc-linmo/daily-agent-digest-distribution/releases/latest/download/install.sh | sh
 ```
 
 The installer asks for the API base URL, model, and `LLM_API_KEY`. The key is entered without echo and saved at `~/.local/share/daily-agent-digest/.env` with mode `600`. Re-running the installer preserves the existing file.
@@ -23,6 +23,19 @@ This installs a self-contained binary runner under `~/.local/share/daily-agent-d
 Production installs download a signed/released binary from `DIGEST_RELEASE_BASE`. The default points to the public distribution repository `mzlc-linmo/daily-agent-digest-distribution`; configure it to your public release host before publishing.
 
 For CI publishing, add a fine-grained secret named `DISTRIBUTION_REPO_TOKEN` to the private source repository. It needs Contents: Read and write permission on `mzlc-linmo/daily-agent-digest-distribution`. Push a tag such as `v0.1.0` to build and publish both macOS binaries there.
+
+Manual workflow dispatch builds both architectures and uploads an unsigned draft Release to verify cross-repository permissions. Drafts are not public downloads. Version tags require Developer ID signing and Apple notarization before any public release can be created. The initial public installation URL will only work after the first signed release.
+
+Required source-repository secrets for version tags:
+
+- `APPLE_CERTIFICATE_BASE64`: Base64-encoded Developer ID Application certificate and private key exported as `.p12`.
+- `APPLE_CERTIFICATE_PASSWORD`: Password protecting that `.p12` export.
+- `APPLE_SIGNING_IDENTITY`: Full Developer ID Application identity name.
+- `APPLE_ID`: Apple Developer account email.
+- `APPLE_APP_PASSWORD`: App-specific password for notarization.
+- `APPLE_TEAM_ID`: Apple Developer team identifier.
+
+CI uses macOS 15 arm64 and Intel runners, checks binary architecture, runs an empty-input CLI test, and generates `SHA256SUMS`. Keep certificates and private keys exclusively in Actions Secrets. PyInstaller packages Python bytecode; it does not provide irreversible source protection.
 
 Configure an OpenAI-compatible endpoint in `~/.local/share/daily-agent-digest/.env` (the launchd job does not read your interactive shell profile):
 

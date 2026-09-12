@@ -87,6 +87,6 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); args=ap.parse_args()
     start,end=day_window(args.date); root=Path(args.root); events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end); payload=summarize(events,args.date); payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
     out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(Path.home()/'.local/share/daily-agent-digest')))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
-    out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8'); print(f'events={len(events)} raw={len(raw_events)} output={out}')
+    out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8'); print(f'events={len(events)} raw={len(events)} output={out}')
 
 if __name__=='__main__': main()
