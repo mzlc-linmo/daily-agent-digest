@@ -4,6 +4,7 @@ from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 APP_DIR = Path(os.getenv('DIGEST_HOME', Path.home()/'.local/share/daily-agent-digest'))
+RELEASE_VERSION = os.getenv('DIGEST_RELEASE_VERSION', 'dev')
 
 def load_env():
     path = APP_DIR/'.env'
@@ -29,7 +30,7 @@ def debug(message):
         APP_DIR.mkdir(parents=True, exist_ok=True); with_open = open(APP_DIR/'debug.log', 'a', encoding='utf-8'); with_open.write(f'{dt.datetime.now(TZ).isoformat()} {message}\n'); with_open.close()
 def app_state(day=None):
     load_env(); day=day or dt.datetime.now(TZ).date().isoformat(); state=read_state(day)
-    if not state: state={'date':day,'work_items':[],'generated_at':None,'report_status':'not_generated','last_error':None,'reports':[]}
+    if not state: state={'schema_version':'1.1','release_version':RELEASE_VERSION,'date':day,'work_items':[],'generated_at':None,'report_status':'not_generated','last_error':None,'reports':[],'summary':''}
     return state
 
 def settings():
@@ -136,11 +137,11 @@ def summarize(events, day):
         except Exception as exc: debug(f'LLM error: {type(exc).__name__}: {exc}'); payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
     return payload
 
-def generate(day=None):
-    day=day or dt.datetime.now(TZ).date().isoformat(); start,end=day_window(day); events=codex(Path.home(),start,end)+pi(Path.home(),start,end)+dsh(Path.home(),start,end)
+def generate(day=None, source_root=None):
+    day=day or dt.datetime.now(TZ).date().isoformat(); root=Path(source_root or os.getenv('DIGEST_SOURCE_ROOT', str(Path.home()))); start,end=day_window(day); events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end)
     payload=summarize(events,day); previous=app_state(day); excluded={x['id'] for x in previous.get('work_items',[]) if x.get('excluded')}
     for item in payload['work_items']: item['excluded']=item['id'] in excluded
-    state={'date':day,'work_items':payload['work_items'],'generated_at':dt.datetime.now(TZ).isoformat(),'report_status':'ready','last_error':None,'reports':sorted(set(previous.get('reports',[])+[day]))}
+    state={'schema_version':'1.1','release_version':RELEASE_VERSION,'date':day,'work_items':payload['work_items'],'generated_at':dt.datetime.now(TZ).isoformat(),'report_status':'ready','last_error':None,'reports':sorted(set(previous.get('reports',[])+[day]))}
     state['summary']=payload.get('summary',''); write_state(state)
     return state
 
@@ -149,14 +150,14 @@ def app_command(command, data):
     if command == 'settings': return settings()
     if command == 'save-settings': return save_settings(data)
     if command == 'clear':
-        state=app_state(day); state.update({'work_items': [], 'summary': '', 'generated_at': None, 'report_status': 'generating', 'last_error': None}); write_state(state); return state
+        state=app_state(day); state.update({'schema_version':'1.1','release_version':RELEASE_VERSION,'work_items': [], 'summary': '', 'generated_at': None, 'report_status': 'generating', 'last_error': None}); write_state(state); return state
     if command in ('generate','state','tick'):
         state=app_state(day)
         now=dt.datetime.now(TZ)
         # Manual generate always refreshes. Tick generates once after 17:30 and finalizes once after 18:00.
         after_preview = now.hour > 17 or (now.hour == 17 and now.minute >= 30)
         if command == 'generate' or (command == 'tick' and now.date().isoformat()==day and after_preview and not state.get('generated_at')):
-            state=generate(day)
+            state=generate(day, data.get('source_root'))
         if command == 'tick' and now.date().isoformat()==day and now.hour >= 18 and state.get('report_status')=='ready': state=submit(day)
         return state
     state=app_state(day); ids={x.get('id') for x in state.get('work_items',[])}
