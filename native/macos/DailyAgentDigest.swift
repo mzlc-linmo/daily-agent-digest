@@ -28,7 +28,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) { statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image=NSImage(systemSymbolName:"checklist", accessibilityDescription:"Daily Agent Digest"); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); timer=Timer.scheduledTimer(withTimeInterval:60,repeats:true){ _ in self.backend.call("tick") { _ in } } }
     @objc func show(){ report.refresh(); report.showWindow(nil); NSApp.activate(ignoringOtherApps:true) }
     @objc func generate(){ backend.call("generate"){ [weak self] _ in self?.show() } }
-    @objc func settings(){ let a=NSAlert(); a.messageText="日报设置"; let u=NSTextField(string: "https://api.deepseek.com/v1"); let model=NSTextField(string: "deepseek-flash"); u.placeholderString="Base URL"; model.placeholderString="Model name"; let box=NSStackView(views:[u,model]); box.orientation = .vertical; box.spacing=8; a.accessoryView=box; a.addButton(withTitle:"保存"); a.addButton(withTitle:"取消"); if a.runModal() == .alertFirstButtonReturn { backend.call("save-settings",["base_url":u.stringValue,"model":model.stringValue]){ _ in } } }
+    @objc func settings(){
+        backend.call("settings") { [weak self] current in
+            guard let self = self else { return }
+            let alert = NSAlert(); alert.messageText = "日报设置"; alert.informativeText = "修改后立即用于下一次总结。API Key 只在安装时输入。"
+            let form = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 118))
+            let urlLabel = NSTextField(labelWithString: "Base URL"); urlLabel.frame = NSRect(x: 0, y: 82, width: 100, height: 24)
+            let url = NSTextField(string: current["base_url"] as? String ?? "https://api.deepseek.com/v1"); url.frame = NSRect(x: 108, y: 78, width: 312, height: 28)
+            let modelLabel = NSTextField(labelWithString: "Model"); modelLabel.frame = NSRect(x: 0, y: 42, width: 100, height: 24)
+            let model = NSTextField(string: current["model"] as? String ?? "deepseek-flash"); model.frame = NSRect(x: 108, y: 38, width: 312, height: 28)
+            let key = NSTextField(labelWithString: (current["api_key_set"] as? Bool == true) ? "API Key: 已配置" : "API Key: 未配置"); key.textColor = .secondaryLabelColor; key.frame = NSRect(x: 108, y: 4, width: 312, height: 22)
+            form.addSubview(urlLabel); form.addSubview(url); form.addSubview(modelLabel); form.addSubview(model); form.addSubview(key)
+            alert.accessoryView = form; alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "保存")
+            if alert.runModal() == .alertSecondButtonReturn { self.backend.call("save-settings", ["base_url": url.stringValue, "model": model.stringValue]) { result in if let error = result["error"] as? String { let e = NSAlert(); e.messageText = "保存失败"; e.informativeText = error; e.runModal() } } }
+        }
+    }
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }
 }
 
