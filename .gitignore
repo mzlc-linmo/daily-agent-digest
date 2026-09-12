@@ -1,0 +1,13 @@
+.env
+.env.*
+*.json
+*.jsonl
+*.sqlite*
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
