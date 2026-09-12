@@ -80,7 +80,7 @@ jobs:
         run: |
           set -eu
           if [ "$RELEASE_SIGNED" = true ]; then
-            gh release create "$RELEASE_REF" dist/* --title "$RELEASE_REF" --notes 'Developer ID signed and notarized macOS binaries. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
+            gh release create "$RELEASE_REF" dist/* --target main --title "$RELEASE_REF" --notes 'Developer ID signed and notarized macOS binaries. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
           else
             gh release create "ci-$BUILD_NUMBER" dist/* --draft --prerelease --title "CI verification $BUILD_NUMBER" --notes 'Unsigned build for private verification only. Not a public installable release. Run a version tag after configuring Apple signing secrets to publish.'
           fi
