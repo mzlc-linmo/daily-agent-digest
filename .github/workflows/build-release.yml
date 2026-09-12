@@ -39,7 +39,7 @@ jobs:
           name: daily-agent-digest-macos-${{ matrix.arch }}
           path: |
             dist/daily-agent-digest-macos-${{ matrix.arch }}
-            dist/Daily Agent Digest ${{ matrix.arch }}.app
+            dist/Daily-Agent-Digest-${{ matrix.arch }}-app.zip
           if-no-files-found: error
       - name: Submit and wait for Apple notarization
         if: startsWith(github.ref, 'refs/tags/v')

@@ -37,6 +37,7 @@ if [ -f native/macos/build.sh ]; then
   native_app="dist/Daily Agent Digest $BUILD_ARCH.app"
   bash native/macos/build.sh "$native_app"
   cp "$binary" "$native_app/Contents/MacOS/daily-agent-digest"
+  ditto -c -k --keepParent "$native_app" "dist/Daily-Agent-Digest-$BUILD_ARCH-app.zip"
 fi
 echo 'Running executable smoke tests'
 "$binary" --help
