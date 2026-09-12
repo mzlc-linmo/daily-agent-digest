@@ -144,6 +144,8 @@ def app_command(command, data):
     load_env(); day=data.get('date') or dt.datetime.now(TZ).date().isoformat()
     if command == 'settings': return settings()
     if command == 'save-settings': return save_settings(data)
+    if command == 'clear':
+        state=app_state(day); state.update({'work_items': [], 'summary': '', 'generated_at': None, 'report_status': 'generating', 'last_error': None}); write_state(state); return state
     if command in ('generate','state','tick'):
         state=app_state(day)
         now=dt.datetime.now(TZ)

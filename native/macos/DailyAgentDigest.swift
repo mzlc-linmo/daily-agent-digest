@@ -27,7 +27,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let backend=Backend(); var statusItem:NSStatusItem!; var report:ReportController!; var timer:Timer!
     func applicationDidFinishLaunching(_ n: Notification) { statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image=NSImage(systemSymbolName:"checklist", accessibilityDescription:"Daily Agent Digest"); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); timer=Timer.scheduledTimer(withTimeInterval:60,repeats:true){ _ in self.backend.call("tick") { _ in } } }
     @objc func show(){ report.refresh(); report.showWindow(nil); NSApp.activate(ignoringOtherApps:true) }
-    @objc func generate(){ backend.call("generate"){ [weak self] _ in self?.show() } }
+    @objc func generate(){
+        let alert = NSAlert(); alert.messageText = "正在生成今日总结"; alert.informativeText = "正在汇总当天所有 agent 工作记录，请稍候。"; let progress = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 360, height: 20)); progress.style = .bar; progress.isIndeterminate = true; progress.startAnimation(nil); alert.accessoryView = progress; alert.addButton(withTitle: "后台运行"); alert.addButton(withTitle: "取消");
+        DispatchQueue.main.async { self.backend.call("clear") { _ in self.backend.call("generate") { result in
+            progress.stopAnimation(nil); progress.isIndeterminate = false; progress.doubleValue = 1
+            let failed = result["error"] as? String
+            alert.messageText = failed == nil ? "今日总结生成成功" : "生成失败"; alert.informativeText = failed ?? "旧的今日总结已替换，可以查看最新内容。"
+            alert.buttons.forEach { $0.isHidden = true }
+            if failed == nil { let view = alert.addButton(withTitle: "查看今日总结"); view.isHidden = false; view.target = self; view.action = #selector(self.showFromGeneration(_:)) }
+            let close = alert.addButton(withTitle: failed == nil ? "关闭" : "确定"); close.isHidden = false
+        } } }
+        alert.runModal()
+    }
+    @objc func showFromGeneration(_ sender: NSButton) { NSApp.abortModal(); show() }
     @objc func settings(){
         backend.call("settings") { [weak self] current in
             guard let self = self else { return }
