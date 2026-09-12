@@ -85,6 +85,17 @@ jobs:
         run: |
           cp install.sh dist/install.sh
           for app in dist/Daily\ Agent\ Digest\ *.app; do [ -d "$app" ] && (cd dist && zip -qr "$(basename "$app" .app | tr ' ' '-')-app.zip" "$(basename "$app")"); done
+          for archive in dist/Daily-Agent-Digest-*-app.zip; do
+            audit_dir=$(mktemp -d)
+            unzip -q "$archive" -d "$audit_dir"
+            app=$(find "$audit_dir" -name DailyAgentDigest -type f | head -1)
+            test -n "$app"
+            echo "archive=$(basename "$archive")"
+            echo "ui_binary_sha256=$(sha256sum "$app" | awk '{print $1}')"
+            info=$(find "$audit_dir" -name Info.plist -type f | head -1)
+            test -n "$info"
+            grep -a -q 'DigestUIBuildID' "$info"
+          done
           cd dist
           sha256sum daily-agent-digest-macos-* *.zip > SHA256SUMS
       - name: Publish signed release or unsigned draft

@@ -37,6 +37,11 @@ if [ -f native/macos/build.sh ]; then
   native_app="dist/Daily Agent Digest $BUILD_ARCH.app"
   bash native/macos/build.sh "$native_app"
   cp "$binary" "$native_app/Contents/MacOS/daily-agent-digest"
+  echo 'Build provenance'
+  echo "git_commit=$(git rev-parse HEAD)"
+  echo "swift_source_sha256=$(shasum -a 256 native/macos/DailyAgentDigest.swift | awk '{print $1}')"
+  echo "ui_binary_sha256=$(shasum -a 256 \"$native_app/Contents/MacOS/DailyAgentDigest\" | awk '{print $1}')"
+  plutil -p "$native_app/Contents/Info.plist"
   ditto -c -k --keepParent "$native_app" "dist/Daily-Agent-Digest-$BUILD_ARCH-app.zip"
 fi
 echo 'Running executable smoke tests'
