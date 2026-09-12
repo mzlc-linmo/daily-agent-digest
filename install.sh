@@ -40,7 +40,7 @@ cat > "$HOME/Library/LaunchAgents/com.daily-agent-digest.plist" <<EOF
 <plist version="1.0"><dict>
 <key>Label</key><string>com.daily-agent-digest</string>
 <key>ProgramArguments</key><array><string>$APP_DIR/run.sh</string></array>
-<key>StartCalendarInterval</key><dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>55</integer></dict>
+<key>StartCalendarInterval</key><dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
 <key>StandardOutPath</key><string>$APP_DIR/launchd.log</string><key>StandardErrorPath</key><string>$APP_DIR/launchd.error.log</string>
 </dict></plist>
 EOF
