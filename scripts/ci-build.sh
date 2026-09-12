@@ -28,9 +28,16 @@ if [ "$SIGN_RELEASE" = true ]; then
   # Sign the embedded Python libraries as well as the outer executable.
   build_args+=(--codesign-identity "$APPLE_SIGNING_IDENTITY")
 fi
+
 echo 'Building executable and embedded libraries'
 pyinstaller "${build_args[@]}" daily_agent_digest.py
 binary="dist/$asset"
+# Build the native menu-bar controller alongside the engine on macOS.
+if [ -f native/macos/build.sh ]; then
+  native_app="dist/Daily Agent Digest $BUILD_ARCH.app"
+  bash native/macos/build.sh "$native_app"
+  cp "$binary" "$native_app/Contents/MacOS/daily-agent-digest"
+fi
 echo 'Running executable smoke tests'
 "$binary" --help
 # Exercise the CLI against empty input without sending any real logs.

@@ -37,7 +37,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: daily-agent-digest-macos-${{ matrix.arch }}
-          path: dist/daily-agent-digest-macos-${{ matrix.arch }}
+          path: |
+            dist/daily-agent-digest-macos-${{ matrix.arch }}
+            dist/Daily Agent Digest ${{ matrix.arch }}.app
           if-no-files-found: error
       - name: Submit and wait for Apple notarization
         if: startsWith(github.ref, 'refs/tags/v')
@@ -68,8 +70,9 @@ jobs:
       - name: Prepare distribution assets
         run: |
           cp install.sh dist/install.sh
+          for app in dist/Daily\ Agent\ Digest\ *.app; do [ -d "$app" ] && ditto -c -k --keepParent "$app" "dist/$(basename "$app" .app | tr ' ' '-')-app.zip"; done
           cd dist
-          sha256sum daily-agent-digest-macos-* > SHA256SUMS
+          sha256sum daily-agent-digest-macos-* *.zip > SHA256SUMS
       - name: Publish signed release or unsigned draft
         env:
           GH_TOKEN: ${{ secrets.DISTRIBUTION_REPO_TOKEN }}

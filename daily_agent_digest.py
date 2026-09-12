@@ -13,7 +13,7 @@ def load_env():
         key, value = line.split('=', 1)
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"": value = value[1:-1]
-        os.environ.setdefault(key.strip(), value)
+        os.environ[key.strip()] = value
 
 def state_path(): return APP_DIR/'state.json'
 def read_state(day=None):
@@ -133,11 +133,12 @@ def app_command(command, data):
     if command == 'save-settings': return save_settings(data)
     if command in ('generate','state','tick'):
         state=app_state(day)
-        if command == 'generate' or not state.get('generated_at'): state=generate(day)
-        # 17:30 preview and 18:00 automatic submission, once per day.
         now=dt.datetime.now(TZ)
-        if command == 'tick' and now.date().isoformat()==day:
-            if now.hour==18 and state.get('report_status')=='ready': state=submit(day)
+        # Manual generate always refreshes. Tick generates once after 17:30 and finalizes once after 18:00.
+        after_preview = now.hour > 17 or (now.hour == 17 and now.minute >= 30)
+        if command == 'generate' or (command == 'tick' and now.date().isoformat()==day and after_preview and not state.get('generated_at')):
+            state=generate(day)
+        if command == 'tick' and now.date().isoformat()==day and now.hour >= 18 and state.get('report_status')=='ready': state=submit(day)
         return state
     state=app_state(day); ids={x.get('id') for x in state.get('work_items',[])}
     if command in ('exclude','restore'):
