@@ -30,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func generate(){
         let alert = NSAlert(); alert.messageText = "正在生成今日总结"; alert.informativeText = "正在汇总当天所有 agent 工作记录，请稍候。"; let progress = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 360, height: 20)); progress.style = .bar; progress.isIndeterminate = true; progress.startAnimation(nil); alert.accessoryView = progress; alert.addButton(withTitle: "后台运行"); alert.addButton(withTitle: "取消");
         DispatchQueue.main.async { self.backend.call("clear") { _ in self.backend.call("generate") { result in
-            progress.stopAnimation(nil); progress.isIndeterminate = false; progress.doubleValue = 1
+            progress.stopAnimation(nil); progress.isIndeterminate = false; progress.doubleValue = 1; alert.accessoryView = nil
             let failed = result["error"] as? String
             alert.messageText = failed == nil ? "今日总结生成成功" : "生成失败"; alert.informativeText = failed ?? "旧的今日总结已替换，可以查看最新内容。"
             alert.buttons.forEach { $0.isHidden = true }
