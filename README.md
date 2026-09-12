@@ -16,9 +16,11 @@ Or install directly on macOS:
 curl -fsSL https://github.com/mzlc-linmo/daily-agent-digest-distribution/releases/latest/download/install.sh | sh
 ```
 
-The installer asks for the API base URL, model, and `LLM_API_KEY`. The key is entered without echo and saved at `~/.local/share/daily-agent-digest/.env` with mode `600`. Re-running the installer preserves the existing file.
+The installer asks only for `LLM_API_KEY`. Base URL defaults to `https://api.deepseek.com/v1` and model defaults to `deepseek-flash`; both can be changed from the tray application's Settings menu or by editing `~/.local/share/daily-agent-digest/.env`. The key is entered without echo and saved with mode `600`. Re-running the installer preserves the existing file.
 
 This installs a self-contained binary runner under `~/.local/share/daily-agent-digest` and schedules it daily at 18:00 with macOS `launchd`.
+
+The tray controller uses the same runner protocol (`--app-command state|generate|exclude|restore|settings|save-settings|submit|tick`). It shows one work item per row and persists exclusions in `state.json`. At 17:30 it generates the day's preview; at 18:00 it submits all non-excluded items. Set `DIGEST_SUBMIT_URL` to enable the reserved JSON POST endpoint.
 
 Production installs download a signed/released binary from `DIGEST_RELEASE_BASE`. The default points to the public distribution repository `mzlc-linmo/daily-agent-digest-distribution`; configure it to your public release host before publishing.
 
