@@ -19,6 +19,9 @@ tmp_sums=$APP_DIR/.SHA256SUMS.$$
 cache_bust="?installer=$(date +%s)-$$"
 release_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$RELEASE_BASE/$ASSET$cache_bust")
 release_tag=$(printf '%s' "$release_url" | sed -n 's#.*releases/download/\([^/]*\)/.*#\1#p')
+if [ -z "$release_tag" ] && [ "$RELEASE_BASE" = "https://github.com/mzlc-linmo/daily-agent-digest-distribution/releases/latest/download" ]; then
+  release_tag=$(curl -fsSL 'https://api.github.com/repos/mzlc-linmo/daily-agent-digest-distribution/releases/latest' | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+fi
 release_tag=${release_tag:-latest}
 curl -fsSL "$RELEASE_BASE/$ASSET$cache_bust" -o "$tmp_bin"
 curl -fsSL "$RELEASE_BASE/SHA256SUMS$cache_bust" -o "$tmp_sums"
