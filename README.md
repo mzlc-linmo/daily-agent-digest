@@ -34,12 +34,12 @@ export LLM_MODEL="deepseek-flash"
 python3 daily_agent_digest.py --date 2026-09-11
 ```
 
-Outputs are written to `~/.local/share/daily-agent-digest/YYYY-MM-DD.json` by default. The collector reads `~/.codex`, `~/.pi/agent/sessions`, and `~/.dsh/sessions`. It is read-only and filters obvious personal, entertainment, gaming, and casual conversation before summarization.
+Outputs are written to `~/.local/share/daily-agent-digest/YYYY-MM-DD.json` by default. The collector reads `~/.codex`, `~/.pi/agent/sessions`, and `~/.dsh/sessions`. It is read-only; the LLM decides which collected conversations are genuine work.
 
 ## Current limitations
 
 - LLM summarization uses only the first 300 collected work events; it is not a complete daily semantic summary.
-- Personal-content filtering uses keywords and can miss personal conversations or exclude work content.
+- Work-content filtering is delegated to the configured LLM; model quality affects classification.
 - The reporting timezone is fixed to UTC+8. The scheduled run at 23:55 excludes the remainder of that day.
 - Configuring all three LLM variables enables sending selected conversation content to that provider. Keep `.env` private (mode 600).
 - Generated reports, credentials, and caches are excluded from Git.

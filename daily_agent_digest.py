@@ -3,16 +3,6 @@ import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, urllib.
 from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
-NON_WORK = ('暗黑4','暗黑 4','游戏','巅峰等级','死灵法师','电影','电视剧','动漫','星座','塔罗','彩票','旅游攻略','情感','恋爱','健身','菜谱','天气','生日','闲聊')
-def work_only(events):
-    kept=[]
-    for e in events:
-        text=e.get('text','').lower()
-        # Keep coding, operations, research, and business work; drop obvious personal/entertainment turns.
-        if any(term in text for term in NON_WORK) and not any(term in text for term in ('代码','部署','服务器','api','项目','脚本','配置','bug','开发')):
-            continue
-        kept.append(e)
-    return kept
 
 def day_window(day):
     start = dt.datetime.fromisoformat(day).replace(tzinfo=TZ)
@@ -83,11 +73,11 @@ def dedupe(rows):
 def summarize(events, day):
     by={}
     for e in events: by.setdefault(e['provider'],set()).add(e['session_id'])
-    payload={'schema_version':'1.0','date':day,'timezone':'Asia/Shanghai','coverage':{'events':len(events),'sessions':sum(map(len,by.values())),'providers':sorted(by),'limitations':[]},'summary':f'Collected {len(events)} work events across {sum(map(len,by.values()))} sessions.','work_items':[{'title':f"{p} session {s}",'status':'observed','details':next(e['text'] for e in events if e['provider']==p and e['session_id']==s)[:500],'source_task_ids':[s]} for p in by for s in by[p]],'blockers':[],'decisions':[],'artifacts':[],'sources':[{'provider':e['provider'],'task_id':e['session_id'],'turn_ids':[e['item_id']],'observed_at':e['timestamp']} for e in events]}
+    payload={'schema_version':'1.0','date':day,'timezone':'Asia/Shanghai','coverage':{'events':len(events),'sessions':sum(map(len,by.values())),'providers':sorted(by),'limitations':[]},'summary':f'Collected {len(events)} events across {sum(map(len,by.values()))} sessions; the LLM classifies work content.','work_items':[{'title':f"{p} session {s}",'status':'observed','details':next(e['text'] for e in events if e['provider']==p and e['session_id']==s)[:500],'source_task_ids':[s]} for p in by for s in by[p]],'blockers':[],'decisions':[],'artifacts':[],'sources':[{'provider':e['provider'],'task_id':e['session_id'],'turn_ids':[e['item_id']],'observed_at':e['timestamp']} for e in events]}
     base=os.getenv('LLM_BASE_URL'); key=os.getenv('LLM_API_KEY'); model=os.getenv('LLM_MODEL')
     if base and key and model:
         context='\n'.join(f"[{e['provider']}] {e['text']}" for e in events[:300])
-        req=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps({'model':model,'messages':[{'role':'system','content':'Summarize agent work in Chinese. Return concise Markdown with completed work, decisions, blockers, and next steps.'},{'role':'user','content':context}]}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+key},method='POST')
+        req=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps({'model':model,'messages':[{'role':'system','content':'Summarize only genuine work activity in Chinese. Decide from the conversation content what is work: include coding, engineering, operations, research, and business tasks. Exclude personal questions, entertainment, games, lifestyle requests, casual chat, and unrelated automation noise. Return concise Markdown with completed work, decisions, blockers, and next steps.'},{'role':'user','content':context}]}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+key},method='POST')
         try:
             with urllib.request.urlopen(req,timeout=60) as r: payload['summary']=json.loads(r.read())['choices'][0]['message']['content']; payload['coverage']['limitations'].append('LLM context capped at 300 events')
         except Exception as exc: payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
@@ -95,7 +85,7 @@ def summarize(events, day):
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); args=ap.parse_args()
-    start,end=day_window(args.date); root=Path(args.root); raw_events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end); events=work_only(raw_events); payload=summarize(events,args.date); payload['coverage']['raw_events']=len(raw_events); payload['coverage']['filtered_events']=len(events)
+    start,end=day_window(args.date); root=Path(args.root); events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end); payload=summarize(events,args.date); payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
     out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(Path.home()/'.local/share/daily-agent-digest')))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
     out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8'); print(f'events={len(events)} raw={len(raw_events)} output={out}')
 
