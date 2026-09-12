@@ -136,7 +136,8 @@ def summarize(events, day):
             fingerprint=hashlib.sha256(text[:800].encode()).hexdigest()
             if fingerprint in seen: continue
             seen.add(fingerprint); compact.append(f"[{e['provider']}] {text[:900]}")
-        context='\n'.join(compact)[:90000]
+        # Keep the single daily request comfortably below provider and proxy limits.
+        context='\n'.join(compact[:500])[:30000]
         system='''你是日报整理器。把当天所有 agent 对话按“工作主题”聚类，而不是按 session 列出。只保留真实工作内容：开发、工程、运维、研究、业务；排除个人问题、娱乐、闲聊和自动化噪音。一次性处理输入并返回严格 JSON，不要 Markdown：{"summary":"...","work_items":[{"title":"简短工作标题","details":"完成了什么","status":"completed|in_progress|blocked","source_task_ids":["provider/session"]}],"decisions":[],"blockers":[],"next_steps":[]}. 工作项数量控制在 3-20 个，合并同一主题。'''
         req=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps({'model':model,'temperature':0.1,'messages':[{'role':'system','content':system},{'role':'user','content':context}]}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+key},method='POST')
         try:
