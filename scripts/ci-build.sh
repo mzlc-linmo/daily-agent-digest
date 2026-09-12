@@ -37,6 +37,15 @@ if [ -f native/macos/build.sh ]; then
   native_app="dist/Daily Agent Digest $BUILD_ARCH.app"
   bash native/macos/build.sh "$native_app"
   cp "$binary" "$native_app/Contents/MacOS/daily-agent-digest"
+  if [ "$SIGN_RELEASE" = true ]; then
+    echo "Signing native App bundle"
+    codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$native_app/Contents/MacOS/daily-agent-digest"
+    codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$native_app/Contents/MacOS/DailyAgentDigest"
+    codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$native_app"
+    codesign --verify --deep --strict --verbose=2 "$native_app"
+    codesign -dv --verbose=4 "$native_app" 2>&1 | grep -Fq 'Authority=Developer ID Application:'
+    echo 'Native App Developer ID signature verified'
+  fi
   echo 'Build provenance'
   echo "git_commit=$(git rev-parse HEAD)"
   echo "swift_source_sha256=$(shasum -a 256 native/macos/DailyAgentDigest.swift | awk '{print $1}')"

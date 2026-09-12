@@ -41,6 +41,8 @@ if command -v ditto >/dev/null 2>&1 && curl -fsSL "$RELEASE_BASE/Daily-Agent-Dig
   for new_app in "$tray_tmp"/*.app; do
     if [ -d "$new_app" ]; then
       for old_app in "$APP_DIR"/*.app; do [ -d "$old_app" ] && rm -rf "$old_app"; done
+      codesign --verify --deep --strict "$new_app" 2>/dev/null || { echo "App signature verification failed" >&2; exit 1; }
+      codesign -dv --verbose=4 "$new_app" 2>&1 | grep -q 'Authority=Developer ID Application:' || { echo "App is not signed with Developer ID Application" >&2; exit 1; }
       mv "$new_app" "$APP_DIR/"
       break
     fi
