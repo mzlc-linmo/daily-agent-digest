@@ -7,7 +7,7 @@ final class Backend {
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process(); p.executableURL = URL(fileURLWithPath: self.executable); p.arguments = ["--app-command", command]
             let stdin = Pipe(), stdout = Pipe(); p.standardInput = stdin; p.standardOutput = stdout
-            do { try p.run(); stdin.fileHandleForWriting.write((try JSONSerialization.data(withJSONObject: input)) ); stdin.fileHandleForWriting.closeFile(); p.waitUntilExit(); let data = stdout.fileHandleForReading.readDataToEndOfFile(); let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? ["error":"后端无响应"]; DispatchQueue.main.async { completion(obj) } }
+            do { try p.run(); stdin.fileHandleForWriting.write((try JSONSerialization.data(withJSONObject: input)) ); stdin.fileHandleForWriting.closeFile(); let data = stdout.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit(); let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? ["error":"后端无响应"]; DispatchQueue.main.async { completion(obj) } }
             catch { DispatchQueue.main.async { completion(["error": error.localizedDescription]) } }
         }
     }

@@ -93,6 +93,3 @@ EOF
   fi
 done
 echo "Installed daily-agent-digest; scheduled daily at 18:00."
-for app in "$APP_DIR"/Daily\ Agent\ Digest\ *.app; do
-  if [ -d "$app" ] && command -v open >/dev/null 2>&1; then open -g "$app" >/dev/null 2>&1 || true; break; fi
-done
