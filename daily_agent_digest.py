@@ -22,7 +22,11 @@ def read_state(day=None):
     if day and state.get('date') != day: state={}
     return state
 def write_state(state):
-    APP_DIR.mkdir(parents=True, exist_ok=True); state_path().write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8'); os.chmod(state_path(), 0o600)
+    APP_DIR.mkdir(parents=True, exist_ok=True); tmp=state_path().with_suffix('.json.tmp'); tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8'); os.chmod(tmp, 0o600); os.replace(tmp, state_path())
+
+def debug(message):
+    if os.getenv('DIGEST_DEBUG') == '1':
+        APP_DIR.mkdir(parents=True, exist_ok=True); with_open = open(APP_DIR/'debug.log', 'a', encoding='utf-8'); with_open.write(f'{dt.datetime.now(TZ).isoformat()} {message}\n'); with_open.close()
 def app_state(day=None):
     load_env(); day=day or dt.datetime.now(TZ).date().isoformat(); state=read_state(day)
     if not state: state={'date':day,'work_items':[],'generated_at':None,'report_status':'not_generated','last_error':None,'reports':[]}
@@ -109,7 +113,7 @@ def dedupe(rows):
 def summarize(events, day):
     by={}
     for e in events: by.setdefault(e['provider'],set()).add(e['session_id'])
-    payload={'schema_version':'1.0','date':day,'timezone':'Asia/Shanghai','coverage':{'events':len(events),'sessions':sum(map(len,by.values())),'providers':sorted(by),'limitations':[]},'summary':f'Collected {len(events)} events across {sum(map(len,by.values()))} sessions; the LLM classifies work content.','work_items':[{'id':hashlib.sha256(f'{p}|{s}'.encode()).hexdigest()[:16],'title':f"{p} session {s}",'status':'observed','details':next(e['text'] for e in events if e['provider']==p and e['session_id']==s)[:500],'source_task_ids':[s],'excluded':False} for p in by for s in by[p]],'blockers':[],'decisions':[],'artifacts':[],'sources':[{'provider':e['provider'],'task_id':e['session_id'],'turn_ids':[e['item_id']],'observed_at':e['timestamp']} for e in events]}
+    payload={'schema_version':'1.0','date':day,'timezone':'Asia/Shanghai','coverage':{'events':len(events),'sessions':sum(map(len,by.values())),'providers':sorted(by),'limitations':[]},'summary':f'Collected {len(events)} events across {sum(map(len,by.values()))} sessions; the LLM classifies work content.','work_items':[{'id':hashlib.sha256(p.encode()).hexdigest()[:16],'title':f"{p} 工作记录（待 LLM 分类）",'status':'observed','details':f'{len(sessions)} 个会话，等待 LLM 主题归并。','source_task_ids':sorted(sessions),'excluded':False} for p,sessions in by.items()],'blockers':[],'decisions':[],'artifacts':[],'sources':[{'provider':e['provider'],'task_id':e['session_id'],'turn_ids':[e['item_id']],'observed_at':e['timestamp']} for e in events]}
     base=os.getenv('LLM_BASE_URL'); key=os.getenv('LLM_API_KEY'); model=os.getenv('LLM_MODEL')
     if base and key and model:
         # Compact all sessions locally before one thematic LLM pass to reduce token use.
@@ -129,7 +133,7 @@ def summarize(events, day):
                 for item in parsed.get('work_items',[])[:20]:
                     item['id']=hashlib.sha256((item.get('title','')+day).encode()).hexdigest()[:16]; item.setdefault('excluded',False); payload['work_items'].append(item)
                 payload['decisions']=parsed.get('decisions',[]); payload['blockers']=parsed.get('blockers',[]); payload['next_steps']=parsed.get('next_steps',[]); payload['coverage']['limitations'].append(f'LLM compacted {len(events)} events to {len(compact)} unique excerpts')
-        except Exception as exc: payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
+        except Exception as exc: debug(f'LLM error: {type(exc).__name__}: {exc}'); payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
     return payload
 
 def generate(day=None):

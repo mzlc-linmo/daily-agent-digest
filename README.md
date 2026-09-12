@@ -22,6 +22,8 @@ This installs a self-contained binary runner under `~/.local/share/daily-agent-d
 
 The tray controller uses the same runner protocol (`--app-command state|generate|exclude|restore|settings|save-settings|submit|tick`). It shows one work item per row and persists exclusions in `state.json`. At 17:30 it generates the day's preview; at 18:00 it submits all non-excluded items. Set `DIGEST_SUBMIT_URL` to enable the reserved JSON POST endpoint.
 
+Set `DIGEST_DEBUG=1` in the runner environment to write provider and protocol errors to `debug.log` under the application directory. Reports are generated with one daily thematic LLM pass after local duplicate removal and excerpt truncation; if the LLM is unavailable, the fallback groups records by provider rather than exposing individual session rows.
+
 Production installs download a signed/released binary from `DIGEST_RELEASE_BASE`. The default points to the public distribution repository `mzlc-linmo/daily-agent-digest-distribution`; configure it to your public release host before publishing.
 
 For CI publishing, add a fine-grained secret named `DISTRIBUTION_REPO_TOKEN` to the private source repository. It needs Contents: Read and write permission on `mzlc-linmo/daily-agent-digest-distribution`. Push a tag such as `v0.1.0` to build and publish both macOS binaries there.
