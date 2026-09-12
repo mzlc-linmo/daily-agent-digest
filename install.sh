@@ -17,6 +17,9 @@ pkill -f "$APP_DIR/Daily Agent Digest .*\.app/Contents/MacOS/DailyAgentDigest" 2
 tmp_bin=$APP_DIR/.${ASSET}.$$
 tmp_sums=$APP_DIR/.SHA256SUMS.$$
 cache_bust="?installer=$(date +%s)-$$"
+release_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$RELEASE_BASE/$ASSET$cache_bust")
+release_tag=$(printf '%s' "$release_url" | sed -n 's#.*releases/download/\([^/]*\)/.*#\1#p')
+release_tag=${release_tag:-latest}
 curl -fsSL "$RELEASE_BASE/$ASSET$cache_bust" -o "$tmp_bin"
 curl -fsSL "$RELEASE_BASE/SHA256SUMS$cache_bust" -o "$tmp_sums"
 expected=$(awk -v f="$ASSET" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp_sums")
@@ -81,7 +84,7 @@ engine_sha=$(shasum -a 256 "$APP_DIR/daily-agent-digest" | awk '{print $1}')
 app_sha=
 for installed_app in "$APP_DIR"/*.app; do [ -d "$installed_app" ] && app_sha=$(shasum -a 256 "$installed_app/Contents/MacOS/DailyAgentDigest" | awk '{print $1}') && break; done
 umask 077
-printf '{"release":"latest","architecture":"%s","engine_sha256":"%s","app_sha256":"%s","installed_at":"%s"}\n' "$(uname -m)" "$engine_sha" "${app_sha:-}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$APP_DIR/install-manifest.json"
+printf '{"release":"%s","architecture":"%s","engine_sha256":"%s","app_sha256":"%s","installed_at":"%s"}\n' "$release_tag" "$(uname -m)" "$engine_sha" "${app_sha:-}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$APP_DIR/install-manifest.json"
 chmod 600 "$APP_DIR/install-manifest.json"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -100,7 +103,7 @@ for app in "$APP_DIR"/Daily\ Agent\ Digest\ *.app; do
   if [ -d "$app" ]; then
     tray_bin="$app/Contents/MacOS/DailyAgentDigest"
     cat > "$TRAY_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>com.daily-agent-digest.tray</string><key>ProgramArguments</key><array><string>$tray_bin</string></array><key>EnvironmentVariables</key><dict><key>DIGEST_RELEASE_VERSION</key><string>latest</string><key>DIGEST_DEBUG</key><string>${DIGEST_DEBUG:-0}</string></dict><key>RunAtLoad</key><true/><key>StandardOutPath</key><string>$APP_DIR/tray.log</string><key>StandardErrorPath</key><string>$APP_DIR/tray.error.log</string></dict></plist>
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>com.daily-agent-digest.tray</string><key>ProgramArguments</key><array><string>$tray_bin</string></array><key>EnvironmentVariables</key><dict><key>DIGEST_RELEASE_VERSION</key><string>$release_tag</string><key>DIGEST_DEBUG</key><string>${DIGEST_DEBUG:-0}</string></dict><key>RunAtLoad</key><true/><key>StandardOutPath</key><string>$APP_DIR/tray.log</string><key>StandardErrorPath</key><string>$APP_DIR/tray.error.log</string></dict></plist>
 EOF
     chmod 600 "$TRAY_PLIST"
     if command -v launchctl >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/com.daily-agent-digest.tray" 2>/dev/null || true; launchctl bootstrap "gui/$(id -u)" "$TRAY_PLIST"; fi
