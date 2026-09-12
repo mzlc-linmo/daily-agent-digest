@@ -22,10 +22,12 @@ if [ "$SIGN_RELEASE" = true ]; then
   security import "$RUNNER_TEMP/digest-certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
   security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
   security list-keychains -d user -s "$keychain"
-  build_args+=(--codesign-identity "$APPLE_SIGNING_IDENTITY")
 fi
 pyinstaller "${build_args[@]}" daily_agent_digest.py
 binary="dist/$asset"
+if [ "$SIGN_RELEASE" = true ]; then
+  codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" "$binary"
+fi
 "$binary" --help
 # Exercise the CLI against empty input without sending any real logs.
 env -u LLM_BASE_URL -u LLM_API_KEY -u LLM_MODEL "$binary" --date 2026-09-11 --root "$RUNNER_TEMP/empty-digest-source" --out "$RUNNER_TEMP/digest-smoke.json"
