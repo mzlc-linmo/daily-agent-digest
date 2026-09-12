@@ -20,8 +20,9 @@ if [ "$SIGN_RELEASE" = true ]; then
   security set-keychain-settings -lut 21600 "$keychain"
   security unlock-keychain -p "$keychain_password" "$keychain"
   security import "$RUNNER_TEMP/digest-certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-  security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+  security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
   security list-keychains -d user -s "$keychain"
+  security default-keychain -s "$keychain"
 fi
 pyinstaller "${build_args[@]}" daily_agent_digest.py
 binary="dist/$asset"
