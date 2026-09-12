@@ -65,7 +65,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: daily-agent-digest-macos-*
+          pattern: '*'
           merge-multiple: true
       - name: Prepare distribution assets
         run: |
