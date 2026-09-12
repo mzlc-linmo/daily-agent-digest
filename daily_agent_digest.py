@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, urllib.request
+import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, ssl, urllib.request
 from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -33,6 +33,14 @@ def write_state(state):
 def debug(message):
     if os.getenv('DIGEST_DEBUG') == '1':
         APP_DIR.mkdir(parents=True, exist_ok=True); with_open = open(APP_DIR/'debug.log', 'a', encoding='utf-8'); with_open.write(f'{dt.datetime.now(TZ).isoformat()} {message}\n'); with_open.close()
+
+def tls_context():
+    cert_file=os.getenv('SSL_CERT_FILE')
+    if not cert_file:
+        for candidate in ('/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt'):
+            if os.path.exists(candidate): cert_file=candidate; break
+    try: return ssl.create_default_context(cafile=cert_file) if cert_file else ssl.create_default_context()
+    except (OSError, ssl.SSLError): return ssl.create_default_context()
 def app_state(day=None):
     load_env(); day=day or dt.datetime.now(TZ).date().isoformat(); state=read_state(day)
     if not state: state={'schema_version':'1.1','release_version':RELEASE_VERSION,'date':day,'work_items':[],'generated_at':None,'report_status':'not_generated','last_error':None,'reports':[],'summary':''}
@@ -141,7 +149,7 @@ def summarize(events, day):
         system='''你是日报整理器。把当天所有 agent 对话按“工作主题”聚类，而不是按 session 列出。只保留真实工作内容：开发、工程、运维、研究、业务；排除个人问题、娱乐、闲聊和自动化噪音。一次性处理输入并返回严格 JSON，不要 Markdown：{"summary":"...","work_items":[{"title":"简短工作标题","details":"完成了什么","status":"completed|in_progress|blocked","source_task_ids":["provider/session"]}],"decisions":[],"blockers":[],"next_steps":[]}. 工作项数量控制在 3-20 个，合并同一主题。'''
         req=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps({'model':model,'temperature':0.1,'messages':[{'role':'system','content':system},{'role':'user','content':context}]}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+key},method='POST')
         try:
-            with urllib.request.urlopen(req,timeout=120) as r:
+            with urllib.request.urlopen(req,timeout=120,context=tls_context()) as r:
                 content=json.loads(r.read())['choices'][0]['message']['content']; parsed=json.loads(content[content.find('{'):content.rfind('}')+1])
                 payload['summary']=parsed.get('summary', payload['summary']); payload['work_items']=[]
                 for item in parsed.get('work_items',[])[:20]:
@@ -191,7 +199,7 @@ def submit(day):
     target=os.getenv('DIGEST_SUBMIT_URL')
     if target:
         req=urllib.request.Request(target, data=json.dumps({'date':day,'work_items':included},ensure_ascii=False).encode(), headers={'Content-Type':'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=30): pass
+        with urllib.request.urlopen(req, timeout=30, context=tls_context()): pass
     state['report_status']='submitted'; state['submitted_count']=len(included); state['last_error']=None; write_state(state); return state
 
 def main():
