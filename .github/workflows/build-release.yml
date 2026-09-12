@@ -39,6 +39,7 @@ jobs:
         timeout-minutes: 8
         env:
           BUILD_ARCH: ${{ matrix.arch }}
+          DIGEST_RELEASE_VERSION: ${{ github.ref_name }}
           SIGN_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
