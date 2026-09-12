@@ -32,4 +32,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with: {path: dist, merge-multiple: true}
       - uses: softprops/action-gh-release@v2
-        with: {files: dist/*, generate_release_notes: true}
+        with:
+          repository: mzlc-linmo/daily-agent-digest-distribution
+          token: ${{ secrets.DISTRIBUTION_REPO_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
