@@ -70,7 +70,7 @@ jobs:
       - name: Prepare distribution assets
         run: |
           cp install.sh dist/install.sh
-          for app in dist/Daily\ Agent\ Digest\ *.app; do [ -d "$app" ] && ditto -c -k --keepParent "$app" "dist/$(basename "$app" .app | tr ' ' '-')-app.zip"; done
+          for app in dist/Daily\ Agent\ Digest\ *.app; do [ -d "$app" ] && (cd dist && zip -qr "$(basename "$app" .app | tr ' ' '-')-app.zip" "$(basename "$app")"); done
           cd dist
           sha256sum daily-agent-digest-macos-* *.zip > SHA256SUMS
       - name: Publish signed release or unsigned draft
