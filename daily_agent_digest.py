@@ -112,10 +112,23 @@ def summarize(events, day):
     payload={'schema_version':'1.0','date':day,'timezone':'Asia/Shanghai','coverage':{'events':len(events),'sessions':sum(map(len,by.values())),'providers':sorted(by),'limitations':[]},'summary':f'Collected {len(events)} events across {sum(map(len,by.values()))} sessions; the LLM classifies work content.','work_items':[{'id':hashlib.sha256(f'{p}|{s}'.encode()).hexdigest()[:16],'title':f"{p} session {s}",'status':'observed','details':next(e['text'] for e in events if e['provider']==p and e['session_id']==s)[:500],'source_task_ids':[s],'excluded':False} for p in by for s in by[p]],'blockers':[],'decisions':[],'artifacts':[],'sources':[{'provider':e['provider'],'task_id':e['session_id'],'turn_ids':[e['item_id']],'observed_at':e['timestamp']} for e in events]}
     base=os.getenv('LLM_BASE_URL'); key=os.getenv('LLM_API_KEY'); model=os.getenv('LLM_MODEL')
     if base and key and model:
-        context='\n'.join(f"[{e['provider']}] {e['text']}" for e in events[:300])
-        req=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps({'model':model,'messages':[{'role':'system','content':'Summarize only genuine work activity in Chinese. Decide from the conversation content what is work: include coding, engineering, operations, research, and business tasks. Exclude personal questions, entertainment, games, lifestyle requests, casual chat, and unrelated automation noise. Return concise Markdown with completed work, decisions, blockers, and next steps.'},{'role':'user','content':context}]}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+key},method='POST')
+        # Compact all sessions locally before one thematic LLM pass to reduce token use.
+        compact=[]; seen=set()
+        for e in events:
+            text=' '.join(e['text'].split())
+            fingerprint=hashlib.sha256(text[:800].encode()).hexdigest()
+            if fingerprint in seen: continue
+            seen.add(fingerprint); compact.append(f"[{e['provider']}] {text[:900]}")
+        context='\n'.join(compact)[:90000]
+        system='''你是日报整理器。把当天所有 agent 对话按“工作主题”聚类，而不是按 session 列出。只保留真实工作内容：开发、工程、运维、研究、业务；排除个人问题、娱乐、闲聊和自动化噪音。一次性处理输入并返回严格 JSON，不要 Markdown：{"summary":"...","work_items":[{"title":"简短工作标题","details":"完成了什么","status":"completed|in_progress|blocked","source_task_ids":["provider/session"]}],"decisions":[],"blockers":[],"next_steps":[]}. 工作项数量控制在 3-20 个，合并同一主题。'''
+        req=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps({'model':model,'temperature':0.1,'messages':[{'role':'system','content':system},{'role':'user','content':context}]}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+key},method='POST')
         try:
-            with urllib.request.urlopen(req,timeout=60) as r: payload['summary']=json.loads(r.read())['choices'][0]['message']['content']; payload['coverage']['limitations'].append('LLM context capped at 300 events')
+            with urllib.request.urlopen(req,timeout=120) as r:
+                content=json.loads(r.read())['choices'][0]['message']['content']; parsed=json.loads(content[content.find('{'):content.rfind('}')+1])
+                payload['summary']=parsed.get('summary', payload['summary']); payload['work_items']=[]
+                for item in parsed.get('work_items',[])[:20]:
+                    item['id']=hashlib.sha256((item.get('title','')+day).encode()).hexdigest()[:16]; item.setdefault('excluded',False); payload['work_items'].append(item)
+                payload['decisions']=parsed.get('decisions',[]); payload['blockers']=parsed.get('blockers',[]); payload['next_steps']=parsed.get('next_steps',[]); payload['coverage']['limitations'].append(f'LLM compacted {len(events)} events to {len(compact)} unique excerpts')
         except Exception as exc: payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
     return payload
 
