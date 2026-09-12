@@ -18,7 +18,9 @@ curl -fsSL https://raw.githubusercontent.com/mzlc-linmo/daily-agent-digest/main/
 
 The installer asks for the API base URL, model, and `LLM_API_KEY`. The key is entered without echo and saved at `~/.local/share/daily-agent-digest/.env` with mode `600`. Re-running the installer preserves the existing file.
 
-This installs a self-contained runner under `~/.local/share/daily-agent-digest` and schedules it daily at 18:00 with macOS `launchd`.
+This installs a self-contained binary runner under `~/.local/share/daily-agent-digest` and schedules it daily at 18:00 with macOS `launchd`.
+
+Production installs download a signed/released binary from `DIGEST_RELEASE_BASE`. The default points to the public distribution repository `mzlc-linmo/daily-agent-digest-distribution`; configure it to your public release host before publishing.
 
 Configure an OpenAI-compatible endpoint in `~/.local/share/daily-agent-digest/.env` (the launchd job does not read your interactive shell profile):
 
