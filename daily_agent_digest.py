@@ -13,7 +13,12 @@ def load_env():
         if not line or line.lstrip().startswith('#') or '=' not in line: continue
         key, value = line.split('=', 1)
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"": value = value[1:-1]
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try: value = json.loads(value)
+            except json.JSONDecodeError: value = value[1:-1]
+        for quote in ('"', "'"):
+            if len(value) >= 2 and value[0] == value[-1] == quote: value = value[1:-1]
+        value = value.replace('\\\"', '"').replace("\\'", "'")
         os.environ[key.strip()] = value
 
 def state_path(): return APP_DIR/'state.json'
@@ -40,7 +45,14 @@ def save_settings(data):
     APP_DIR.mkdir(parents=True, exist_ok=True); path=APP_DIR/'.env'; old={}
     if path.exists():
         for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
-            if '=' in line: k,v=line.split('=',1); old[k]=v
+            if '=' in line:
+                k,v=line.split('=',1); old[k]=v.strip()
+                if len(old[k]) >= 2 and old[k][0] == old[k][-1] == '"':
+                    try: old[k]=json.loads(old[k])
+                    except json.JSONDecodeError: old[k]=old[k][1:-1]
+                for quote in ('"', "'"):
+                    if len(old[k]) >= 2 and old[k][0] == old[k][-1] == quote: old[k]=old[k][1:-1]
+                old[k]=old[k].replace('\\\"','"').replace("\\'", "'")
     old['LLM_BASE_URL']=data.get('base_url', old.get('LLM_BASE_URL','https://api.deepseek.com/v1')); old['LLM_MODEL']=data.get('model', old.get('LLM_MODEL','deepseek-flash'))
     if data.get('api_key'): old['LLM_API_KEY']=data['api_key']
     path.write_text(''.join(f'{k}={json.dumps(v)}\n' for k,v in old.items()), encoding='utf-8'); os.chmod(path, 0o600); return settings()

@@ -56,7 +56,7 @@ cleanup() {
   rm -f "$tmp_bin" "$tmp_sums"
 }
 trap cleanup EXIT HUP INT TERM
-shell_quote() { printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/&'/"; }
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 if [ ! -f "$ENV_FILE" ]; then
   BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com/v1}; MODEL=${LLM_MODEL:-deepseek-flash}; API_KEY=${LLM_API_KEY:-}
   if [ -z "$API_KEY" ] && { exec 3<>/dev/tty; } 2>/dev/null; then
@@ -70,6 +70,14 @@ if [ ! -f "$ENV_FILE" ]; then
   fi
   BASE_URL=${BASE_URL:-https://api.deepseek.com/v1}; MODEL=${MODEL:-deepseek-flash}
   [ -n "$API_KEY" ] || { echo "LLM_API_KEY is required" >&2; exit 1; }
+  umask 077
+  { printf 'LLM_BASE_URL='; shell_quote "$BASE_URL"; printf '\nLLM_MODEL='; shell_quote "$MODEL"; printf '\nLLM_API_KEY='; shell_quote "$API_KEY"; printf '\n'; } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+else
+  # Rewrite legacy incorrectly quoted values produced by older installers.
+  . "$ENV_FILE"
+  BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com/v1}; MODEL=${LLM_MODEL:-deepseek-flash}; API_KEY=${LLM_API_KEY:-}
+  API_KEY=${API_KEY#\"}; API_KEY=${API_KEY#\'}; API_KEY=${API_KEY%\"}; API_KEY=${API_KEY%\'}
   umask 077
   { printf 'LLM_BASE_URL='; shell_quote "$BASE_URL"; printf '\nLLM_MODEL='; shell_quote "$MODEL"; printf '\nLLM_API_KEY='; shell_quote "$API_KEY"; printf '\n'; } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
