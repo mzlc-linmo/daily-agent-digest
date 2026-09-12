@@ -11,10 +11,14 @@ command -v codesign >/dev/null 2>&1 || { echo "codesign is required" >&2; exit 1
 case "$(uname -s)" in Darwin) ;; *) echo "This installer supports macOS only" >&2; exit 1 ;; esac
 case "$(uname -m)" in arm64) ASSET=daily-agent-digest-macos-arm64 ;; x86_64) ASSET=daily-agent-digest-macos-x86_64 ;; *) echo "Unsupported macOS architecture" >&2; exit 1 ;; esac
 mkdir -p "$APP_DIR" "$HOME/Library/LaunchAgents"
+# Stop the previous tray instance before replacing its bundle. This prevents two menu-bar icons during upgrades.
+if command -v launchctl >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/com.daily-agent-digest.tray" 2>/dev/null || true; fi
+pkill -f "$APP_DIR/Daily Agent Digest .*\.app/Contents/MacOS/DailyAgentDigest" 2>/dev/null || true
 tmp_bin=$APP_DIR/.${ASSET}.$$
 tmp_sums=$APP_DIR/.SHA256SUMS.$$
-curl -fsSL "$RELEASE_BASE/$ASSET" -o "$tmp_bin"
-curl -fsSL "$RELEASE_BASE/SHA256SUMS" -o "$tmp_sums"
+cache_bust="?installer=$(date +%s)-$$"
+curl -fsSL "$RELEASE_BASE/$ASSET$cache_bust" -o "$tmp_bin"
+curl -fsSL "$RELEASE_BASE/SHA256SUMS$cache_bust" -o "$tmp_sums"
 expected=$(awk -v f="$ASSET" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp_sums")
 [ -n "$expected" ] || { echo "No checksum found for $ASSET" >&2; exit 1; }
 actual=$(shasum -a 256 "$tmp_bin" | awk '{print $1}')
@@ -25,7 +29,7 @@ chmod 755 "$tmp_bin"
 mv -f "$tmp_bin" "$APP_DIR/daily-agent-digest"
 # Install the optional native tray controller when the release provides it.
 APP_ZIP="$APP_DIR/.tray.$$.zip"
-if command -v ditto >/dev/null 2>&1 && curl -fsSL "$RELEASE_BASE/Daily-Agent-Digest-$(uname -m)-app.zip" -o "$APP_ZIP" 2>/dev/null; then
+if command -v ditto >/dev/null 2>&1 && curl -fsSL "$RELEASE_BASE/Daily-Agent-Digest-$(uname -m)-app.zip$cache_bust" -o "$APP_ZIP" 2>/dev/null; then
   ditto -x -k "$APP_ZIP" "$APP_DIR" 2>/dev/null || true
   rm -f "$APP_ZIP"
 fi
