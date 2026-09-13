@@ -374,6 +374,32 @@ Content-Type: application/json
 | D-22 | 报告窗口正文渲染不正确,连续三次返工:① 手写行高公式与渲染取到不同宽度 → 正文被裁成一行;② 改用 `usesAutomaticRowHeights` + Auto Layout 后,单列 `NSTableColumn` 退回默认宽度(约 100pt)→ 正文被挤进约 60pt 窄栏逐字换行、`×` 按钮停在窗口中间 | FR-9.10 / A21 | **已修复**:行高与单元格帧统一由 `contentWidth()`(取自 `NSScrollView.contentSize`)派生,列宽显式同步为同一值并关闭自动列宽,文本高度改用 `NSLayoutManager` 测量。实测 `column=802 body=778`,正文铺满并按内容换行 |
 | D-23 | 报告窗口被前台应用遮挡:accessory 应用仅靠 `NSApp.activate` 不会置顶,`查看今日总结` 后窗口可能整体藏在浏览器/聊天窗口之后 | FR-9.11 / A23 | **已修复**:`makeKeyAndOrderFront` + `orderFrontRegardless` |
 | D-24 | 用 LLM 改写总结来实现排除:慢(~10 秒)、要花钱、不可逆、每次结果不稳定,还要维护 `summary_full`/缓存两份文本 | FR-3.13 / Q17 | **已否决并移除**:改为结构化工作项数组,排除即数组过滤(实测 106ms) |
+| D-25 | **app bundle 只签名、从未公证**,引擎二进制公证后也未 staple。`spctl -a -vvv -t exec` → `rejected, source=Unnotarized Developer ID`;`syspolicy_check distribution` → `Notary Ticket Missing`。已确认 v0.4.11 同样如此,**不是 v0.5.0 引入** | FR-13.1 / FR-12.3 / A12 | **后续迭代(P2)**:本期只记录不改动,细节与修复方向见 8.1 |
+
+### 8.1 D-25:app bundle 公证缺口(已确认,暂缓)
+
+**证据**(2026-09-13,针对已发布的 v0.5.0 公共资产):
+
+```
+Daily Agent Digest arm64.app: rejected
+  source=Unnotarized Developer ID          ← app bundle 未公证
+  origin=Developer ID Application: Jeen Tsway (LN7XF9MWY3)
+syspolicy_check distribution daily-agent-digest-macos-arm64
+  Notary Ticket Missing                    ← 引擎二进制已 Accepted 但未 staple
+对照 v0.4.11:同样的 Unnotarized Developer ID → 历史遗留
+```
+
+**根因**:`scripts/ci-notarize.sh` 只对 `dist/$asset`(引擎二进制)调用 `notarytool submit`,app bundle(`dist/Daily-Agent-Digest-$BUILD_ARCH-app.zip`)从未提交给 Apple;整条流水线也没有 `xcrun stapler staple` 步骤。`install.sh` 只断言代码签名存在,未断言公证通过。
+
+**影响**:
+
+- 正常安装路径(`curl | sh`)下载的文件不带 `com.apple.quarantine`,Gatekeeper 不会拦截,所以现有用户未受影响。
+- 用浏览器下载 app zip 后首次启动会被 Gatekeeper 拦下("Unnotarized Developer ID")。
+- 断网环境下首次启动引擎时,因无本地票据可能校验失败。
+- 发布说明中"Developer ID signed and **notarized** macOS binaries and menu-bar app"对 app bundle 而言不准确。
+
+**修复方向**(下个迭代):`ci-notarize.sh` 增加 app bundle 的提交与等待;对引擎二进制与 app bundle 执行 `xcrun stapler staple`;发布前用 `spctl -a -t exec` 断言 `Accepted` 作为流水线门禁;同步修正 release notes 文案。
+
 
 ## 9. 里程碑建议
 
@@ -385,7 +411,7 @@ Content-Type: application/json
 | M4 安装与升级原子化 | D-3、D-4、D-9 + 隔离安装测试 | A1、A2、A3、A12 |
 | M5 UI 可验收与可追溯 | D-15、D-6、UI 冒烟脚本、诊断面板 | A8、A10、NFR-9 |
 | M6 团队上线 | D-14、FR-14:安装说明、隐私披露、3–10 人灰度 | A11、NFR-13 |
-| 后续 | Windows 对等(FR-10)、历史/周报、本地脱敏规则 | — |
+| 后续 | **D-25 app bundle 公证与 staple**、Windows 对等(FR-10)、历史/周报、本地脱敏规则 | — |
 
 ## 10. 风险
 
@@ -410,6 +436,8 @@ Content-Type: application/json
 6. Windows 客户端源码共 9 行,仅能弹出原始 JSON;Windows CI job 只做编译断言。
 7. 正式版(`v0.4.11`)已在本机停止:两个 launchd 服务 `bootout` + `disable`,托盘进程已退出,安装文件与 `.env` 未修改。本地开发改用源码开发版(`scripts/dev.sh`,隔离在 `.dev/`),详见 `docs/development.md`。
 8. 实测(`.dev` 开发环境 + 真实 LLM 端点):同样输入下 LLM 返回的 `source_task_ids` 为 `codex/default`、`deepseek-harness/default`,而真实 session id 形如 `01a09339-...`、`dsh-...` —— 印证 D-18。
+9. **v0.5.0 已发布**(2026-09-13,提交 `ae281b1`):CI 三个 job 全绿(含新增 UI 冒烟测试),公共资产 6 个齐全,`scripts/release-audit.sh` 手动运行通过(4 个文件 SHA256 全部 OK),实测发布二进制包含本次修复(报告无 `summary` 字段、未配置通道时 `submit_status=not_configured`)。
+10. `scripts/release-audit.sh` 仍未接入 CI(D-9),本次为手动执行;本机 `sha256sum` 存在,但 macOS 原生只有 `shasum`,接入 CI 时需注意。
 
 ## 12. 已确认决策记录
 
