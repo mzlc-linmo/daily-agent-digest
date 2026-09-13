@@ -49,18 +49,36 @@ curl -sS -X POST https://<你的>.workers.dev/admin/bootstrap \
 
 bootstrap 是幂等的:表已存在就复用,字段已存在就跳过,只补齐缺失的。
 
-## 签发成员 Key
+## 签发成员 Key(后端签发,签发即绑定人员)
+
+Key 由**后端**签发,签发时就把人员身份(工号、姓名、飞书 open_id)绑定进去;
+提交时服务端直接按 Key 确定身份,不再解析邮箱。
 
 ```bash
-node scripts/new-key.mjs zhangsan 张三
+# 需要 KV:首次部署前执行一次
+npx wrangler kv namespace create KEYS      # 把输出的 id 填进 wrangler.toml
+
+# 签发(open_id 优先;也可给 email 让服务端解析,后者需要 contact:user.id:readonly)
+curl -sS -X POST https://<你的>.workers.dev/admin/keys \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"member_id":"zhangsan","member":"张三","open_id":"ou_xxxxxxxx"}'
 ```
 
-输出两项:
+返回里的 `key`(`dag_<key_id>_<secret>`)只出现这一次,交给该成员填进 App;服务端只保存哈希。
 
-- **明文 Key**(`dag_k1a2b3c4_…`)—— 只发给成员一次,让他填进 App 的「设置」;
-- **JSON 条目** —— 合并进 `wrangler.toml` 的 `API_KEYS`(服务端只存 `sha256`,不留明文)。
+```bash
+# 列出(不含哈希)
+curl -sS https://<你的>.workers.dev/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"
 
-撤销成员:把该条目的 `"enabled"` 改为 `false` 并重新部署。
+# 撤销:下一次请求立即失效
+curl -sS -X POST https://<你的>.workers.dev/admin/keys/revoke \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key_id":"<key_id>"}'
+```
+
+**怎么拿到 open_id**:最常见的是从企业已有表格的人员字段直接读(例如排期表的「负责人」),
+读到的 open_id 由同一个应用写入本表即可用;或者给 `email`,由服务端解析。
+两者都没有会被**拒绝签发**,避免生成一把无法关联通讯录的 Key。
 
 ## 成员侧配置
 
@@ -105,7 +123,9 @@ ADMIN_TOKEN="dev-admin"
 | --- | --- |
 | `91402` / 权限不足 | 应用没被加为该多维表格的协作者,或权限变更后没重新发布版本 |
 | `not_ready` / 503 | App ID / Secret 不对,或 `FEISHU_APP_SECRET` 没设置 |
-| 成员报 `invalid_key` | Key 拼错,或 `API_KEYS` 未合并 / 未重新部署 |
+| 成员报 `invalid_key` | Key 拼错,或该 Key 已被撤销(`403 key_revoked`) |
+| 签发时报「无法解析为 open_id」 | 应用未开通 `contact:user.id:readonly`,或邮箱不属于本企业;改为直接给 `open_id` |
+| 提交成功但「成员」列空白 | 该 Key 记录缺 `open_id`(手工塞进旧 `API_KEYS` 变量的条目会这样),重新用 `/admin/keys` 签发 |
 | 大陆网络访问超时 | `*.workers.dev` 不可达,见设计文档 12.1;可迁到国内云函数,客户端无需改动 |
 
 ## 日志

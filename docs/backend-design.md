@@ -113,11 +113,36 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 
 ## 5. 鉴权与密钥管理
 
-- 一把 Key 绑定一个成员,格式 `dag_<key_id>_<secret>`;服务端**只存 `sha256(secret)`**,用恒定时间比较。条目里的 `email` 用于把「成员」人员字段关联到通讯录(需要 `contact:user.id:readonly`),也可直接给 `open_id` 跳过解析。
-- **Serverless 下的存放方式**:Key 表放在**云函数的环境变量 / 平台密钥配置**里,内容是一个 JSON:`{"<key_id>": {"hash": "...", "member": "张三", "member_id": "zhangsan", "enabled": true}}`。3–10 人的规模下最简;轮换 = 改配置后重新部署。
-- 若希望**不重新部署就能增删成员**,可改为在同一个多维表格里加一张「成员」表,函数读取并缓存 60 秒。作为可选升级项,不在 MVP 内。
+**核心模型:Key 就是人员身份的载体。**
+
+```
+管理员在后端签发 Key
+        │  ① 指定人员(工号 + 姓名),并确定其飞书 open_id
+        │  ② 生成随机 secret,只把 sha256 存进 KV
+        ▼
+   Key 记录 = { hash, member, member_id, open_id, enabled, created_at }
+        │  ③ 明文 Key 只返回一次,交给该成员
+        ▼
+成员在 App 里填「提交地址 + Key」→ 提交时服务端由此确定身份
+```
+
+- **签发时就绑定人员**,包括 `open_id`。提交时直接取用,**不再每次去解析邮箱**——身份不会漂移,也不依赖提交时的通讯录调用。
+- `open_id` 的确定方式(二选一):
+  - 直接给 `open_id`(推荐:从企业已有表格的人员字段读取,或由管理员提供);
+  - 给 `email` 由服务端调 `contact/v3/users/batch_get_id` 解析 —— 这需要应用开通 **`contact:user.id:readonly`** 并重新发布。
+  - 两者都拿不到就**拒绝签发**,不生成一把无法关联通讯录的 Key。
+- 存储:**Workers KV**(键 `key:<key_id>`),无数据库;鉴权时按 `key_id` 直接读,边缘缓存,延迟可忽略。
+- 服务端**只存 `sha256(secret)`**,恒定时比较;明文只在签发响应里返回一次。
+- **撤销**:把 `enabled` 置为 false(保留记录便于审计),**下一次请求立即失效**;也可以按需删除记录。
 - 客户端把 Key 存在 `.env`(权限 `0600`),设置界面只写不回显(沿用 FR-11.3)。
-- 签发:管理员本地生成 `secret`、算出 `sha256`、把 `key_id` 与哈希写进配置,把明文 Key 发给成员一次。**服务端永远看不到明文。**
+
+### 5.1 空值/异常的处理口径
+
+| 情况 | 行为 |
+| --- | --- |
+| Key 不存在或格式错误 | `401 invalid_key` |
+| Key 已撤销 | `403 key_revoked` |
+| Key 未绑定 `open_id`(只可能来自手工塞进旧 `API_KEYS` 变量的条目) | 提交照常成功,「成员」列留空,响应里 `member_linked: false`,并写日志 —— 宁可空一列,也不丢一天的日报 |
 
 ## 6. 多维表格设计
 
@@ -261,6 +286,9 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | 多维表格 | base「团队日报」`JHoFbrmTBaTN8nsmoYScZyTpnEb`,表「日报明细」`tbl77oxPmPcVVyVz` |
 | 飞书应用 | `cli_aa13a11707b89bdb`(凭据存于本机钥匙串 `zentao.mzlc.me`) |
 | secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
+| KV | `KEYS` 命名空间 `6f1b2801ee524cd7a3dab047e5c7e1a8`,存放成员 Key |
+| Key 生命周期 | **线上已验证**:签发 → 用 Key 调 `/api/v1/me` 成功 → 列表不含哈希 → 撤销后立即 `403 key_revoked` |
+| open_id 获取 | **不需要新权限**:从企业已有表格的人员字段(「负责人」等)即可取到本应用可用的 open_id,实测写入「日报明细」的成员列成功(`code=0`) |
 | 已核验 | `/healthz` ok;bootstrap 幂等;鉴权边界(无 Key/错 Key → 401、未知路径 → 404);`created → unchanged → updated → unchanged` 且同日行数恒为 1;真实写入 6 行 |
 | 待办 | 应用需开通 `contact:user.id:readonly` 并重新发布,「成员」列才会关联到通讯录 |
 

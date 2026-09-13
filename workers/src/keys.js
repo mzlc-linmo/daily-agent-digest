@@ -1,0 +1,104 @@
+// API Key 的签发、查询与撤销。
+//
+// 设计要点:**Key 就是人员身份的载体**。签发时就把人员信息(姓名、工号、飞书
+// open_id)写进这条记录,提交时直接取用 —— 不再在每次提交时去解析邮箱。
+// 因此 "解析不到人" 只可能发生在签发环节,而那时应当直接报错让管理员修正。
+//
+// 存储:Workers KV(键 `key:<key_id>`),无需数据库,撤销即时生效。
+// 记录字段:{ hash, member, member_id, open_id, enabled, created_at, revoked_at }
+
+import { ValidationError } from './report.js';
+import { sha256Hex } from './report.js';
+
+const KEY_PREFIX = 'key:';
+
+export function newKeyId() {
+  return [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function newSecret() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export async function readKey(env, keyId) {
+  if (!env.KEYS || !keyId) return null;
+  return env.KEYS.get(`${KEY_PREFIX}${keyId}`, 'json');
+}
+
+export async function writeKey(env, keyId, record) {
+  if (!env.KEYS) throw new Error('未绑定 KV 命名空间 KEYS');
+  await env.KEYS.put(`${KEY_PREFIX}${keyId}`, JSON.stringify(record));
+}
+
+/// 签发:先确定人员身份(必须有 open_id 或可解析的邮箱),再生成 Key。
+export async function issueKey(env, feishu, { member_id, member, email, open_id }) {
+  const memberId = String(member_id ?? '').trim();
+  const memberName = String(member ?? '').trim();
+  if (!memberId) throw new ValidationError('必须提供 member_id(工号或账号)');
+  if (!memberName) throw new ValidationError('必须提供 member(姓名)');
+
+  let resolved = String(open_id ?? '').trim();
+  if (!resolved) {
+    const mail = String(email ?? '').trim();
+    if (!mail) throw new ValidationError('必须提供 email 或 open_id,否则无法把「成员」列关联到飞书通讯录');
+    const ids = await feishu.resolveOpenIds(env, [mail], []);
+    resolved = ids[mail] ?? '';
+    if (!resolved) {
+      throw new ValidationError(
+        `无法把邮箱 ${mail} 解析为 open_id:请确认该邮箱属于本企业成员,且应用已开通 contact:user.id:readonly 并重新发布版本`,
+      );
+    }
+  }
+
+  const keyId = newKeyId();
+  const secret = newSecret();
+  const record = {
+    hash: await sha256Hex(secret),
+    member: memberName,
+    member_id: memberId,
+    open_id: resolved,
+    enabled: true,
+    created_at: new Date().toISOString(),
+    revoked_at: null,
+  };
+  await writeKey(env, keyId, record);
+  return {
+    key: `dag_${keyId}_${secret}`, // 只在这里返回一次,服务端只留哈希
+    key_id: keyId,
+    member: memberName,
+    member_id: memberId,
+    open_id_suffix: resolved.slice(-6),
+  };
+}
+
+/// 列出所有 Key(绝不返回哈希与明文)。
+export async function listKeys(env) {
+  if (!env.KEYS) return [];
+  const listed = await env.KEYS.list({ prefix: KEY_PREFIX });
+  const out = [];
+  for (const item of listed.keys ?? []) {
+    const record = await readKey(env, item.name.slice(KEY_PREFIX.length));
+    if (!record) continue;
+    out.push({
+      key_id: item.name.slice(KEY_PREFIX.length),
+      member: record.member,
+      member_id: record.member_id,
+      linked: Boolean(record.open_id),
+      enabled: record.enabled !== false,
+      created_at: record.created_at ?? null,
+      revoked_at: record.revoked_at ?? null,
+    });
+  }
+  return out.sort((a, b) => String(a.member_id).localeCompare(String(b.member_id)));
+}
+
+/// 撤销:保留记录(便于审计),把 enabled 置为 false;鉴权随即失败。
+export async function revokeKey(env, keyId) {
+  const record = await readKey(env, keyId);
+  if (!record) throw new ValidationError(`Key 不存在:${keyId}`);
+  record.enabled = false;
+  record.revoked_at = new Date().toISOString();
+  await writeKey(env, keyId, record);
+  return { key_id: keyId, member: record.member, member_id: record.member_id, revoked_at: record.revoked_at };
+}

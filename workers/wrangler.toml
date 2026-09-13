@@ -12,8 +12,13 @@ BITABLE_TABLE_NAME = "日报明细"
 BITABLE_TABLE_ID = "tbl77oxPmPcVVyVz"
 # 飞书应用的 App ID(非敏感,来自钥匙串 zentao.mzlc.me/feishu-app-id);App Secret 用 secret 存
 FEISHU_APP_ID = "cli_aa13a11707b89bdb"
-# 成员 Key 表,由 workers/scripts/new-key.mjs 生成后合并进来
-API_KEYS = "{}"
+# 成员 Key 已改由 KV 保存,通过 POST /admin/keys 签发(见 README)。
+# 仅保留为空以兼容旧部署;鉴权优先读 KV。
 
 [observability]
 enabled = true
+
+# API Key 存放在 KV:由后端管理员签发(签发时绑定人员),撤销即时生效。
+[[kv_namespaces]]
+binding = "KEYS"
+id = "6f1b2801ee524cd7a3dab047e5c7e1a8"

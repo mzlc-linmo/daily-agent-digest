@@ -9,6 +9,7 @@ import {
   REPORT_DATE, MAX_BODY_BYTES,
 } from './report.js';
 import * as realFeishu from './feishu.js';
+import { issueKey, listKeys, revokeKey } from './keys.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -45,19 +46,10 @@ export async function submitDigest(request, env, feishu, now) {
   const fingerprint = await contentFingerprint(report);
   const submitId = `${member.member_id}-${report.date}`;
 
-  // 成员是「人员」字段:把邮箱解析成 open_id(需要 contact:user.id:readonly)。
-  // 解析失败不影响提交,只是这一列为空,并在返回里标出 member_linked=false。
-  let openId = member.open_id;
-  if (!openId && member.email) {
-    try {
-      const resolved = await feishu.resolveOpenIds(env, [member.email], []);
-      openId = resolved[member.email] ?? '';
-    } catch (err) {
-      console.warn(`open_id 解析失败(成员字段将留空):${err.message}`);
-    }
-  }
-  const linkedMember = { ...member, open_id: openId };
-  const rows = toRows(report, linkedMember, submitId, fingerprint, now());
+  // 身份在签发 Key 时就已绑定,这里直接取用;唯一会失败的情况是 Key 被撤销(已在鉴权阶段拦截)。
+  const openId = member.open_id;
+  if (!openId) console.warn(`Key ${member.key_id} 未绑定 open_id,「成员」列将留空`);
+  const rows = toRows(report, { ...member, open_id: openId }, submitId, fingerprint, now());
   const existing = await feishu.findRecordsBySubmitId(env, submitId);
 
   const meta = {
@@ -171,6 +163,33 @@ export async function bootstrap(request, env, feishu) {
   });
 }
 
+/// 管理员签发 Key:此时就把人员身份(含 open_id)绑死。
+export async function adminIssueKey(request, env, feishu) {
+  authenticateAdmin(request, env);
+  const body = await request.json().catch(() => ({}));
+  const issued = await issueKey(env, feishu, {
+    member_id: body.member_id,
+    member: body.member,
+    email: body.email,
+    open_id: body.open_id,
+  });
+  return json({
+    ...issued,
+    next_step: '把 key 发给该成员,填进 App 的「设置」;服务端只保存哈希,明文不再可查',
+  }, 201);
+}
+
+export async function adminListKeys(request, env) {
+  authenticateAdmin(request, env);
+  return json({ keys: await listKeys(env) });
+}
+
+export async function adminRevokeKey(request, env) {
+  authenticateAdmin(request, env);
+  const body = await request.json().catch(() => ({}));
+  return json(await revokeKey(env, String(body.key_id ?? '')));
+}
+
 export async function healthz(env, feishu) {
   try {
     await feishu.healthcheck(env);
@@ -199,6 +218,12 @@ export async function handleRequest(request, env, deps = {}) {
         return await submitDigest(request, env, feishu, now);
       case 'POST /admin/bootstrap':
         return await bootstrap(request, env, feishu);
+      case 'POST /admin/keys':
+        return await adminIssueKey(request, env, feishu);
+      case 'GET /admin/keys':
+        return await adminListKeys(request, env);
+      case 'POST /admin/keys/revoke':
+        return await adminRevokeKey(request, env);
       default:
         return json({ error: { code: 'not_found', message: `未知接口:${route}` } }, 404);
     }

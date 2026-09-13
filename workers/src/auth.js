@@ -9,6 +9,7 @@
 //   ADMIN_TOKEN = 用于 /admin/bootstrap 的管理口令(建议用 secret 而非 vars)
 
 import { sha256Hex, timingSafeEqualHex } from './report.js';
+import { readKey } from './keys.js';
 
 export class AuthError extends Error {
   constructor(message, status = 401, code = 'invalid_key') {
@@ -19,19 +20,7 @@ export class AuthError extends Error {
   }
 }
 
-export function loadKeys(env) {
-  const raw = env.API_KEYS;
-  if (!raw) throw new Error('缺少环境变量 API_KEYS');
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`API_KEYS 不是合法 JSON:${err.message}`);
-  }
-  if (!parsed || typeof parsed !== 'object') throw new Error('API_KEYS 必须是对象');
-  return parsed;
-}
-
+/// 解析 `dag_<key_id>_<secret>`。格式不对返回 null。
 export function parseKey(presented) {
   if (typeof presented !== 'string') return null;
   const match = /^dag_([A-Za-z0-9]+)_(.+)$/.exec(presented.trim());
@@ -39,31 +28,46 @@ export function parseKey(presented) {
   return { keyId: match[1], secret: match[2] };
 }
 
-/// 校验请求头里的 Key,返回成员信息。任何失败都抛 AuthError。
+/// 取出这位成员绑定的 Key 记录。
+/// 优先读 KV(签发时已绑定人员);API_KEYS 变量仅作为旧部署的兼容回退。
+export async function identify(presented, env) {
+  const parsed = parseKey(presented);
+  if (!parsed) return null;
+  const fromKv = await readKey(env, parsed.keyId);
+  if (fromKv) return { keyId: parsed.keyId, secret: parsed.secret, entry: fromKv };
+  const legacy = legacyKeys(env)[parsed.keyId];
+  return legacy ? { keyId: parsed.keyId, secret: parsed.secret, entry: legacy } : null;
+}
+
+function legacyKeys(env) {
+  if (!env.API_KEYS) return {};
+  try {
+    const parsed = JSON.parse(env.API_KEYS);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/// 校验请求头里的 Key,返回成员身份(含签发时就绑定的 open_id)。
 export async function authenticate(request, env) {
   const header = request.headers.get('Authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : request.headers.get('X-API-Key');
-  const parsed = parseKey(token);
-  if (!parsed) throw new AuthError('缺少或格式错误的 API Key');
+  const found = await identify(token, env);
+  if (!found) throw new AuthError('缺少、格式错误或已失效的 API Key');
 
-  const keys = loadKeys(env);
-  const entry = keys[parsed.keyId];
-  if (!entry) throw new AuthError('API Key 不存在');
-
-  const digest = await sha256Hex(parsed.secret);
-  if (!timingSafeEqualHex(digest, String(entry.hash ?? ''))) {
+  const digest = await sha256Hex(found.secret);
+  if (!timingSafeEqualHex(digest, String(found.entry.hash ?? ''))) {
     throw new AuthError('API Key 不正确');
   }
-  if (entry.enabled === false) {
-    throw new AuthError('成员已停用', 403, 'member_disabled');
+  if (found.entry.enabled === false) {
+    throw new AuthError('该 API Key 已被撤销', 403, 'key_revoked');
   }
   return {
-    key_id: parsed.keyId,
-    member: String(entry.member ?? parsed.keyId),
-    member_id: String(entry.member_id ?? parsed.keyId),
-    // 成员字段是「人员」类型:优先用直接配好的 open_id,否则用邮箱在提交时解析。
-    open_id: entry.open_id ? String(entry.open_id) : '',
-    email: entry.email ? String(entry.email) : '',
+    key_id: found.keyId,
+    member: String(found.entry.member ?? found.keyId),
+    member_id: String(found.entry.member_id ?? found.keyId),
+    open_id: String(found.entry.open_id ?? ''),
   };
 }
 
@@ -76,8 +80,4 @@ export function authenticateAdmin(request, env) {
   if (!timingSafeEqualHex(token, expected)) throw new AuthError('管理口令不正确', 401, 'invalid_admin_token');
 }
 
-/// 生成一把新 Key(管理员本地使用,不经过服务端):
-///   node workers/scripts/new-key.mjs zhangsan 张三
-export async function makeKeyEntry(secret) {
-  return sha256Hex(secret);
-}
+
