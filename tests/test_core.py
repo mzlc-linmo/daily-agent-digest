@@ -200,6 +200,60 @@ class GenerateTests(unittest.TestCase):
             self.assertEqual(cleared['work_items'], [])
 
 
+class ContextSelectionTests(unittest.TestCase):
+    """送进 LLM 的上下文必须先选材:去重、排除自动化、按信号分层、来源之间配额。
+
+    回归的缺陷:按采集顺序取前 N 条时,冗长的工具输出吃光预算,实测 281 条里只有
+    34 条进得去且全部来自一个来源,另一个来源 100% 缺席 —— 于是日报里只剩自动化项。
+    """
+
+    def ev(self, provider, kind, text, ts="2026-09-13T10:00:00+08:00"):
+        return {"provider": provider, "session_id": provider + "-s", "item_id": text[:8],
+                "timestamp": ts, "kind": kind, "text": text, "dedupe_key": f"{provider}|{text[:8]}"}
+
+    def test_automation_records_are_excluded_locally(self):
+        events = [
+            self.ev("codex", "userMessage", "请帮我重构日报生成逻辑并补测试"),
+            self.ev("codex", "functionCallOutput", '{"name": "automation_update", "output": "ok"}'),
+            self.ev("codex", "functionCallOutput", '{"name": "automation_run", "output": "ok"}'),
+            self.ev("deepseek-harness", "tool/call", '{"name":"automation_tick"}'),
+        ]
+        context, stats = engine.build_context(events)
+        self.assertEqual(stats['automation_excluded'], 3)
+        self.assertNotIn('automation', context.lower())
+        self.assertIn('重构日报生成逻辑', context)
+
+    def test_human_intent_is_kept_before_machine_output(self):
+        events = [self.ev("codex", "functionCallOutput", "机器输出" + "x" * 500) for _ in range(20)]
+        events.append(self.ev("codex", "userMessage", "这是人的真实意图，必须优先保留"))
+        context, stats = engine.build_context(events, limit=1200)
+        self.assertIn("这是人的真实意图", context)
+
+    def test_one_provider_cannot_starve_the_other(self):
+        big = [self.ev("codex", "functionCallOutput", f"codex 大量输出 {i} " + "x" * 850) for i in range(60)]
+        small = [self.ev("deepseek-harness", "assistant/message", f"dsh 真实工作叙述 {i} " + "y" * 400) for i in range(10)]
+        context, stats = engine.build_context(big + small, limit=20000)
+        self.assertGreater(stats['sent_by_provider'].get('deepseek-harness', 0), 0,
+                           "深源内容不得被另一个来源的体量挤光")
+        self.assertIn("dsh 真实工作叙述", context)
+
+    def test_budget_is_respected_and_omissions_are_reported(self):
+        events = [self.ev("codex", "userMessage", f"内容 {i} " + "x" * 400) for i in range(200)]
+        context, stats = engine.build_context(events, limit=5000)
+        self.assertLessEqual(len(context), 5000)
+        self.assertEqual(stats['sent'] + sum(stats['omitted_by_provider'].values()), stats['unique'])
+        self.assertTrue(engine.context_note(stats))
+        self.assertIn("省略", engine.context_note(stats))
+
+    def test_duplicates_are_collapsed(self):
+        events = [self.ev("codex", "userMessage", "完全相同的一句话") for _ in range(5)]
+        context, stats = engine.build_context(events)
+        self.assertEqual(stats['unique'], 1)
+
+    def test_default_budget_matches_the_documented_limit(self):
+        self.assertEqual(engine.CONTEXT_CHAR_LIMIT, 90000)
+
+
 class SubmitNeverFakesSuccessTests(unittest.TestCase):
     """D-1:未配置上报通道或上报失败时,绝不能把日报标记成已上报。"""
 

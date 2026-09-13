@@ -92,6 +92,13 @@
 - FR-2.2 送 LLM 的上下文同时受「条数」与「字符数」双重约束(当前:前 500 条、每条约 900 字符、总 30000 字符,`:146-148`)。
 - FR-2.3 预算常量集中定义并可被测试断言;目标值上调为「单条摘要 ≤900 字符、单次请求 ≤90000 UTF-8 字符、工作项 ≤20 条」(与现实现不一致,见 D-5)。
 - FR-2.4 送 LLM 前必须完成本地去重与截断,不得发送全量原始记录。
+- FR-2.5 **选材必须先于预算(已确认并实现)**:只按采集顺序取前 N 条会让冗长的机器输出吃光预算,真实工作被整体挤掉。规则为:
+  1. 本地去重(指纹相同只留一条);
+  2. **本地排除自动化记录**(定时脚本 / `automation_*`),不占用模型预算,也不指望模型过滤;
+  3. 按信号分层:高信号(`userMessage`/`agentMessage`/`assistant/message`/`reasoning`)→ 未知 → 低信号(工具输出、命令执行、流程事件);
+  4. **各来源之间轮转取样**,任一来源的体量都不能把别的来源挤掉;
+  5. 预算 **90,000 字符**(FR-2.3 的目标值),单条摘录 ≤900 字符;
+  6. 统计写入 `coverage.context`,并输出一行人类可读的 `coverage_note`(同时写入 `state.coverage_note`):「当天采集 N 条 → 去重 N 条;排除自动化 N 条;送模型 N 条/N 字符;因预算省略:<来源 N 条>」,界面底部显示该行。
 
 #### FR-3 LLM 主题归并(P0)
 
@@ -340,6 +347,7 @@ Content-Type: application/json
 - **A19** 生成过程中主队列不被阻塞:`clear`/`generate` 的调用与完成均在进度面板显示期间正常执行,`tick` 定时器持续触发,结果弹窗必定带可见按钮(防止 D-19 回归)。
 - **A20** 日报形态与字数:任意输入下 `report_chars` ≤1000 且等于**未排除项**的 `title + desc` 之和;3 项时每项正文可写满 100–300 字;20 项时全部保留且总量仍 ≤1000。
 - **A21** 报告窗口中工作总结按「标题 + 内容」渲染全部未排除项并**完整可见**(按内容自适应高度),工作主题索引只显示标题,正文不重复出现。
+- **A27** 上下文选材:自动化记录在本地被排除;高信号(人的消息/助手叙述)先于机器输出进入预算;任一来源都不会被另一个来源挤空;实际上下文 ≤ 预算;`coverage_note` 记录采集/去重/排除自动化/送模型/省略各来源的条数并在界面显示(6 项回归测试)。
 - **A22** `--mode=verbose` 注入超长总结与超长标题时,引擎仍裁剪到 ≤1000 字、标题 ≤30 字,且工作项数量不变。
 - **A23** 报告窗口在浏览器/聊天应用处于前台时仍可见(置顶),不被遮挡。
 - **A24** 排除反应:排除一项后,该项的标题与内容立即从工作总结中消失且**其余项文字不变**(`--self-test` 断言)、`report_chars` 相应减少、索引行变为「已排除/恢复」;恢复后整块回到总结;全部排除时工作总结显示"没有可上报的内容"。
@@ -354,7 +362,7 @@ Content-Type: application/json
 | D-2 | LLM 失败时 UI 误报「生成成功」 | FR-9.4 / NFR-6 | **已修复**:新增 `Backend.failureReason` 同时检查 `error`/`last_error`/`report_status`,`--self-test` 覆盖 8 种状态映射 |
 | D-3 | 安装非原子:引擎先替换、app 后校验;失败即版本错配;`pkill -f` 偏宽 | FR-12.5 / FR-8.4 | P0 |
 | D-4 | 安装临时文件泄漏(下载早于 `trap` 注册) | FR-12.7 | P1 |
-| D-5 | token 预算未达目标(30000 字符/500 条 vs 90000 字符/20 项) | FR-2.3 | P1 |
+| D-5 | token 预算未达目标(30000 字符 vs 90000 目标) | FR-2.3 | **已修复**:预算提到 90,000 字符,单条摘录上限 900 字符 |
 | D-6 | 版本可追溯不完整:引擎调度路径不注入 `DIGEST_RELEASE_VERSION`(仅托盘 plist 注入);二进制未内嵌版本 | NFR-9 | P1 |
 | D-7 | 排除项身份依赖 `sha256(title+day)`,标题措辞变化导致排除丢失 | FR-6.3 | P1 |
 | D-8 | `clear` 后若生成未执行,状态永久停留 `generating` | FR-4.2 | P1 |
@@ -375,6 +383,7 @@ Content-Type: application/json
 | D-23 | 报告窗口被前台应用遮挡:accessory 应用仅靠 `NSApp.activate` 不会置顶,`查看今日总结` 后窗口可能整体藏在浏览器/聊天窗口之后 | FR-9.11 / A23 | **已修复**:`makeKeyAndOrderFront` + `orderFrontRegardless` |
 | D-24 | 用 LLM 改写总结来实现排除:慢(~10 秒)、要花钱、不可逆、每次结果不稳定,还要维护 `summary_full`/缓存两份文本 | FR-3.13 / Q17 | **已否决并移除**:改为结构化工作项数组,排除即数组过滤(实测 106ms) |
 | D-25 | **app bundle 只签名、从未公证**,引擎二进制公证后也未 staple。`spctl -a -vvv -t exec` → `rejected, source=Unnotarized Developer ID`;`syspolicy_check distribution` → `Notary Ticket Missing`。已确认 v0.4.11 同样如此,**不是 v0.5.0 引入** | FR-13.1 / FR-12.3 / A12 | **后续迭代(P2)**:本期只记录不改动,细节与修复方向见 8.1 |
+| D-26 | **上下文按采集顺序截断,真实工作被整体挤掉**:实测 281 条事件只有 34 条进得去且全部来自 codex,deepseek-harness 的 214 条 100% 缺席;送进去的前 12 条全是 `functionCallOutput` 自动化输出,于是日报只产出自动化工作项 | FR-2.5 / A27 | **已修复**:本地排除自动化 + 按信号分层 + 来源轮转 + 90k 预算。同一份数据修复后:326 条 → 排除自动化 46 条 → 送模型 158 条(codex 32 + dsh 126),日报产出 5 项真实工作 |
 
 ### 8.1 D-25:app bundle 公证缺口(已确认,暂缓)
 
@@ -438,6 +447,8 @@ syspolicy_check distribution daily-agent-digest-macos-arm64
 8. 实测(`.dev` 开发环境 + 真实 LLM 端点):同样输入下 LLM 返回的 `source_task_ids` 为 `codex/default`、`deepseek-harness/default`,而真实 session id 形如 `01a09339-...`、`dsh-...` —— 印证 D-18。
 9. **v0.5.0 已发布**(2026-09-13,提交 `ae281b1`):CI 三个 job 全绿(含新增 UI 冒烟测试),公共资产 6 个齐全,`scripts/release-audit.sh` 手动运行通过(4 个文件 SHA256 全部 OK),实测发布二进制包含本次修复(报告无 `summary` 字段、未配置通道时 `submit_status=not_configured`)。
 10. `scripts/release-audit.sh` 仍未接入 CI(D-9),本次为手动执行;本机 `sha256sum` 存在,但 macOS 原生只有 `shasum`,接入 CI 时需注意。
+11. 实测(2026-09-13,真实 `$HOME`):当天 281–331 条事件中,`codex` 的 `functionCallOutput`+`commandExecution`+`mcpToolCall` 占 77k 字符,`dsh` 的 `assistant/message` 占 152k 字符;修复前只有 34 条进入模型且全部来自 codex,修复后为 158 条(codex 32 + dsh 126),日报从"3 项自动化"变为"5 项真实工作"。
+12. 开发版默认从 fixture 采集(`.dev/source`),要看真实数据必须 `./scripts/dev.sh app --real` 或 `generate --live --real`;这正是"今日 0 条"的直接原因(当日 fixture 无数据)。
 
 ## 12. 已确认决策记录
 

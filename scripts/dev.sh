@@ -150,6 +150,7 @@ cmd_generate() {
     case "$1" in
       --live) live=1 ;;
       --mock) live=0 ;;
+      --real) source=$HOME ;;
       --mode=*) mode=${1#--mode=} ;;
       --date=*) date=${1#--date=} ;;
       *) die "unknown option for generate: $1" ;;
@@ -157,7 +158,7 @@ cmd_generate() {
     shift
   done
   ensure_setup
-  source=$DEV_SOURCE
+  source=${source:-$DEV_SOURCE}
   if [ "$live" = 1 ]; then
     home=$DEV_HOME
     say "generating against the LIVE endpoint from $DEV_HOME/.env"
@@ -226,10 +227,11 @@ stop_app() {
 }
 
 cmd_app() {
-  local demo=0
+  local demo=0 source=$DEV_SOURCE
   while [ $# -gt 0 ]; do
     case "$1" in
       --demo) demo=1 ;;
+      --real) source=$HOME ;;
       *) die "unknown option for app: $1" ;;
     esac
     shift
@@ -252,7 +254,7 @@ cmd_app() {
   (
     export DIGEST_ENGINE="$WRAPPER"
     export DIGEST_HOME="$home"
-    export DIGEST_SOURCE_ROOT="$DEV_SOURCE"
+    export DIGEST_SOURCE_ROOT="$source"
     export DIGEST_DEBUG=1
     export DIGEST_DEBUG_LOG="$DEV_LOGS/tray.debug.log"
     [ "$autogen" = 1 ] && export DIGEST_DEBUG_AUTOGENERATE=1
@@ -266,6 +268,7 @@ cmd_app() {
     say "menu bar: 查看今日总结 / 生成今日总结 / 设置 / 退出"
     say "engine  : $WRAPPER -> $ENGINE_SRC"
     say "home    : $home"
+    say "source  : $source$([ "$source" = "$DEV_SOURCE" ] && echo " (fixtures)")"
     say "logs    : $DEV_LOGS/tray.debug.log"
   else
     tail -20 "$DEV_LOGS/tray.out.log" >&2 || true
@@ -323,6 +326,7 @@ Local development harness for Daily Agent Digest.
   scripts/dev.sh test                  run the Python unit tests
   scripts/dev.sh generate [options]    clear + generate + print the resulting state
                                          (default: offline mock LLM; --live uses .env endpoint)
+                                         --real  read the real $HOME instead of fixtures
                                          --mode=ok|malformed|error500|hang   mock failure injection
                                          --date=YYYY-MM-DD
   scripts/dev.sh run [--date=D]        run the engine CLI (read-only report file)
@@ -333,6 +337,7 @@ Local development harness for Daily Agent Digest.
   scripts/dev.sh app [--demo]         build if needed, then launch the dev tray app
                                          --demo: run against the mock LLM and auto-generate once
                                                  so the progress -> result dialog can be watched
+                                         --real: collect from the real $HOME instead of fixtures
   scripts/dev.sh state [--mock]        pretty-print the dev state.json
   scripts/dev.sh stop                  stop the dev tray app and the mock LLM
   scripts/dev.sh status                show what is running and where the dev state lives

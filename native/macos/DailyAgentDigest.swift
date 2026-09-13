@@ -187,7 +187,11 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
             self.stateChars = obj["report_chars"] as? Int ?? ReportController.includedChars(items: self.items)
             self.renderSummary()
             self.updateMetadata()
-            self.status.stringValue = "工作主题是索引：点击右侧 × 可把该项的标题与内容从上面的工作总结中移除，恢复即可还原。"
+            // 选材说明必须可见:否则"今天的日报怎么这么少"无从判断。
+            let coverage = obj["coverage_note"] as? String ?? ""
+            self.status.stringValue = coverage.isEmpty
+                ? "工作主题是索引：点击右侧 × 可把该项的标题与内容从上面的工作总结中移除，恢复即可还原。"
+                : coverage
             self.relayout()
             DebugLog.write("report state date=\(self.stateDay) status=\(self.stateStatus) items=\(self.items.count) report_chars=\(self.stateChars) engine=\(self.stateRelease) ui=\(self.stateUIBuild)")
             self.syncColumnWidth()
