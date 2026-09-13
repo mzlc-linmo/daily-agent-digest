@@ -159,7 +159,8 @@
 
 #### FR-7 上报到飞书群(P0,本期重点)
 
-- FR-7.1 **通道**:飞书自定义机器人(群 webhook),端点形态 `https://open.feishu.cn/open-apis/bot/v2/hook/{token}`;token 由团队统一提供,通过安装参数或托盘设置写入 `.env`。
+- FR-7.1 **通道(已变更)**:改为「提交服务 + 飞书多维表格」,详见 `docs/backend-design.md`;群自定义机器人方案(Q3)被 Q19 取代。以下 7.1–7.10 中与群消息相关的条目保留为历史口径。
+- FR-7.1(历史) **通道**:飞书自定义机器人(群 webhook),端点形态 `https://open.feishu.cn/open-apis/bot/v2/hook/{token}`;token 由团队统一提供,通过安装参数或托盘设置写入 `.env`。
 - FR-7.2 **未配置 webhook 时不得标记为已上报**(已实现):`submit` 保持 `report_status: ready`,写入 `submit_status: not_configured` 与 `submit_error` 说明;日报字数与内容不受影响,配置通道后可重试。
 - FR-7.3 **响应码校验**:飞书在业务失败时可能返回 HTTP 200 且响应体 `code != 0`,必须解析响应体并校验 `code == 0` 才算成功。
 - FR-7.4 **签名校验**:当团队启用了「签名校验」安全设置时,请求体必须包含 `timestamp`(秒级)与 `sign`;`sign = base64(HMAC-SHA256(key = timestamp + "\n" + secret, data = ""))`。未配置 secret 时按飞书默认的「无签名」模式发送。
@@ -491,7 +492,12 @@ syspolicy_check distribution daily-agent-digest-macos-arm64
 | Q13 | 团队规模 | **3–10 人,全 macOS,各自本地运行** | 无服务端;私有仓库迁移风险记入第 10 章 |
 | Q14 | 1000 字的口径 | **摘要 + 所有标题 + 所有正文** | FR-3.11 按此计算 `report_chars` |
 | Q15 | 项多时如何取舍 | **压缩每项字数,保持全部工作项**(不删项) | `fit_report` 按项数均分预算,20 项也全部保留 |
-| Q18 | 飞书登录(待决策) | **调研完成,待定**:可行但非必要,详见 `docs/feishu-login-research.md`;需先明确是"身份标注"还是"发送者必须是本人" | 若选"发送者本人",需放弃群自定义机器人通道,改用自建应用 + `im:message.send_as_user`,并先验证 loopback 回调可否登记 |
+| Q19 | 日报提交目标 | **只写飞书多维表格**,不再向群里发消息(取代 Q3) | 群自定义机器人 webhook 从设计中移除,改由提交服务写表 |
+| Q20 | 提交服务部署 | **云函数 / Serverless** | 无数据库:以表内 `提交ID` 检索实现幂等与覆盖;token 用模块级缓存 |
+| Q21 | 同日重新提交 | **覆盖旧行** | `batch_update` + 多余行 `batch_delete`;内容相同则幂等不写 |
+| Q22 | 多维表格结构 | **一行一个工作项** | 可直接按人/日期/状态/来源筛选与聚合 |
+| Q23 | 客户端配置 | **只需 API 地址 + API Key** | 移除 `DIGEST_FEISHU_WEBHOOK`;姓名由 `GET /api/v1/me` 回填 |
+| Q18 | 飞书登录(暂缓) | **调研完成,待定**:可行但非必要,详见 `docs/feishu-login-research.md`;需先明确是"身份标注"还是"发送者必须是本人" | 若选"发送者本人",需放弃群自定义机器人通道,改用自建应用 + `im:message.send_as_user`,并先验证 loopback 回调可否登记 |
 | Q17 | 「工作总结」的结构 | **每一项一个标题+内容,LLM 直接产出 `{title, desc}` JSON;排除 = 删除数组元素** | 取消自由叙述与 `summary` 字段;排除不再需要 LLM(见 D-24) |
 | Q16 | 「工作总结」显示什么 | **把摘要扩展成完整总结(报告主体),工作项只保留标题、不要正文** | 摘要预算从 150 字放开到 600–900 字;`work_items` 不再有 `details`;界面改为总结区自适应高度 + 标题列表 |
 
