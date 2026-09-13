@@ -2,11 +2,45 @@ import json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT))
+import daily_agent_digest as engine  # noqa: E402
 
-def command(home, name, payload):
-    p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', name], input=json.dumps(payload), text=True, capture_output=True, env={**os.environ, 'DIGEST_HOME': str(home), 'DIGEST_DEBUG': '1'}, check=False)
+LLM_VARS = ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "DIGEST_SUBMIT_URL")
+
+
+def command(home, name, payload, source_root=None, extra_env=None):
+    env = {k: v for k, v in os.environ.items() if k not in LLM_VARS}
+    env.update({"DIGEST_HOME": str(home), "DIGEST_DEBUG": "1"})
+    if source_root is not None:
+        env["DIGEST_SOURCE_ROOT"] = str(source_root)
+    if extra_env:
+        env.update(extra_env)
+    p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', name],
+                       input=json.dumps(payload), text=True, capture_output=True, env=env, check=False)
     assert p.returncode == 0, p.stderr + p.stdout
     return json.loads(p.stdout)
+
+
+def today():
+    """The engine's current report day, so these tests do not break at midnight."""
+    return engine.dt.datetime.now(engine.TZ).date().isoformat()
+
+
+def item(title, size=0, excluded=False, ident=None):
+    return {"id": ident or title[:16].ljust(16, "x"), "title": title,
+            "desc": ("完成了采集器重构并补充回归测试" * (size // 14 + 2))[:size],
+            "status": "completed", "source_task_ids": ["codex/s1"], "excluded": excluded}
+
+
+def no_llm_env():
+    return {k: os.environ.pop(k, None) for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")}
+
+
+def restore_env(saved):
+    for key, value in saved.items():
+        if value is not None:
+            os.environ[key] = value
+
 
 class CoreProtocolTests(unittest.TestCase):
     def test_clear_and_settings_are_private_and_atomic(self):
@@ -17,5 +51,204 @@ class CoreProtocolTests(unittest.TestCase):
             self.assertEqual((home/'.env').stat().st_mode & 0o777, 0o600)
             self.assertEqual(command(home, 'settings', {})['model'], 'test-model')
             self.assertFalse((home/'state.json.tmp').exists())
+
+
+class ReportShapeTests(unittest.TestCase):
+    """The report is a list of independent work items (title + desc), capped at
+    1000 characters, and no work item is ever dropped to fit."""
+
+    def total(self, items):
+        return sum(engine.char_count(i['title']) + engine.char_count(i['desc']) for i in items)
+
+    def test_char_count_ignores_whitespace(self):
+        self.assertEqual(engine.char_count("  a b\n\tc  "), 3)
+        self.assertEqual(engine.char_count("日报 摘要"), 4)
+        self.assertEqual(engine.char_count(None), 0)
+
+    def test_three_items_can_use_the_full_body_range(self):
+        items, total = engine.fit_report([item(f"主题{i}", 400) for i in range(3)])
+        self.assertLessEqual(total, engine.REPORT_CHAR_LIMIT)
+        self.assertEqual(len(items), 3)
+        for entry in items:
+            body = engine.char_count(entry['desc'])
+            self.assertGreaterEqual(body, engine.ITEM_CHAR_MIN)
+            self.assertLessEqual(body, engine.ITEM_CHAR_MAX)
+
+    def test_many_items_are_compressed_and_none_are_dropped(self):
+        items, total = engine.fit_report([item(f"主题{i}", 400) for i in range(20)])
+        self.assertEqual(len(items), 20, "the report must never drop a work item")
+        self.assertLessEqual(total, engine.REPORT_CHAR_LIMIT)
+
+    def test_item_chars_field_matches_title_plus_body(self):
+        items, _ = engine.fit_report([item("标题", 120)])
+        self.assertEqual(items[0]['chars'], engine.char_count("标题") + engine.char_count(items[0]['desc']))
+
+    def test_long_title_is_clamped(self):
+        items, _ = engine.fit_report([{"title": "很长" * 60, "desc": "内容"}])
+        self.assertLessEqual(engine.char_count(items[0]['title']), engine.TITLE_CHAR_MAX)
+
+    def test_empty_body_is_allowed_no_minimum(self):
+        items, total = engine.fit_report([item(f"主题{i}", 0) for i in range(3)])
+        self.assertEqual([engine.char_count(i['desc']) for i in items], [0, 0, 0])
+        self.assertLessEqual(total, engine.REPORT_CHAR_LIMIT)
+
+    def test_total_never_exceeds_limit_even_with_oversized_input(self):
+        items, total = engine.fit_report([item(f"主题{i}", 1200) for i in range(4)])
+        self.assertLessEqual(total, engine.REPORT_CHAR_LIMIT)
+        self.assertEqual(len(items), 4)
+
+
+class ExclusionIsArrayFilterTests(unittest.TestCase):
+    """排除一项 = 从数组里去掉一项:不调用 LLM,描述文字原样保留,立即可逆。"""
+
+    def state(self):
+        return {"schema_version": "1.2", "date": today(),
+                "work_items": [item("采集器重构", 150, ident="a"*16),
+                               item("CI 签名修复", 150, ident="b"*16)],
+                "report_chars": 0, "included_count": 0, "excluded_count": 0, "last_error": None}
+
+    def test_report_chars_counts_only_included_items(self):
+        state = self.state()
+        state['work_items'][1]['excluded'] = True
+        engine.recount_report(state)
+        self.assertEqual(state['included_count'], 1)
+        self.assertEqual(state['excluded_count'], 1)
+        self.assertEqual(state['report_chars'],
+                         engine.char_count("采集器重构") + engine.char_count(state['work_items'][0]['desc']))
+
+    def test_excluding_needs_no_llm_and_leaves_descriptions_untouched(self):
+        saved = no_llm_env()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                before = self.state()
+                (home / "state.json").write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
+                result = command(home, "exclude", {"date": today(), "id": "b" * 16})
+        finally:
+            restore_env(saved)
+        self.assertIsNone(result.get("last_error"), "排除不应依赖 LLM,也不应报错")
+        self.assertNotIn("summary", result)
+        self.assertEqual([i["id"] for i in result["work_items"] if i["excluded"]], ["b" * 16])
+        for entry in result["work_items"]:
+            expected = next(i for i in before["work_items"] if i["id"] == entry["id"])
+            self.assertEqual(entry["desc"], expected["desc"], "排除不应改动任何描述文字")
+
+    def test_exclude_then_restore_round_trips(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            seed = self.state()
+            (home / "state.json").write_text(json.dumps(seed, ensure_ascii=False), encoding="utf-8")
+            excluded = command(home, "exclude", {"date": today(), "id": "a"*16})
+            self.assertEqual(excluded["included_count"], 1)
+            self.assertEqual(excluded["excluded_count"], 1)
+            self.assertEqual(excluded["report_chars"],
+                             engine.char_count("CI 签名修复") + engine.char_count(seed["work_items"][1]["desc"]))
+            restored = command(home, "restore", {"date": today(), "id": "a"*16})
+            self.assertEqual(restored["included_count"], 2)
+            self.assertEqual(restored["excluded_count"], 0)
+
+    def test_unknown_id_is_rejected_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "state.json").write_text(json.dumps(self.state(), ensure_ascii=False), encoding="utf-8")
+            p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', 'exclude'],
+                               input=json.dumps({"date": today(), "id": "does-not-exist"}), text=True, capture_output=True,
+                               env={**os.environ, "DIGEST_HOME": str(home)}, check=False)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("unknown work item id", p.stdout)
+            self.assertEqual(json.loads((home / "state.json").read_text(encoding="utf-8"))["excluded_count"], 0)
+
+    def test_exclusions_survive_regeneration(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            sessions = source / ".pi/agent/sessions"; sessions.mkdir(parents=True)
+            lines = [json.dumps({"timestamp": "2026-09-12T10:00:00+08:00", "id": "m1",
+                                 "type": "message", "content": "重构采集器并补充测试。"}, ensure_ascii=False)]
+            (sessions / "session-a.jsonl").write_text("\n".join(lines), encoding="utf-8")
+            first = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
+            target = first['work_items'][0]['id']
+            command(home, 'exclude', {'date': '2026-09-12', 'id': target})
+            again = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
+            self.assertEqual([i['id'] for i in again['work_items'] if i['excluded']], [target])
+
+
+class GenerateTests(unittest.TestCase):
+    def test_generate_returns_items_with_titles_and_bodies_within_the_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            sessions = source / ".pi/agent/sessions"; sessions.mkdir(parents=True)
+            lines = []
+            for i in range(40):
+                lines.append(json.dumps({"timestamp": "2026-09-12T10:%02d:00+08:00" % (i % 60),
+                                         "id": f"m{i}", "type": "message",
+                                         "content": f"第{i}条工作记录：重构采集器并补充测试。" * 5},
+                                        ensure_ascii=False))
+            (sessions / "session-a.jsonl").write_text("\n".join(lines), encoding="utf-8")
+            state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
+            self.assertEqual(state['report_status'], 'ready', state.get('last_error'))
+            self.assertTrue(state['work_items'])
+            self.assertNotIn('summary', state, "报告就是工作项列表,没有单独的叙述字段")
+            for entry in state['work_items']:
+                self.assertTrue(entry['title'])
+                self.assertIn('desc', entry)
+            total = sum(engine.char_count(i['title']) + engine.char_count(i['desc'])
+                        for i in state['work_items'])
+            self.assertEqual(total, state['report_chars'])
+            self.assertLessEqual(total, engine.REPORT_CHAR_LIMIT)
+            cleared = command(home, 'clear', {'date': '2026-09-12'})
+            self.assertEqual(cleared['report_chars'], 0)
+            self.assertEqual(cleared['work_items'], [])
+
+
+class SubmitNeverFakesSuccessTests(unittest.TestCase):
+    """D-1:未配置上报通道或上报失败时,绝不能把日报标记成已上报。"""
+
+    def seed(self, home):
+        state = {"schema_version": "1.2", "date": today(), "report_status": "ready",
+                 "work_items": [item("采集器重构", 150, ident="a"*16)],
+                 "report_chars": 0, "included_count": 0, "excluded_count": 0,
+                 "submit_status": None, "submit_error": None, "last_error": None}
+        engine.recount_report(state)
+        (Path(home) / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    def test_submit_without_a_webhook_is_not_reported_as_submitted(self):
+        saved = {k: os.environ.pop(k, None) for k in ("DIGEST_SUBMIT_URL",)}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.seed(d)
+                result = command(Path(d), "submit", {"date": today()})
+                stored = json.loads((Path(d) / "state.json").read_text(encoding="utf-8"))
+        finally:
+            for key, value in saved.items():
+                if value is not None: os.environ[key] = value
+        self.assertNotEqual(result["report_status"], "submitted", "未配置通道时不得标记为已上报")
+        self.assertEqual(result["report_status"], "ready")
+        self.assertEqual(result["submit_status"], "not_configured")
+        self.assertTrue(result["submit_error"])
+        self.assertEqual(stored["submit_status"], "not_configured")
+        self.assertNotIn("submitted_count", stored)
+
+    def test_a_failing_webhook_is_not_reported_as_submitted(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.seed(d)
+            # 127.0.0.1:1 上没有服务,连接必然失败
+            result = command(Path(d), "submit", {"date": today()},
+                             extra_env={"DIGEST_SUBMIT_URL": "http://127.0.0.1:1/hook"})
+        self.assertNotEqual(result["report_status"], "submitted")
+        self.assertEqual(result["submit_status"], "failed")
+        self.assertTrue(result["submit_error"])
+
+    def test_tick_after_18_does_not_mark_submitted_without_a_webhook(self):
+        saved = {k: os.environ.pop(k, None) for k in ("DIGEST_SUBMIT_URL",)}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.seed(d)
+                result = command(Path(d), "tick", {"date": today()},
+                                 extra_env={"DIGEST_SOURCE_ROOT": str(Path(d) / "empty-source")})
+        finally:
+            for key, value in saved.items():
+                if value is not None: os.environ[key] = value
+        self.assertNotEqual(result["report_status"], "submitted")
+
 
 if __name__ == '__main__': unittest.main()

@@ -11,3 +11,6 @@ build/
 dist/
 *.egg-info/
 .DS_Store
+# Local development harness runtime (scripts/dev.sh): isolated home, fixture
+# source tree, logs, dev app bundle and the seeded .env.
+.dev/

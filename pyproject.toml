@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daily-agent-digest"
-version = "0.1.0"
+version = "0.5.0"
 description = "Local daily summaries across Codex, Pi agent, and DeepSeek Harness sessions"
 requires-python = ">=3.10"
 

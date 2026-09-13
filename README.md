@@ -57,9 +57,29 @@ python3 daily_agent_digest.py --date 2026-09-11
 
 Outputs are written to `~/.local/share/daily-agent-digest/YYYY-MM-DD.json` by default. The collector reads `~/.codex`, `~/.pi/agent/sessions`, and `~/.dsh/sessions`. It is read-only; the LLM decides which collected conversations are genuine work.
 
+Each report is a **structured list of work items**, not a free-text narrative: the LLM returns `{title, desc}` per item, and the report window renders every *included* item as a heading plus its own body. The whole report (all titles + all bodies) is capped at 1000 characters; each body targets 100-300 characters and bodies are compressed rather than dropping items when there are many. Because items are independent, excluding one is a plain array filter: it disappears from the report instantly, costs no LLM call, and is fully reversible. The engine clamps the model output locally and records `report_chars` for verification.
+
+## Local development
+
+Run the engine and the tray app from source against an isolated data directory under `.dev/` (never touches an installed copy, registers no launchd service):
+
+```bash
+./scripts/dev.sh setup      # isolated home, .env, fixture data sources, engine wrapper
+./scripts/dev.sh test       # unit tests
+./scripts/dev.sh generate   # offline end-to-end generation with a built-in mock LLM
+./scripts/dev.sh app        # build and launch the dev menu bar app
+./scripts/dev.sh status     # what is running and where the dev state lives
+```
+
+`generate --mode=malformed|error500|hang` injects LLM failures to exercise the error paths. See `docs/development.md` (Chinese) for the full command list, isolation guarantees and rollback of an installed copy.
+
+## Requirements baseline
+
+`docs/requirements.md` is the confirmed requirements baseline (team-internal use, Feishu group reporting, macOS only). It supersedes the earlier production delivery plan.
+
 ## Current limitations
 
-- LLM summarization uses only the first 300 collected work events; it is not a complete daily semantic summary.
+- LLM summarization sends at most the first 500 deduplicated excerpts, capped at 30,000 characters; it is not a complete daily semantic summary.
 - Work-content filtering is delegated to the configured LLM; model quality affects classification.
 - The reporting timezone is fixed to UTC+8. The scheduled run at 18:00 excludes work performed after 18:00; run manually later for a complete day.
 - Configuring all three LLM variables enables sending selected conversation content to that provider. Keep `.env` private (mode 600).
