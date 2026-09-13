@@ -188,7 +188,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 2. 新增请求头 `Idempotency-Key = date:content_sha256`(客户端只知道日期与内容指纹;服务端用"已认证成员 + 日期"做幂等,不依赖该头);
 3. 设置项:`DIGEST_FEISHU_WEBHOOK` **移除**,改为 `DIGEST_SUBMIT_URL` + `DIGEST_API_KEY`;成员只需填这两项(已确认 Q23),姓名由服务端回填显示;
 4. 保存设置时调用 `GET /api/v1/me` 校验 Key;
-5. 沿用 D-1:非 2xx 或响应判定失败 → `submit_status=failed`,绝不显示"已上报"。
+6. 沿用 D-1:非 2xx 或响应判定失败 → `submit_status=failed`,绝不显示"已上报"。
 
 ## 9. 安全、隐私与运维
 
@@ -288,6 +288,8 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
 | KV | `KEYS` 命名空间 `6f1b2801ee524cd7a3dab047e5c7e1a8`,存放成员 Key |
 | Key 生命周期 | **线上已验证**:签发 → 用 Key 调 `/api/v1/me` 成功 → 列表不含哈希 → 撤销后立即 `403 key_revoked` |
+| 端到端 | **已完成**:本地 App → 线上 Worker → 飞书表格,今日 6 项工作的「成员」列显示 **Master Cui**(已关联通讯录) |
+| 客户端 UA | Cloudflare 会拦截 `Python-urllib`(403 / error code 1010),引擎已固定发送 `DailyAgentDigest/<版本>`;自研客户端必须带 UA |
 | open_id 获取 | **不需要新权限**:从企业已有表格的人员字段(「负责人」等)即可取到本应用可用的 open_id,实测写入「日报明细」的成员列成功(`code=0`) |
 | 已核验 | `/healthz` ok;bootstrap 幂等;鉴权边界(无 Key/错 Key → 401、未知路径 → 404);`created → unchanged → updated → unchanged` 且同日行数恒为 1;真实写入 6 行 |
 | 待办 | 应用需开通 `contact:user.id:readonly` 并重新发布,「成员」列才会关联到通讯录 |

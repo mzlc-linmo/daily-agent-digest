@@ -466,6 +466,9 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
         self.assertEqual(result["submit_status"], "submitted")
         self.assertEqual(result["submit_mode"], "created")
         self.assertEqual(request["headers"]["authorization"], "Bearer dag_k1_secret")
+        # Cloudflare 会拦 Python-urllib 的默认 UA(1010),必须带自己的标识
+        self.assertEqual(request["headers"]["user-agent"], engine.USER_AGENT)
+        self.assertIn("DailyAgentDigest/", request["headers"]["user-agent"])
         self.assertTrue(request["headers"]["idempotency-key"])
         self.assertEqual(request["body"]["work_items"][0]["title"], "采集器重构")
         self.assertEqual(request["body"]["release_version"], engine.RELEASE_VERSION)

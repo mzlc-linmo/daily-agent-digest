@@ -5,6 +5,8 @@ from pathlib import Path
 TZ = dt.timezone(dt.timedelta(hours=8))
 APP_DIR = Path(os.getenv('DIGEST_HOME', Path.home()/'.local/share/daily-agent-digest'))
 RELEASE_VERSION = os.getenv('DIGEST_RELEASE_VERSION', 'dev')
+# Cloudflare 会拦截 Python-urllib 的默认 UA(错误码 1010),必须带自己的标识。
+USER_AGENT = f'DailyAgentDigest/{RELEASE_VERSION}'
 
 # Report contract (docs/requirements.md FR-3.11). The whole report is
 # 工作总结 + every work-item title, counted in characters with whitespace
@@ -513,7 +515,7 @@ def submit(day):
     url=target.rstrip('/')+'/api/v1/digests'
     req=urllib.request.Request(url, data=json.dumps(payload,ensure_ascii=False).encode(),
         headers={'Content-Type':'application/json','Authorization':'Bearer '+key,
-                 'Idempotency-Key':f'{day}:{fingerprint}'}, method='POST')
+                 'User-Agent':USER_AGENT,'Idempotency-Key':f'{day}:{fingerprint}'}, method='POST')
     try:
         with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
             body=json.loads(r.read() or b'{}')
@@ -546,7 +548,8 @@ def check_submit(data=None):
     target=(data.get('submit_url') or os.getenv('DIGEST_SUBMIT_URL') or '').strip()
     key=(data.get('submit_api_key') or os.getenv('DIGEST_API_KEY') or '').strip()
     if not target or not key: raise ValueError('未配置提交地址或 API Key')
-    req=urllib.request.Request(target.rstrip('/')+'/api/v1/me', headers={'Authorization':'Bearer '+key}, method='GET')
+    req=urllib.request.Request(target.rstrip('/')+'/api/v1/me',
+        headers={'Authorization':'Bearer '+key,'User-Agent':USER_AGENT}, method='GET')
     try:
         with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
             body=json.loads(r.read() or b'{}')
