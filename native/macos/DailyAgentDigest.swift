@@ -612,8 +612,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "当前已是最新版本(\(current))。"
     }
 
-    /// 当前版本信息:应用包、UI 构建、引擎自报版本、报告生成时的引擎版本与路径。
-    func releaseInfo(engineVersion: String) -> [(String, String)] {
+    /// 完整版本信息:只写入调试日志与剪贴板,不占弹窗版面。
+    func releaseDetails(engineVersion: String) -> [(String, String)] {
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let uiBuild = Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") as? String ?? "unknown"
         let home = ProcessInfo.processInfo.environment["DIGEST_HOME"]
@@ -629,22 +629,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
     }
 
+    /// 弹窗只放"版本"与"不一致"这两类信息:一致时一行,不一致时才多一行。
+    static func aboutSummary(app: String, engine: String, reportVersion: String) -> String {
+        var lines = ["版本:\(app)"]
+        if engine != app { lines.append("引擎:\(engine)(与应用不一致)") }
+        if reportVersion != engine { lines.append("今天的报告由:\(reportVersion)(与当前引擎不同)") }
+        return lines.joined(separator: "\n")
+    }
+
     @objc func about(){
         // 先问引擎它自己的版本:state 里的 release_version 是"生成报告时的版本",
         // 直接显示会让人以为当前跑的就是那个版本。
         backend.call("settings") { [weak self] info in
             guard let self = self else { return }
             let engine = info["release_version"] as? String ?? "unknown"
-            let rows = self.releaseInfo(engineVersion: engine)
-            let body = rows.map { "\($0.0):\($0.1)" }.joined(separator: "\n")
-            DebugLog.write("about shown " + rows.map { "\($0.0)=\($0.1)" }.joined(separator: " "))
+            let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+            let details = self.releaseDetails(engineVersion: engine)
+            let detailText = details.map { "\($0.0):\($0.1)" }.joined(separator: "\n")
+            DebugLog.write("about shown " + details.map { "\($0.0)=\($0.1)" }.joined(separator: " "))
+
             let alert = NSAlert()
-            alert.messageText = "关于 Daily Agent Digest"
-            alert.informativeText = body + "\n\n点击“检查最新版本”会向发布仓库查询最新版本号。"
+            alert.messageText = "Daily Agent Digest"
+            alert.informativeText = AppDelegate.aboutSummary(app: appVersion, engine: engine,
+                                                              reportVersion: self.report.stateRelease)
             alert.addButton(withTitle: "检查最新版本")
+            alert.addButton(withTitle: "复制详细信息")
             alert.addButton(withTitle: "关闭")
-            if self.presentAlert(alert) == .alertFirstButtonReturn {
-                self.checkLatestVersion(current: rows[0].1)
+            let response = self.presentAlert(alert)
+            if response == .alertFirstButtonReturn {
+                self.checkLatestVersion(current: appVersion)
+            } else if response == .alertSecondButtonReturn {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(detailText + "\n\n" + AppDelegate.aboutSummary(app: appVersion, engine: engine,
+                                                                                      reportVersion: self.report.stateRelease),
+                                     forType: .string)
+                DebugLog.write("about details copied to pasteboard")
             }
         }
     }
@@ -766,6 +786,22 @@ enum SelfTest {
         } else {
             passed = false
             print("FAIL included char count wrong -> \(chars)")
+        }
+
+        // 「关于」的压缩规则:一致时一行,不一致时才提示。
+        let same = AppDelegate.aboutSummary(app: "v0.5.0", engine: "v0.5.0", reportVersion: "v0.5.0")
+        let mismatch = AppDelegate.aboutSummary(app: "v0.5.0", engine: "v0.4.11", reportVersion: "v0.4.10")
+        if same == "版本:v0.5.0" && same.split(separator: "\n").count == 1 {
+            print("PASS about collapses to one line when every version matches")
+        } else {
+            passed = false
+            print("FAIL about summary not collapsed -> \(same)")
+        }
+        if mismatch.split(separator: "\n").count == 3 && mismatch.contains("与应用不一致") && mismatch.contains("与当前引擎不同") {
+            print("PASS about surfaces only the mismatches")
+        } else {
+            passed = false
+            print("FAIL about mismatch summary wrong -> \(mismatch)")
         }
 
         // 版本比较:用于判断当前运行的版本是否最新。
