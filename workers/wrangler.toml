@@ -4,14 +4,14 @@ compatibility_date = "2024-11-01"
 
 # 非敏感配置放这里;密钥用 `wrangler secret put`(见 README)。
 [vars]
-# 多维表格 base ID(URL 里 /base/ 之后那段,形如 bascn…),由你提供
-BITABLE_APP_TOKEN = ""
+# 独立 base「团队日报」(app_token);App Secret 用 wrangler secret 存
+BITABLE_APP_TOKEN = "JHoFbrmTBaTN8nsmoYScZyTpnEb"
 # 目标表名;留空 BITABLE_TABLE_ID 时,bootstrap 会按这个名字找表或建表
 BITABLE_TABLE_NAME = "日报明细"
-# 由 bootstrap 返回后填回这里
-BITABLE_TABLE_ID = ""
-# 飞书应用的 App ID(非敏感);App Secret 用 secret 存
-FEISHU_APP_ID = ""
+# 表「日报明细」的 id(由 bootstrap 创建)
+BITABLE_TABLE_ID = "tbl77oxPmPcVVyVz"
+# 飞书应用的 App ID(非敏感,来自钥匙串 zentao.mzlc.me/feishu-app-id);App Secret 用 secret 存
+FEISHU_APP_ID = "cli_aa13a11707b89bdb"
 # 成员 Key 表,由 workers/scripts/new-key.mjs 生成后合并进来
 API_KEYS = "{}"
 
