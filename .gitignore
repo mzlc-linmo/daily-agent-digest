@@ -14,3 +14,8 @@ dist/
 # Local development harness runtime (scripts/dev.sh): isolated home, fixture
 # source tree, logs, dev app bundle and the seeded .env.
 .dev/
+
+# Cloudflare Worker(workers/)
+workers/node_modules/
+workers/.wrangler/
+workers/.dev.vars

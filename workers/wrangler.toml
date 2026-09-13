@@ -1,0 +1,19 @@
+name = "daily-agent-digest-submit"
+main = "src/worker.js"
+compatibility_date = "2024-11-01"
+
+# 非敏感配置放这里;密钥用 `wrangler secret put`(见 README)。
+[vars]
+# 多维表格 base ID(URL 里 /base/ 之后那段,形如 bascn…),由你提供
+BITABLE_APP_TOKEN = ""
+# 目标表名;留空 BITABLE_TABLE_ID 时,bootstrap 会按这个名字找表或建表
+BITABLE_TABLE_NAME = "日报明细"
+# 由 bootstrap 返回后填回这里
+BITABLE_TABLE_ID = ""
+# 飞书应用的 App ID(非敏感);App Secret 用 secret 存
+FEISHU_APP_ID = ""
+# 成员 Key 表,由 workers/scripts/new-key.mjs 生成后合并进来
+API_KEYS = "{}"
+
+[observability]
+enabled = true

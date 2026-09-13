@@ -39,6 +39,46 @@ def pi_line(role, text, i=0, ts="2026-09-13T10:00:00+08:00"):
                       ensure_ascii=False)
 
 
+class StubSubmitService:
+    """本地桩:验证客户端提交链路(请求头、载荷、响应处理)。"""
+
+    def __init__(self, response):
+        import http.server, threading
+        payload = json.dumps(response).encode()
+        captured = self.requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length)
+                captured.append({
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": json.loads(raw or b"{}"),
+                })
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = _handle
+            do_POST = _handle
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
 def no_llm_env():
     return {k: os.environ.pop(k, None) for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")}
 
@@ -391,15 +431,68 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
         self.assertEqual(stored["submit_status"], "not_configured")
         self.assertNotIn("submitted_count", stored)
 
-    def test_a_failing_webhook_is_not_reported_as_submitted(self):
+    def test_a_failing_service_is_not_reported_as_submitted(self):
         with tempfile.TemporaryDirectory() as d:
             self.seed(d)
             # 127.0.0.1:1 上没有服务,连接必然失败
             result = command(Path(d), "submit", {"date": today()},
-                             extra_env={"DIGEST_SUBMIT_URL": "http://127.0.0.1:1/hook"})
+                             extra_env={"DIGEST_SUBMIT_URL": "http://127.0.0.1:1",
+                                        "DIGEST_API_KEY": "dag_k1_secret"})
         self.assertNotEqual(result["report_status"], "submitted")
         self.assertEqual(result["submit_status"], "failed")
         self.assertTrue(result["submit_error"])
+
+    def test_missing_api_key_is_not_configured_rather_than_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.seed(d)
+            result = command(Path(d), "submit", {"date": today()},
+                             extra_env={"DIGEST_SUBMIT_URL": "https://digest.example.com"})
+            stored = json.loads((Path(d) / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["submit_status"], "not_configured")
+        self.assertNotEqual(result["report_status"], "submitted")
+        self.assertNotIn("secret-value", json.dumps(stored), "状态里绝不能出现密钥内容")
+
+    def test_a_successful_submission_marks_submitted_with_the_returned_mode(self):
+        server = StubSubmitService({"mode": "created", "submitted_at": "2026-09-13T18:00:00+08:00"})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.seed(d)
+                result = command(Path(d), "submit", {"date": today()},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+            request = server.requests[0]
+        finally:
+            server.stop()
+        self.assertEqual(result["report_status"], "submitted")
+        self.assertEqual(result["submit_status"], "submitted")
+        self.assertEqual(result["submit_mode"], "created")
+        self.assertEqual(request["headers"]["authorization"], "Bearer dag_k1_secret")
+        self.assertTrue(request["headers"]["idempotency-key"])
+        self.assertEqual(request["body"]["work_items"][0]["title"], "采集器重构")
+        self.assertEqual(request["body"]["release_version"], engine.RELEASE_VERSION)
+
+    def test_check_submit_validates_the_key_against_the_service(self):
+        server = StubSubmitService({"member": "张三", "member_id": "zhangsan"})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                result = command(home, "check-submit", {},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+        finally:
+            server.stop()
+        self.assertEqual(result["member"], "张三")
+
+    def test_check_submit_without_configuration_reports_an_error(self):
+        saved = {k: os.environ.pop(k, None) for k in ("DIGEST_SUBMIT_URL", "DIGEST_API_KEY")}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', 'check-submit'],
+                                   input="{}", text=True, capture_output=True,
+                                   env={**os.environ, "DIGEST_HOME": d}, check=False)
+        finally:
+            for key, value in saved.items():
+                if value is not None: os.environ[key] = value
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("未配置提交地址", p.stdout)
 
     def test_tick_after_18_does_not_mark_submitted_without_a_webhook(self):
         saved = {k: os.environ.pop(k, None) for k in ("DIGEST_SUBMIT_URL",)}

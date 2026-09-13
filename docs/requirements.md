@@ -159,7 +159,9 @@
 
 #### FR-7 上报到飞书群(P0,本期重点)
 
-- FR-7.1 **通道(已变更)**:改为「提交服务 + 飞书多维表格」,详见 `docs/backend-design.md`;群自定义机器人方案(Q3)被 Q19 取代。以下 7.1–7.10 中与群消息相关的条目保留为历史口径。
+- FR-7.1 **通道(已变更并实现)**:App 用**提交地址 + API Key** 向自建提交服务提交,由服务端写入**飞书多维表格**;群自定义机器人方案(Q3)由 Q19 取代。契约与实现见 `docs/backend-design.md` 与 `workers/`。
+- FR-7.11 客户端凭据只填一次:提交地址与 API Key 存于 `APP_DIR/.env`(权限 `0600`),`settings` 只返回 `submit_url` 与 `submit_api_key_set`,**绝不回显密钥**;设置面板提供「测试连接」,经 `GET /api/v1/me` 校验并回填服务端成员名。
+- FR-7.12 提交幂等:服务端按「已认证成员 + 日期」覆盖既有行,内容指纹相同则幂等返回且不写表;客户端发送 `Idempotency-Key: <date>:<content_sha256>` 仅作追踪。
 - FR-7.1(历史) **通道**:飞书自定义机器人(群 webhook),端点形态 `https://open.feishu.cn/open-apis/bot/v2/hook/{token}`;token 由团队统一提供,通过安装参数或托盘设置写入 `.env`。
 - FR-7.2 **未配置 webhook 时不得标记为已上报**(已实现):`submit` 保持 `report_status: ready`,写入 `submit_status: not_configured` 与 `submit_error` 说明;日报字数与内容不受影响,配置通道后可重试。
 - FR-7.3 **响应码校验**:飞书在业务失败时可能返回 HTTP 200 且响应体 `code != 0`,必须解析响应体并校验 `code == 0` 才算成功。
@@ -366,6 +368,7 @@ Content-Type: application/json
 - **A20** 日报形态与字数:任意输入下 `report_chars` ≤1000 且等于**未排除项**的 `title + desc` 之和;3 项时每项正文可写满 100–300 字;20 项时全部保留且总量仍 ≤1000。
 - **A21** 报告窗口中工作总结按「标题 + 内容」渲染全部未排除项并**完整可见**(按内容自适应高度),工作主题索引只显示标题,正文不重复出现。
 - **A27** 上下文选材:进入上下文的只有提示词/最终文本/交付物;任一来源都不会被另一个来源挤空;实际上下文 ≤ 预算;`coverage_note` 记录入库/送模型/省略各来源的条数并在界面显示。
+- **A30** 提交服务:未配置地址或 Key 时 `submit_status=not_configured`;服务端返回非 2xx 时 `submit_status=failed` 且 `report_status` 保持 `ready`;成功时 `report_status=submitted` 并记录 `submit_mode`;状态文件中不得出现密钥内容;`check-submit` 能返回服务端成员名(7 项客户端测试 + 12 项 worker 测试覆盖)。
 - **A29** 版本可追溯:「关于」显示的引擎版本来自引擎实时应答;`--check-version` 无头模式可验证三种判定(开发构建 / 有新版 / 已最新),退出码同时反映是否检查成功。
 - **A28** 抽取正确性:三个来源的提示词与最终文本都能取到且**忽略 reasoning/thinking/tool-call**;过程记录默认不入库;带 `reasoning`/`tool-call` 分片的记录只取 `text` 分片;提到 `automation_u` 等词的提示词与最终文本**必须保留**(旧子串规则会误删);超过 4000 字符的记录先抽取再截断(8 项回归测试)。
 - **A22** `--mode=verbose` 注入超长总结与超长标题时,引擎仍裁剪到 ≤1000 字、标题 ≤30 字,且工作项数量不变。

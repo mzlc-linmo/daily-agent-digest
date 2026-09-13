@@ -59,7 +59,7 @@ Serverless 没有本地库,而"同一天覆盖旧行"需要知道旧行的 `reco
 POST /api/v1/digests
 Authorization: Bearer <member-api-key>
 Content-Type: application/json
-Idempotency-Key: <member_id>:<date>:<content_sha256>
+Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等由"已认证成员 + 日期"推导
 ```
 
 ```json
@@ -160,7 +160,7 @@ Idempotency-Key: <member_id>:<date>:<content_sha256>
 引擎的 `submit()` 已经在向 `DIGEST_SUBMIT_URL` POST `{date, work_items}`,因此:
 
 1. 载荷扩展为第 4.1 节字段(补 `generated_at` / `release_version` / `report_chars` / `coverage_note`,以及每项 `status`、`source_task_ids`);
-2. 新增请求头 `Idempotency-Key = member_id:date:content_sha256`;
+2. 新增请求头 `Idempotency-Key = date:content_sha256`(客户端只知道日期与内容指纹;服务端用"已认证成员 + 日期"做幂等,不依赖该头);
 3. 设置项:`DIGEST_FEISHU_WEBHOOK` **移除**,改为 `DIGEST_SUBMIT_URL` + `DIGEST_API_KEY`;成员只需填这两项(已确认 Q23),姓名由服务端回填显示;
 4. 保存设置时调用 `GET /api/v1/me` 校验 Key;
 5. 沿用 D-1:非 2xx 或响应判定失败 → `submit_status=failed`,绝不显示"已上报"。
@@ -238,7 +238,22 @@ Idempotency-Key: <member_id>:<date>:<content_sha256>
 | 应用是否已发布 | 你确认 | 权限变更后必须重新发布版本才生效 |
 | 表结构 | 二选一 | ① 你给已有表的字段名;② **我提供 bootstrap 接口,自动建表 + 建字段并返回 `table_id`**(推荐,避免手工建错类型) |
 
-## 15. 已确认决策
+## 15. 实现状态(2026-09-13)
+
+| 部分 | 状态 | 位置 |
+| --- | --- | --- |
+| Worker:路由 / 鉴权 / 校验 / 幂等覆盖 / 错误语义 / bootstrap | **已实现** | `workers/src/*.js` |
+| Worker 单测(12 项:created·updated·unchanged·鉴权·校验·502) | **通过** | `workers/test/handler.test.js`(`npm test`,零依赖) |
+| 部署配置与操作说明 | **已就绪** | `workers/wrangler.toml`、`workers/README.md` |
+| 客户端:设置项(提交地址 + API Key,保存一次长期复用) | **已实现** | `daily_agent_digest.py` 的 `settings`/`save_settings`,`DailyAgentDigest.swift` 设置面板 |
+| 客户端:提交载荷 + `Idempotency-Key` + 失败语义 | **已实现** | `daily_agent_digest.py` 的 `submit()` |
+| 客户端:Key 校验与姓名回填(`check-submit` → `GET /api/v1/me`) | **已实现** | 同上 + 设置面板「测试连接」 |
+| 端到端(引擎 → 假服务) | **已验证** | 请求头、载荷字段、只上报未排除项、`check-submit` 回填成员 |
+| 真实飞书表格写入 | **待部署后验证** | 需要 `BITABLE_APP_TOKEN` 与协作者/发布确认 |
+
+尚未完成:Cloudflare 侧的实际部署与 bootstrap(需要你的 `app_token`);`GET /api/v1/digests?date=` 目前只被测试覆盖,客户端暂未使用。
+
+## 16. 已确认决策
 
 | 编号 | 问题 | 决策 |
 | --- | --- | --- |

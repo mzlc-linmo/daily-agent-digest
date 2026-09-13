@@ -230,11 +230,12 @@ def tls_context():
     except (OSError, ssl.SSLError): return ssl.create_default_context()
 def app_state(day=None):
     load_env(); day=day or dt.datetime.now(TZ).date().isoformat(); state=read_state(day)
-    if not state: state={'schema_version':'1.2','release_version':RELEASE_VERSION,'date':day,'work_items':[],'generated_at':None,'report_status':'not_generated','last_error':None,'reports':[],'report_chars':0,'included_count':0,'excluded_count':0,'submit_status':None,'submit_error':None}
+    if not state: state={'schema_version':'1.2','release_version':RELEASE_VERSION,'date':day,'work_items':[],'generated_at':None,'report_status':'not_generated','last_error':None,'reports':[],'report_chars':0,'included_count':0,'excluded_count':0,'submit_status':None,'submit_error':None,'submitted_at':None,'submit_mode':None}
     return state
 
 def settings():
-    load_env(); return {'base_url':os.getenv('LLM_BASE_URL','https://api.deepseek.com/v1'),'model':os.getenv('LLM_MODEL','deepseek-flash'),'api_key_set':bool(os.getenv('LLM_API_KEY')),'release_version':RELEASE_VERSION}
+    load_env(); return {'base_url':os.getenv('LLM_BASE_URL','https://api.deepseek.com/v1'),'model':os.getenv('LLM_MODEL','deepseek-flash'),'api_key_set':bool(os.getenv('LLM_API_KEY')),'release_version':RELEASE_VERSION,
+                        'submit_url':os.getenv('DIGEST_SUBMIT_URL',''),'submit_api_key_set':bool(os.getenv('DIGEST_API_KEY'))}
 
 def save_settings(data):
     APP_DIR.mkdir(parents=True, exist_ok=True); path=APP_DIR/'.env'; old={}
@@ -250,6 +251,9 @@ def save_settings(data):
                 old[k]=old[k].replace('\\\"','"').replace("\\'", "'")
     old['LLM_BASE_URL']=data.get('base_url', old.get('LLM_BASE_URL','https://api.deepseek.com/v1')); old['LLM_MODEL']=data.get('model', old.get('LLM_MODEL','deepseek-flash'))
     if data.get('api_key'): old['LLM_API_KEY']=data['api_key']
+    # 提交服务:地址与 API Key 各填一次即长期复用(与 LLM 配置同一个 0600 的 .env)。
+    if 'submit_url' in data: old['DIGEST_SUBMIT_URL']=str(data['submit_url']).strip()
+    if data.get('submit_api_key'): old['DIGEST_API_KEY']=str(data['submit_api_key']).strip()
     path.write_text(''.join(f'{k}={json.dumps(v)}\n' for k,v in old.items()), encoding='utf-8'); os.chmod(path, 0o600); return settings()
 
 def day_window(day):
@@ -460,6 +464,7 @@ def generate(day=None, source_root=None):
 def app_command(command, data):
     load_env(); day=data.get('date') or dt.datetime.now(TZ).date().isoformat()
     if command == 'settings': return settings()
+    if command == 'check-submit': return check_submit(data)
     if command == 'save-settings': return save_settings(data)
     if command == 'clear':
         state=app_state(day); state.update({'schema_version':'1.2','release_version':RELEASE_VERSION,'work_items': [], 'report_chars': 0, 'included_count': 0, 'excluded_count': 0, 'submit_status': None, 'submit_error': None, 'generated_at': None, 'report_status': 'generating', 'last_error': None}); write_state(state); return state
@@ -484,33 +489,72 @@ def app_command(command, data):
     raise ValueError('unknown app command')
 
 def submit(day):
-    """上报今天的日报。
+    """把当天的日报提交到提交服务,由服务端写入飞书多维表格。
 
-    未配置上报通道或上报失败时**绝不**把状态置为 submitted:那会让界面与后续流程
-    以为日报已经送达。改为持久化 submit_status / submit_error,report_status 保持
-    不变,便于重试与排查。
+    未配置提交地址/Key,或服务端返回非 2xx 时**绝不**把状态置为 submitted:
+    那会让界面以为日报已经送达。改为持久化 submit_status / submit_error,便于重试与排查。
     """
     state=app_state(day)
     if state.get('report_status')=='submitted': return state
     included=[x for x in state.get('work_items',[]) if not x.get('excluded')]
-    target=os.getenv('DIGEST_SUBMIT_URL')
-    if not target:
+    target=(os.getenv('DIGEST_SUBMIT_URL') or '').strip(); key=(os.getenv('DIGEST_API_KEY') or '').strip()
+    if not target or not key:
         state['submit_status']='not_configured'
-        state['submit_error']='未配置上报通道(DIGEST_SUBMIT_URL),日报未上报'
+        state['submit_error']='未配置提交地址或 API Key(DIGEST_SUBMIT_URL / DIGEST_API_KEY),日报未提交'
         state['last_error']=state['submit_error']
         write_state(state); return state
+
+    items=[{'title':x.get('title',''),'desc':x.get('desc',''),'status':x.get('status','completed'),
+            'source_task_ids':x.get('source_task_ids',[])} for x in included]
+    payload={'date':day,'generated_at':state.get('generated_at'),'release_version':RELEASE_VERSION,
+             'report_chars':state.get('report_chars',0),'coverage_note':state.get('coverage_note') or '',
+             'work_items':items}
+    fingerprint=hashlib.sha256(json.dumps([[i['title'],i['desc'],i['status']] for i in items],ensure_ascii=False).encode()).hexdigest()
+    url=target.rstrip('/')+'/api/v1/digests'
+    req=urllib.request.Request(url, data=json.dumps(payload,ensure_ascii=False).encode(),
+        headers={'Content-Type':'application/json','Authorization':'Bearer '+key,
+                 'Idempotency-Key':f'{day}:{fingerprint}'}, method='POST')
     try:
-        req=urllib.request.Request(target, data=json.dumps({'date':day,'work_items':included},ensure_ascii=False).encode(), headers={'Content-Type':'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=30, context=tls_context()): pass
+        with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
+            body=json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        detail=exc.read().decode('utf-8','replace')[:300]
+        return fail_submit(state, day, f'HTTP {exc.code}: {detail}')
     except Exception as exc:
         debug(f'submit error: {type(exc).__name__}: {exc}')
-        state['submit_status']='failed'
-        state['submit_error']=f'{type(exc).__name__}: {exc}'
-        state['last_error']=state['submit_error']
-        write_state(state); return state
+        return fail_submit(state, day, f'{type(exc).__name__}: {exc}')
+    mode=body.get('mode')
+    if mode not in ('created','updated','unchanged'):
+        return fail_submit(state, day, f'提交服务返回了无法识别的结果:{str(body)[:200]}')
     state['report_status']='submitted'; state['submitted_count']=len(included)
     state['submit_status']='submitted'; state['submit_error']=None; state['last_error']=None
+    state['submitted_at']=body.get('submitted_at') or dt.datetime.now(TZ).isoformat()
+    state['submit_mode']=mode
     write_state(state); return state
+
+def fail_submit(state, day, message):
+    debug(f'submit failed: {message}')
+    state['submit_status']='failed'; state['submit_error']=message; state['last_error']=message
+    write_state(state); return state
+
+def check_submit(data=None):
+    """调 GET /api/v1/me 校验地址与 Key,供设置界面"测试连接"并回填姓名。
+
+    传入 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
+    """
+    load_env(); data=data or {}
+    target=(data.get('submit_url') or os.getenv('DIGEST_SUBMIT_URL') or '').strip()
+    key=(data.get('submit_api_key') or os.getenv('DIGEST_API_KEY') or '').strip()
+    if not target or not key: raise ValueError('未配置提交地址或 API Key')
+    req=urllib.request.Request(target.rstrip('/')+'/api/v1/me', headers={'Authorization':'Bearer '+key}, method='GET')
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
+            body=json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f'HTTP {exc.code}: {exc.read().decode("utf-8","replace")[:200]}')
+    except Exception as exc:
+        raise ValueError(f'{type(exc).__name__}: {exc}')
+    return {'member':body.get('member',''),'member_id':body.get('member_id','')}
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); ap.add_argument('--app-command'); args=ap.parse_args()

@@ -75,6 +75,10 @@ Run the engine and the tray app from source against an isolated data directory u
 
 `generate --mode=malformed|error500|hang` injects LLM failures to exercise the error paths. See `docs/development.md` (Chinese) for the full command list, isolation guarantees and rollback of an installed copy.
 
+## Submission service
+
+Digests are submitted with a configurable **API address + API key** and land in a Feishu Bitable. The service is a zero-dependency Cloudflare Worker in `workers/` (12 unit tests, `npm test`); it authenticates each member by key, validates the payload, and overwrites that member's rows for the day, so a regenerated report replaces the previous one instead of duplicating it. The address and key are entered once in the tray Settings panel and reused from `~/.local/share/daily-agent-digest/.env` (mode 600) thereafter. See `docs/backend-design.md` and `workers/README.md`.
+
 ## Requirements baseline
 
 `docs/requirements.md` is the confirmed requirements baseline (team-internal use, Feishu group reporting, macOS only). It supersedes the earlier production delivery plan.

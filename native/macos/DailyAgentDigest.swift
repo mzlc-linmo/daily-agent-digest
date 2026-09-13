@@ -651,18 +651,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func settings(){
         backend.call("settings") { [weak self] current in
             guard let self = self else { return }
-            let alert = NSAlert(); alert.messageText = "日报设置"; alert.informativeText = "修改后立即用于下一次总结。API Key 只在安装时输入。"
-            let form = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 118))
-            let urlLabel = NSTextField(labelWithString: "Base URL"); urlLabel.frame = NSRect(x: 0, y: 82, width: 100, height: 24)
-            let url = NSTextField(string: current["base_url"] as? String ?? "https://api.deepseek.com/v1"); url.frame = NSRect(x: 108, y: 78, width: 312, height: 28)
-            let modelLabel = NSTextField(labelWithString: "Model"); modelLabel.frame = NSRect(x: 0, y: 42, width: 100, height: 24)
-            let model = NSTextField(string: current["model"] as? String ?? "deepseek-flash"); model.frame = NSRect(x: 108, y: 38, width: 312, height: 28)
-            let key = NSTextField(labelWithString: (current["api_key_set"] as? Bool == true) ? "API Key: 已配置" : "API Key: 未配置"); key.textColor = .secondaryLabelColor; key.frame = NSRect(x: 108, y: 4, width: 312, height: 22)
-            form.addSubview(urlLabel); form.addSubview(url); form.addSubview(modelLabel); form.addSubview(model); form.addSubview(key)
-            alert.accessoryView = form; alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "保存")
-            if presentAlert(alert) == .alertSecondButtonReturn { self.backend.call("save-settings", ["base_url": url.stringValue, "model": model.stringValue]) { result in if let error = result["error"] as? String { let e = NSAlert(); e.messageText = "保存失败"; e.informativeText = error; e.runModal() } } }
+            let alert = NSAlert()
+            alert.messageText = "日报设置"
+            alert.informativeText = "提交地址与 API Key 保存一次即可，之后每次提交自动复用。"
+            let form = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 196))
+            func field(_ label: String, _ value: String, _ y: Int, secure: Bool = false) -> NSTextField {
+                let caption = NSTextField(labelWithString: label)
+                caption.frame = NSRect(x: 0, y: y + 4, width: 104, height: 22)
+                form.addSubview(caption)
+                let input = secure ? NSSecureTextField(string: value) : NSTextField(string: value)
+                input.frame = NSRect(x: 112, y: y, width: 340, height: 26)
+                form.addSubview(input)
+                return input
+            }
+            let url = field("LLM Base URL", current["base_url"] as? String ?? "https://api.deepseek.com/v1", 158)
+            let model = field("Model", current["model"] as? String ?? "deepseek-flash", 124)
+            let submitURL = field("提交地址", current["submit_url"] as? String ?? "", 90)
+            let submitKey = field("提交 API Key", "", 56, secure: true)
+            submitKey.placeholderString = (current["submit_api_key_set"] as? Bool == true) ? "已配置，留空表示不修改" : "dag_…"
+            let llmKey = NSTextField(labelWithString: (current["api_key_set"] as? Bool == true) ? "LLM API Key：已配置" : "LLM API Key：未配置")
+            llmKey.textColor = .secondaryLabelColor
+            llmKey.frame = NSRect(x: 112, y: 24, width: 340, height: 20)
+            form.addSubview(llmKey)
+            alert.accessoryView = form
+            alert.addButton(withTitle: "保存")
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "测试连接")
+
+            switch self.presentAlert(alert) {
+            case .alertFirstButtonReturn:
+                var payload: [String: Any] = ["base_url": url.stringValue, "model": model.stringValue,
+                                              "submit_url": submitURL.stringValue]
+                if !submitKey.stringValue.isEmpty { payload["submit_api_key"] = submitKey.stringValue }
+                self.backend.call("save-settings", payload) { result in
+                    if let error = result["error"] as? String { self.showInfo("保存失败", error) }
+                    else { self.showInfo("已保存", "提交地址与 API Key 已写入本地配置，之后无需再次输入。") }
+                }
+            case .alertThirdButtonReturn:
+                // 测试"当前输入"的值,不必先保存。
+                var payload: [String: Any] = ["submit_url": submitURL.stringValue]
+                if !submitKey.stringValue.isEmpty { payload["submit_api_key"] = submitKey.stringValue }
+                self.backend.call("check-submit", payload) { result in
+                    if let error = result["error"] as? String {
+                        self.showInfo("连接失败", error)
+                    } else {
+                        let member = result["member"] as? String ?? "未知"
+                        self.showInfo("连接成功", "服务端识别为该成员：\(member)\n确认无误后点“保存”。")
+                    }
+                }
+            default:
+                break
+            }
         }
     }
+
+    /// 统一的小提示弹窗(始终置顶)。
+    func showInfo(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        presentAlert(alert)
+    }
+
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }
 }
 
