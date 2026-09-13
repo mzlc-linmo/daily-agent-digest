@@ -234,7 +234,7 @@ def app_state(day=None):
     return state
 
 def settings():
-    load_env(); return {'base_url':os.getenv('LLM_BASE_URL','https://api.deepseek.com/v1'),'model':os.getenv('LLM_MODEL','deepseek-flash'),'api_key_set':bool(os.getenv('LLM_API_KEY'))}
+    load_env(); return {'base_url':os.getenv('LLM_BASE_URL','https://api.deepseek.com/v1'),'model':os.getenv('LLM_MODEL','deepseek-flash'),'api_key_set':bool(os.getenv('LLM_API_KEY')),'release_version':RELEASE_VERSION}
 
 def save_settings(data):
     APP_DIR.mkdir(parents=True, exist_ok=True); path=APP_DIR/'.env'; old={}

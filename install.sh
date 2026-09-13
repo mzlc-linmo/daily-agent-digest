@@ -90,6 +90,8 @@ set -eu
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 export LLM_BASE_URL LLM_API_KEY LLM_MODEL
 export DIGEST_OUTPUT_DIR=\${DIGEST_OUTPUT_DIR:-"$APP_DIR"}
+# 定时任务也要写入本次安装的版本号,否则 CLI 生成的日报无法追溯引擎版本。
+export DIGEST_RELEASE_VERSION=\${DIGEST_RELEASE_VERSION:-"$release_tag"}
 exec "$APP_DIR/daily-agent-digest" "\$@"
 EOF
 chmod 755 "$APP_DIR/run.sh"

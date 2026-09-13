@@ -437,7 +437,7 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let backend=Backend(); var statusItem:NSStatusItem!; var report:ReportController!; var timer:Timer!; var progressPanel:NSPanel?; var generationBackgrounded=false
-    func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image=NSImage(systemSymbolName:"checklist", accessibilityDescription:"Daily Agent Digest"); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); let tickTimer=Timer(timeInterval:60,repeats:true){ _ in self.backend.call("tick") { _ in } }; RunLoop.main.add(tickTimer,forMode:.common); timer=tickTimer; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_AUTOGENERATE"] == "1" { DebugLog.write("auto generate requested by DIGEST_DEBUG_AUTOGENERATE"); self.perform(#selector(self.generate), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWREPORT"] == "1" { DebugLog.write("report window requested by DIGEST_DEBUG_SHOWREPORT"); self.perform(#selector(self.show), with: nil, afterDelay: 1.0) } }
+    func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image=NSImage(systemSymbolName:"checklist", accessibilityDescription:"Daily Agent Digest"); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); let tickTimer=Timer(timeInterval:60,repeats:true){ _ in self.backend.call("tick") { _ in } }; RunLoop.main.add(tickTimer,forMode:.common); timer=tickTimer; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_AUTOGENERATE"] == "1" { DebugLog.write("auto generate requested by DIGEST_DEBUG_AUTOGENERATE"); self.perform(#selector(self.generate), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWREPORT"] == "1" { DebugLog.write("report window requested by DIGEST_DEBUG_SHOWREPORT"); self.perform(#selector(self.show), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWABOUT"] == "1" { DebugLog.write("about requested by DIGEST_DEBUG_SHOWABOUT"); self.perform(#selector(self.about), with: nil, afterDelay: 1.0) } }
     @objc func show(){
         report.refresh()
         report.showWindow(nil)
@@ -516,7 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.messageText = "生成失败"
             alert.informativeText = reason
             alert.addButton(withTitle: "确定")
-            alert.runModal()
+            presentAlert(alert)
             DebugLog.write("generation reported failure: \(reason)")
             report.refresh()
         } else {
@@ -526,9 +526,149 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: "查看今日总结")
             alert.addButton(withTitle: "关闭")
             DebugLog.write("generation result alert shown items=\(count)")
-            if alert.runModal() == .alertFirstButtonReturn { show() }
+            if presentAlert(alert) == .alertFirstButtonReturn { show() }
         }
     }
+    /// 菜单栏(accessory)应用的弹窗不会自动浮到前台,必须显式激活并置顶,
+    /// 否则 alert 可能整体藏在浏览器/聊天窗口之后(D-23 的同一类问题)。
+    @discardableResult
+    func presentAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.level = .floating
+        return alert.runModal()
+    }
+
+    // MARK: - 版本信息与更新检查
+
+    /// 从 "v0.5.0" / "dev-a3f9c1b" 取数字段;非数字版本(开发构建)返回 nil。
+    static func versionNumbers(_ tag: String) -> [Int]? {
+        let cleaned = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let parts = cleaned.split(separator: ".").map { Int($0.prefix(while: { $0.isNumber })) }
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
+        return parts.map { $0! }
+    }
+
+    /// candidate 是否比 current 新;任一版本不是数字版本时返回 nil(无法比较)。
+    static func isNewer(_ candidate: String, than current: String) -> Bool? {
+        guard let a = versionNumbers(candidate), let b = versionNumbers(current) else { return nil }
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    /// 运行中的版本信息:应用包、UI 构建、引擎自报版本与路径。
+    func releaseInfo() -> [(String, String)] {
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let uiBuild = Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") as? String ?? "unknown"
+        let home = ProcessInfo.processInfo.environment["DIGEST_HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest"
+        return [
+            ("应用版本", appVersion),
+            ("UI 构建", uiBuild),
+            ("引擎版本", report.stateRelease),
+            ("引擎路径", backend.executable),
+            ("应用路径", Bundle.main.bundlePath),
+            ("数据目录", home),
+        ]
+    }
+
+    /// 查询发布仓库的最新 release tag。只有用户显式触发(点击按钮或
+    /// --check-version)时才会联网。
+    static func fetchLatestVersion(completion: @escaping (Result<String, Error>) -> Void) {
+        let urlString = ProcessInfo.processInfo.environment["DIGEST_RELEASES_API"]
+            ?? "https://api.github.com/repos/mzlc-linmo/daily-agent-digest-distribution/releases/latest"
+        guard let url = URL(string: urlString) else {
+            completion(.failure(NSError(domain: "digest", code: 1,
+                                        userInfo: [NSLocalizedDescriptionKey: "无法解析发布仓库地址"])))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        // ephemeral:版本检查不该在磁盘上留下缓存数据库
+        URLSession(configuration: .ephemeral).dataTask(with: request) { data, _, error in
+            if let error = error { completion(.failure(error)); return }
+            guard let data = data,
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let tag = obj["tag_name"] as? String else {
+                completion(.failure(NSError(domain: "digest", code: 2,
+                                            userInfo: [NSLocalizedDescriptionKey: "发布仓库没有返回可识别的版本号"])))
+                return
+            }
+            completion(.success(tag))
+        }.resume()
+    }
+
+    /// 把"当前版本 vs 最新版本"翻译成一句人话。
+    static func versionVerdict(current: String, latest: String) -> String {
+        guard let newer = isNewer(latest, than: current) else {
+            return "当前是开发构建(\(current)),无法与发布版本 \(latest) 比较。"
+        }
+        return newer
+            ? "有新版本可用:最新 \(latest),当前 \(current)。"
+            : "当前已是最新版本(\(current))。"
+    }
+
+    /// 当前版本信息:应用包、UI 构建、引擎自报版本、报告生成时的引擎版本与路径。
+    func releaseInfo(engineVersion: String) -> [(String, String)] {
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let uiBuild = Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") as? String ?? "unknown"
+        let home = ProcessInfo.processInfo.environment["DIGEST_HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest"
+        return [
+            ("应用版本", appVersion),
+            ("UI 构建", uiBuild),
+            ("引擎版本(当前)", engineVersion),
+            ("今天的报告由", report.stateRelease),
+            ("引擎路径", backend.executable),
+            ("应用路径", Bundle.main.bundlePath),
+            ("数据目录", home),
+        ]
+    }
+
+    @objc func about(){
+        // 先问引擎它自己的版本:state 里的 release_version 是"生成报告时的版本",
+        // 直接显示会让人以为当前跑的就是那个版本。
+        backend.call("settings") { [weak self] info in
+            guard let self = self else { return }
+            let engine = info["release_version"] as? String ?? "unknown"
+            let rows = self.releaseInfo(engineVersion: engine)
+            let body = rows.map { "\($0.0):\($0.1)" }.joined(separator: "\n")
+            DebugLog.write("about shown " + rows.map { "\($0.0)=\($0.1)" }.joined(separator: " "))
+            let alert = NSAlert()
+            alert.messageText = "关于 Daily Agent Digest"
+            alert.informativeText = body + "\n\n点击“检查最新版本”会向发布仓库查询最新版本号。"
+            alert.addButton(withTitle: "检查最新版本")
+            alert.addButton(withTitle: "关闭")
+            if self.presentAlert(alert) == .alertFirstButtonReturn {
+                self.checkLatestVersion(current: rows[0].1)
+            }
+        }
+    }
+
+    /// 用户显式点击时才联网:请求公共发布仓库的最新 release tag。
+    func checkLatestVersion(current: String){
+        DebugLog.write("version check start current=\(current)")
+        AppDelegate.fetchLatestVersion { [weak self] result in
+            let message: String
+            switch result {
+            case .success(let latest): message = AppDelegate.versionVerdict(current: current, latest: latest)
+            case .failure(let error): message = "检查失败:\(error.localizedDescription)"
+            }
+            DebugLog.write("version check done: \(message)")
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "版本检查"
+                alert.informativeText = message
+                alert.addButton(withTitle: "好")
+                self?.presentAlert(alert)
+            }
+        }
+    }
+
     @objc func settings(){
         backend.call("settings") { [weak self] current in
             guard let self = self else { return }
@@ -541,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let key = NSTextField(labelWithString: (current["api_key_set"] as? Bool == true) ? "API Key: 已配置" : "API Key: 未配置"); key.textColor = .secondaryLabelColor; key.frame = NSRect(x: 108, y: 4, width: 312, height: 22)
             form.addSubview(urlLabel); form.addSubview(url); form.addSubview(modelLabel); form.addSubview(model); form.addSubview(key)
             alert.accessoryView = form; alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "保存")
-            if alert.runModal() == .alertSecondButtonReturn { self.backend.call("save-settings", ["base_url": url.stringValue, "model": model.stringValue]) { result in if let error = result["error"] as? String { let e = NSAlert(); e.messageText = "保存失败"; e.informativeText = error; e.runModal() } } }
+            if presentAlert(alert) == .alertSecondButtonReturn { self.backend.call("save-settings", ["base_url": url.stringValue, "model": model.stringValue]) { result in if let error = result["error"] as? String { let e = NSAlert(); e.messageText = "保存失败"; e.informativeText = error; e.runModal() } } }
         }
     }
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }
@@ -628,6 +768,24 @@ enum SelfTest {
             print("FAIL included char count wrong -> \(chars)")
         }
 
+        // 版本比较:用于判断当前运行的版本是否最新。
+        let cases: [(String, String, Bool?)] = [
+            ("v0.5.1", "v0.5.0", true),
+            ("v0.5.0", "v0.5.0", false),
+            ("v0.5.0", "v0.5.1", false),
+            ("v0.6.0", "v0.5.9", true),
+            ("v0.5.10", "v0.5.9", true),
+            ("dev-a3f9c1b", "v0.5.0", nil),
+            ("v0.5.0", "dev-a3f9c1b", nil),
+        ]
+        let wrong = cases.filter { AppDelegate.isNewer($0.0, than: $0.1) != $0.2 }
+        if wrong.isEmpty {
+            print("PASS version comparison identifies newer, equal, older and dev builds")
+        } else {
+            passed = false
+            print("FAIL version comparison wrong for \(wrong.map { "\($0.0) vs \($0.1)" })")
+        }
+
         let shortHeight = ReportController.textHeight("短标题", font: font, width: width)
         if shortHeight <= 0 || shortHeight > 26 {
             passed = false
@@ -639,6 +797,25 @@ enum SelfTest {
         _ = row
         return passed
     }
+}
+
+if CommandLine.arguments.contains("--check-version") {
+    // 无头版本检查:便于脚本与 CI 验证"当前版本是否最新"这条链路。
+    let current = CommandLine.arguments.first(where: { $0.hasPrefix("--current=") })
+        .map { String($0.dropFirst("--current=".count)) }
+        ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown")
+    let semaphore = DispatchSemaphore(value: 0)
+    var output = "检查失败:没有返回结果"
+    AppDelegate.fetchLatestVersion { result in
+        switch result {
+        case .success(let latest): output = AppDelegate.versionVerdict(current: current, latest: latest)
+        case .failure(let error): output = "检查失败:\(error.localizedDescription)"
+        }
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 20)
+    print(output)
+    exit(output.hasPrefix("检查失败") ? 1 : 0)
 }
 
 if CommandLine.arguments.contains("--self-test") {

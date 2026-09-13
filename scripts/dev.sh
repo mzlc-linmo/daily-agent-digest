@@ -63,7 +63,9 @@ ensure_setup() {
 export DIGEST_HOME="\${DIGEST_HOME:-$DEV_HOME}"
 export DIGEST_SOURCE_ROOT="\${DIGEST_SOURCE_ROOT:-$DEV_SOURCE}"
 export DIGEST_OUTPUT_DIR="\${DIGEST_OUTPUT_DIR:-$DEV_HOME}"
-export DIGEST_RELEASE_VERSION="\${DIGEST_RELEASE_VERSION:-dev-$(git_sha)}"
+# 运行时解析版本号,这样「关于」里的引擎版本不会随提交而过期。
+DIGEST_SHA=\$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+export DIGEST_RELEASE_VERSION="\${DIGEST_RELEASE_VERSION:-dev-\$DIGEST_SHA}"
 export DIGEST_DEBUG="\${DIGEST_DEBUG:-1}"
 exec "$PYTHON" "$ENGINE_SRC" "\$@"
 EOF
