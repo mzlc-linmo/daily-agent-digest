@@ -414,13 +414,13 @@ def summarize(events, day):
     by={}
     for e in events: by.setdefault(e['provider'],set()).add(e['session_id'])
     payload={'schema_version':'1.0','date':day,'timezone':'Asia/Shanghai','coverage':{'events':len(events),'sessions':sum(map(len,by.values())),'providers':sorted(by),'limitations':[]},'work_items':[{'id':hashlib.sha256(p.encode()).hexdigest()[:16],'title':f"{p} 工作记录（待 LLM 分类）",'desc':f'该来源当天有 {len(sessions)} 个会话，等待 LLM 按工作主题归并。','status':'observed','source_task_ids':sorted(sessions),'excluded':False} for p,sessions in by.items()],'blockers':[],'decisions':[],'artifacts':[],'sources':[{'provider':e['provider'],'task_id':e['session_id'],'turn_ids':[e['item_id']],'observed_at':e['timestamp']} for e in events]}
+    # 选材统计与 LLM 是否可用无关:降级报告也应该能说明"本来会送什么"。
+    context, stats = build_context(events)
+    payload['coverage']['context'] = stats
+    payload['coverage']['limitations'].append(context_note(stats))
+    debug(f"context: {context_note(stats)}")
     base, key, model = llm_config()
     if base and key and model:
-        # 在预算内选材:去重 -> 排除自动化 -> 按信号分层 + 来源轮转(FR-2)。
-        context, stats = build_context(events)
-        payload['coverage']['context'] = stats
-        payload['coverage']['limitations'].append(context_note(stats))
-        debug(f"context: {context_note(stats)}")
         system='''你是日报整理器。把当天所有 agent 对话按“工作主题”聚类，每个主题写成一项独立内容。只保留真实工作内容：开发、工程、运维、研究、业务；排除个人问题、娱乐、闲聊和自动化噪音。一次性处理输入并返回严格 JSON，不要 Markdown：{"work_items":[{"title":"工作主题（不超过 30 字）","desc":"该项工作的完整说明","status":"completed|in_progress|blocked","source_task_ids":["provider/session"]}],"decisions":[],"blockers":[],"next_steps":[]}.
 要求（必须遵守）：
 1. 每一项的 desc 是这一项完整而独立的说明：写清做了什么、为什么做、怎么做的、结果或产出是什么，目标 100-300 字。
