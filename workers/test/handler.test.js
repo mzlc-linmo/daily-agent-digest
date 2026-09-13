@@ -16,7 +16,7 @@ async function makeEnv() {
   const hash = await sha256Hex(SECRET);
   return {
     API_KEYS: JSON.stringify({
-      k1: { hash, member: '张三', member_id: 'zhangsan', enabled: true },
+      k1: { hash, member: '张三', member_id: 'zhangsan', enabled: true, email: 'zhangsan@example.com' },
       k2: { hash, member: '李四', member_id: 'lisi', enabled: false },
     }),
     ADMIN_TOKEN: 'admin-token',
@@ -59,6 +59,13 @@ function fakeFeishu() {
       calls.delete += 1;
       for (const id of ids) rows.delete(id);
     },
+    async resolveOpenIds(_env, emails = []) {
+      calls.resolve = (calls.resolve ?? 0) + 1;
+      const out = {};
+      for (const email of emails) out[email] = email === 'unlinked@example.com' ? '' : `ou_${email.split('@')[0]}`;
+      return out;
+    },
+    async updateField() { return {}; },
     async healthcheck() { return true; },
     async listTables() { return [{ table_id: 'tbl_test', name: '日报明细' }]; },
     async listFields() { return Object.values(FIELDS).map((field_name) => ({ field_name })); },
@@ -97,14 +104,17 @@ test('首次提交创建行,一行一个工作项', async () => {
   assert.equal(feishu.rows.size, 2);
   const fields = [...feishu.rows.values()][0];
   assert.equal(fields[FIELDS.submitId], 'zhangsan-2026-09-13');
-  assert.equal(fields[FIELDS.member], '张三');
+  assert.deepEqual(fields[FIELDS.member], [{ id: 'ou_zhangsan' }], '成员是人员字段,写入 open_id');
+  assert.equal(fields[FIELDS.memberId], 'zhangsan');
   assert.equal(fields[FIELDS.sources][0], 'codex');
+  assert.equal(body.member_linked, true);
 });
 
 test('成员身份由 Key 决定,请求体里的名字不被采信', async () => {
   const feishu = fakeFeishu();
   await handleRequest(post('/api/v1/digests', { ...REPORT, member: '李四', member_id: 'lisi' }), ENV, { feishu });
-  assert.equal([...feishu.rows.values()][0][FIELDS.member], '张三');
+  assert.equal([...feishu.rows.values()][0][FIELDS.memberId], 'zhangsan');
+  assert.deepEqual([...feishu.rows.values()][0][FIELDS.member], [{ id: 'ou_zhangsan' }]);
 });
 
 test('同一天内容不变时幂等返回,不写表', async () => {
@@ -129,6 +139,29 @@ test('同一天内容变化时覆盖,行数不变', async () => {
   assert.equal(body.mode, 'updated');
   assert.equal(feishu.rows.size, 1, '工作项变少时多余的行应被删除');
   assert.equal([...feishu.rows.values()][0][FIELDS.desc], '改了内容');
+});
+
+test('解析不到 open_id 时成员列留空,但提交仍然成功', async () => {
+  const feishu = fakeFeishu();
+  const env = {
+    ...ENV,
+    API_KEYS: JSON.stringify({ k9: { hash: await sha256Hex(SECRET), member: '王五', member_id: 'wangwu',
+                                     email: 'unlinked@example.com', enabled: true } }),
+  };
+  const res = await handleRequest(post('/api/v1/digests', REPORT, { key: `dag_k9_${SECRET}` }), env, { feishu });
+  const body = await res.json();
+  assert.equal(res.status, 201, '解析不到人不应该让提交失败');
+  assert.equal(body.member_linked, false);
+  assert.equal([...feishu.rows.values()][0][FIELDS.member], undefined, '宁可不写,也不写错类型');
+});
+
+test('通讯录接口报错时不影响提交', async () => {
+  const feishu = fakeFeishu();
+  feishu.resolveOpenIds = async () => { throw new Error('缺少通讯录权限'); };
+  const res = await handleRequest(post('/api/v1/digests', REPORT), ENV, { feishu });
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.equal(body.member_linked, false);
 });
 
 test('拒绝无效 Key、停用成员与格式错误的 Key', async () => {

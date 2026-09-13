@@ -61,6 +61,9 @@ export async function authenticate(request, env) {
     key_id: parsed.keyId,
     member: String(entry.member ?? parsed.keyId),
     member_id: String(entry.member_id ?? parsed.keyId),
+    // 成员字段是「人员」类型:优先用直接配好的 open_id,否则用邮箱在提交时解析。
+    open_id: entry.open_id ? String(entry.open_id) : '',
+    email: entry.email ? String(entry.email) : '',
   };
 }
 

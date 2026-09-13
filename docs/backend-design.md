@@ -113,7 +113,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 
 ## 5. 鉴权与密钥管理
 
-- 一把 Key 绑定一个成员,格式 `dag_<key_id>_<secret>`;服务端**只存 `sha256(secret)`**,用恒定时间比较。
+- 一把 Key 绑定一个成员,格式 `dag_<key_id>_<secret>`;服务端**只存 `sha256(secret)`**,用恒定时间比较。条目里的 `email` 用于把「成员」人员字段关联到通讯录(需要 `contact:user.id:readonly`),也可直接给 `open_id` 跳过解析。
 - **Serverless 下的存放方式**:Key 表放在**云函数的环境变量 / 平台密钥配置**里,内容是一个 JSON:`{"<key_id>": {"hash": "...", "member": "张三", "member_id": "zhangsan", "enabled": true}}`。3–10 人的规模下最简;轮换 = 改配置后重新部署。
 - 若希望**不重新部署就能增删成员**,可改为在同一个多维表格里加一张「成员」表,函数读取并缓存 60 秒。作为可选升级项,不在 MVP 内。
 - 客户端把 Key 存在 `.env`(权限 `0600`),设置界面只写不回显(沿用 FR-11.3)。
@@ -127,7 +127,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | --- | --- | --- |
 | 提交ID | 文本 | `{member_id}-{date}`;幂等与覆盖的检索键 |
 | 日期 | 日期 | 建议作为排序主字段 |
-| 成员 | 文本(或"人员") | 由 Key 推导;同租户内可用人员字段支持筛选 |
+| 成员 | **人员(关联飞书通讯录,type=11)** | 由 Key 推导后写入 `[{"id": "<open_id>"}]`;需要应用具备 `contact:user.id:readonly` 才能把邮箱解析成 open_id。解析不到时该列留空,但提交照常成功 |
 | 标题 | 文本 | 工作项标题 |
 | 内容 | 多行文本 | 工作项正文 |
 | 状态 | 单选 | `completed` / `in_progress` / `blocked` |
@@ -140,7 +140,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 
 ### 6.2 飞书侧准备步骤
 
-1. 开发者后台创建**自建应用**,开通 `bitable:app`(读写多维表格)。
+1. 开发者后台创建**自建应用**,开通 `bitable:app`(读写多维表格);若「成员」列要关联通讯录,还需开通 **`contact:user.id:readonly`**(把邮箱解析成 open_id)。
 2. 把应用添加为目标多维表格的**协作者**(或在文档「…」→ 添加文档应用),否则写表报权限错误。
 3. **发布应用版本**(权限变更需重新发布才生效)。
 4. 记录 `app_token`(URL 中 `/base/` 之后那段)与 `table_id`(`?table=` 参数),写进函数环境变量。
@@ -249,11 +249,22 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | 客户端:提交载荷 + `Idempotency-Key` + 失败语义 | **已实现** | `daily_agent_digest.py` 的 `submit()` |
 | 客户端:Key 校验与姓名回填(`check-submit` → `GET /api/v1/me`) | **已实现** | 同上 + 设置面板「测试连接」 |
 | 端到端(引擎 → 假服务) | **已验证** | 请求头、载荷字段、只上报未排除项、`check-submit` 回填成员 |
-| 真实飞书表格写入 | **待部署后验证** | 需要 `BITABLE_APP_TOKEN` 与协作者/发布确认 |
+| 真实飞书表格写入 | **已验证** | 独立 base「团队日报」/ 表「日报明细」已建,今日 6 项真实工作已写入 |
 
 尚未完成:Cloudflare 侧的实际部署与 bootstrap(需要你的 `app_token`);`GET /api/v1/digests?date=` 目前只被测试覆盖,客户端暂未使用。
 
-## 16. 已确认决策
+## 16. 部署与验证记录(2026-09-13)
+
+| 项 | 值 |
+| --- | --- |
+| Worker 地址 | `https://daily-agent-digest-submit.mzlc.workers.dev` |
+| 多维表格 | base「团队日报」`JHoFbrmTBaTN8nsmoYScZyTpnEb`,表「日报明细」`tbl77oxPmPcVVyVz` |
+| 飞书应用 | `cli_aa13a11707b89bdb`(凭据存于本机钥匙串 `zentao.mzlc.me`) |
+| secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
+| 已核验 | `/healthz` ok;bootstrap 幂等;鉴权边界(无 Key/错 Key → 401、未知路径 → 404);`created → unchanged → updated → unchanged` 且同日行数恒为 1;真实写入 6 行 |
+| 待办 | 应用需开通 `contact:user.id:readonly` 并重新发布,「成员」列才会关联到通讯录 |
+
+## 17. 已确认决策
 
 | 编号 | 问题 | 决策 |
 | --- | --- | --- |

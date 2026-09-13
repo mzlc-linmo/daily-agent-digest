@@ -138,6 +138,41 @@ export async function listFields(env) {
   return data.items ?? [];
 }
 
+export async function updateField(env, fieldId, body) {
+  return call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/fields/${fieldId}`, {
+    method: 'PUT',
+    body,
+  });
+}
+
+/// 把邮箱/手机号解析成 open_id(同一应用内有效)。结果按输入缓存,避免每次提交都查。
+const userIdCache = new Map();
+
+export function __resetUserIdCache() {
+  userIdCache.clear();
+}
+
+export async function resolveOpenIds(env, emails = [], mobiles = []) {
+  const missing = [...emails, ...mobiles].filter((key) => key && !userIdCache.has(key));
+  if (missing.length) {
+    const data = await call(env, '/contact/v3/users/batch_get_id', {
+      method: 'POST',
+      query: { user_id_type: 'open_id' },
+      body: { emails, mobiles },
+    });
+    for (const entry of data.user_list ?? []) {
+      const openId = entry.user_id ?? entry.open_id ?? '';
+      for (const key of [entry.email, entry.mobile]) {
+        if (key) userIdCache.set(key, openId);
+      }
+    }
+    for (const key of missing) if (!userIdCache.has(key)) userIdCache.set(key, '');
+  }
+  const resolved = {};
+  for (const key of [...emails, ...mobiles]) if (key) resolved[key] = userIdCache.get(key) ?? '';
+  return resolved;
+}
+
 export async function createField(env, field) {
   return call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/fields`, {
     method: 'POST',

@@ -44,13 +44,27 @@ export async function submitDigest(request, env, feishu, now) {
   const report = validatePayload(body);
   const fingerprint = await contentFingerprint(report);
   const submitId = `${member.member_id}-${report.date}`;
-  const rows = toRows(report, member, submitId, fingerprint, now());
+
+  // 成员是「人员」字段:把邮箱解析成 open_id(需要 contact:user.id:readonly)。
+  // 解析失败不影响提交,只是这一列为空,并在返回里标出 member_linked=false。
+  let openId = member.open_id;
+  if (!openId && member.email) {
+    try {
+      const resolved = await feishu.resolveOpenIds(env, [member.email], []);
+      openId = resolved[member.email] ?? '';
+    } catch (err) {
+      console.warn(`open_id 解析失败(成员字段将留空):${err.message}`);
+    }
+  }
+  const linkedMember = { ...member, open_id: openId };
+  const rows = toRows(report, linkedMember, submitId, fingerprint, now());
   const existing = await feishu.findRecordsBySubmitId(env, submitId);
 
   const meta = {
     submission_id: `sub_${crypto.randomUUID()}`,
     member: member.member,
     member_id: member.member_id,
+    member_linked: Boolean(openId),
     date: report.date,
     submitted_at: new Date(now()).toISOString(),
   };
@@ -126,7 +140,18 @@ export async function bootstrap(request, env, feishu) {
   }
 
   const scoped = { ...env, BITABLE_TABLE_ID: tableId };
-  const present = new Set((await feishu.listFields(scoped)).map((field) => field.field_name));
+  const current = await feishu.listFields(scoped);
+  const byName = new Map(current.map((field) => [field.field_name, field]));
+  // 历史遗留:成员曾是文本字段,现在必须是人员字段(关联通讯录)。
+  const legacyMember = byName.get(FIELDS.member);
+  if (legacyMember && legacyMember.type !== 11) {
+    const renamed = `${FIELDS.member}文本`;
+    await feishu.updateField(scoped, legacyMember.field_id, { field_name: renamed, type: legacyMember.type });
+    byName.delete(FIELDS.member);
+    byName.set(renamed, { ...legacyMember, field_name: renamed });
+    created.push(`renamed:${FIELDS.member}->${renamed}`);
+  }
+  const present = new Set(byName.keys());
   for (const definition of FIELD_DEFS) {
     if (present.has(definition.field_name)) {
       existingFields.push(definition.field_name);

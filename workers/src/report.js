@@ -30,7 +30,8 @@ export const FIELDS = {
 export const FIELD_DEFS = [
   { field_name: FIELDS.submitId, type: 1 },
   { field_name: FIELDS.date, type: 5, property: { date_formatter: 'yyyy/MM/dd', auto_fill: false } },
-  { field_name: FIELDS.member, type: 1 },
+  // 人员字段(关联飞书通讯录):写入 [{"id": "<open_id>"}],需要 contact:user.id:readonly 才能把邮箱解析成 open_id
+  { field_name: FIELDS.member, type: 11 },
   { field_name: FIELDS.memberId, type: 1 },
   { field_name: FIELDS.title, type: 1 },
   { field_name: FIELDS.desc, type: 1 },
@@ -119,12 +120,16 @@ export function timingSafeEqualHex(a, b) {
 }
 
 /// 把校验后的报告转成多维表格行(一行一个工作项)。
+///
+/// 成员字段是「人员」类型,写入的是 open_id 数组;解析不到时留空而不是写错类型
+/// —— 宁可这一列空着,也不能让整次提交失败。
 export function toRows(report, member, submitId, fingerprint, submittedAtMs) {
+  const person = member.open_id ? [{ id: member.open_id }] : undefined;
   return report.items.map((item) => ({
     fields: {
       [FIELDS.submitId]: submitId,
       [FIELDS.date]: Date.parse(`${report.date}T00:00:00+08:00`),
-      [FIELDS.member]: member.member,
+      ...(person ? { [FIELDS.member]: person } : {}),
       [FIELDS.memberId]: member.member_id,
       [FIELDS.title]: item.title,
       [FIELDS.desc]: item.desc,
