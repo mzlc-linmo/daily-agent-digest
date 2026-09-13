@@ -82,61 +82,42 @@ def strip_code_fence(text):
         text = '\n'.join(lines)
     return text.strip()
 
-def signal_rank(event):
-    """0 = 人的意图/助手叙述,1 = 未知,2 = 机器输出与流程事件。"""
-    kind = str(event.get('kind') or '')
-    if kind in HIGH_SIGNAL_KINDS: return 0
-    if kind in LOW_SIGNAL_KINDS: return 2
-    return 1
-
-def is_automation(event):
-    """定时脚本/自动化任务的记录在本地直接排除,不占用模型的上下文预算。"""
-    kind = str(event.get('kind') or '').lower()
-    if kind == 'automation': return True
-    text = str(event.get('text') or '')
-    return 'automation_u' in text or '"name": "automation' in text or '"name":"automation' in text
+# 抽取层已经只留下提示词/最终文本/交付物,所以这里不再需要任何关键词匹配。
+ROLE_TIERS = ('prompt', 'result', 'deliverable', 'process')
 
 def build_context(events, limit=CONTEXT_CHAR_LIMIT):
     """在预算内挑选送进 LLM 的摘录,返回 (上下文文本, 统计)。
 
-    规则:先本地去重,再排除自动化记录,然后按「人的意图 → 其他 → 机器输出」分层,
-    并在各来源之间轮转取样,任何一个来源的体量都不会把别的来源挤掉。
+    分层:人的提示词 → AI 的最终文本 → 交付物(→ 过程,仅当显式开启)。
+    各来源之间轮转取样,任一来源的体量都不会把别的来源挤掉。
     """
-    seen = set(); pool = []; automation = 0
+    seen = set(); pool = []
     for e in events:
-        if is_automation(e):
-            automation += 1
-            continue
         text = ' '.join(str(e.get('text') or '').split())
+        if not text: continue
         fingerprint = hashlib.sha256(text[:800].encode()).hexdigest()
         if fingerprint in seen: continue
         seen.add(fingerprint)
-        pool.append((e, f"[{e['provider']}] {text[:EXCERPT_CHAR_MAX]}"))
+        pool.append((e, f"[{e['provider']}/{e.get('role','?')}] {text[:EXCERPT_CHAR_MAX]}"))
 
     providers = sorted({e['provider'] for e, _ in pool})
-    tiers = {}
-    for p in providers:
-        rows = [x for x in pool if x[0]['provider'] == p]
-        tiers[p] = (
-            [x for x in rows if signal_rank(x[0]) == 0],
-            [x for x in rows if signal_rank(x[0]) == 1],
-            [x for x in rows if signal_rank(x[0]) == 2],
-        )
+    tiers = {p: {role: [] for role in ROLE_TIERS} for p in providers}
+    for e, text in pool:
+        tiers[e['provider']][str(e.get('role') or 'process')].append((e, text))
 
-    kept = []; used = 0
-    taken = {p: 0 for p in providers}
-    for tier in range(3):
+    kept = []; used = 0; taken = {p: 0 for p in providers}; sent_roles = {role: 0 for role in ROLE_TIERS}
+    for role in ROLE_TIERS:
         cursor = {p: 0 for p in providers}
         while True:
             progressed = False
             for p in providers:
-                rows = tiers[p][tier]
+                rows = tiers[p][role]
                 while cursor[p] < len(rows):
                     text = rows[cursor[p]][1]
-                    if used + len(text) + 1 > limit:
-                        break
+                    if used + len(text) + 1 > limit: break
                     cursor[p] += 1; taken[p] += 1
                     kept.append(text); used += len(text) + 1
+                    sent_roles[role] += 1
                     progressed = True
             if not progressed: break
 
@@ -144,20 +125,28 @@ def build_context(events, limit=CONTEXT_CHAR_LIMIT):
     stats = {
         'events': len(events),
         'unique': len(pool),
-        'automation_excluded': automation,
         'sent': len(kept),
         'chars': used,
         'char_limit': limit,
         'sent_by_provider': {p: taken[p] for p in providers},
+        'collected_by_role': {role: sum(1 for e in events if str(e.get('role') or 'process') == role)
+                              for role in ROLE_TIERS},
+        'sent_by_role': sent_roles,
         'omitted_by_provider': {p: n for p, n in omitted.items() if n},
     }
     return '\n'.join(kept), stats
 
 def context_note(stats):
     """一行人类可读的选材说明,写入报告以便知道有什么没进模型。"""
-    parts = [f"当天采集 {stats['events']} 条 → 去重 {stats['unique']} 条",
-             f"排除自动化 {stats['automation_excluded']} 条",
-             f"送模型 {stats['sent']} 条 / {stats['chars']} 字符(上限 {stats['char_limit']})"]
+    if not stats: return ''
+    collected = stats.get('collected_by_role') or {}
+    sent = stats.get('sent_by_role') or {}
+    detail = f"提示词 {collected.get('prompt',0)} / 最终文本 {collected.get('result',0)}"
+    if collected.get('deliverable'): detail += f" / 交付物 {collected['deliverable']}"
+    parts = [f"当天入库 {stats.get('unique',0)} 条({detail})",
+             f"送模型 {stats.get('sent',0)} 条(提示词 {sent.get('prompt',0)} / 最终文本 {sent.get('result',0)}"
+             f"{' / 交付物 ' + str(sent.get('deliverable')) if sent.get('deliverable') else ''})"
+             f" / {stats.get('chars',0)} 字符(上限 {stats.get('char_limit')})"]
     if stats['omitted_by_provider']:
         detail = '、'.join(f"{p} {n} 条" for p, n in sorted(stats['omitted_by_provider'].items()))
         parts.append(f"因预算省略:{detail}")
@@ -277,54 +266,146 @@ def in_window(value, start, end):
         except ValueError: return False
     return start <= stamp < end
 
+MESSAGE_CHAR_MAX = 4000      # 单条提示词/最终文本的上限(抽取之后再截断)
+
+def parts_text(content):
+    """从 content 分片里取正文,忽略 reasoning/thinking/toolCall/tool-result。"""
+    if isinstance(content, str): return ' '.join(content.split())
+    if not isinstance(content, list): return ''
+    out = []
+    for part in content:
+        if isinstance(part, dict) and part.get('type') == 'text':
+            out.append(str(part.get('text') or ''))
+    return ' '.join(' '.join(out).split())
+
+def extract_codex(item_type, data):
+    kind = str(item_type or '')
+    if kind == 'userMessage':
+        return 'prompt', parts_text(data.get('content')) or str(data.get('text') or '')
+    if kind == 'agentMessage':
+        return 'result', str(data.get('text') or '') or parts_text(data.get('content'))
+    return None, None
+
+def extract_dsh(obj):
+    """只认 user/message、assistant/message 的正文与 deliverables/presented。"""
+    kind = str(obj.get('type') or '')
+    data = obj.get('data') or {}
+    if kind == 'user/message':
+        return 'prompt', parts_text(data.get('content'))
+    if kind == 'assistant/message':
+        return 'result', parts_text((data.get('message') or {}).get('content'))
+    if kind == 'deliverables/presented':
+        files = data.get('files') or []
+        text = '; '.join(f"{f.get('path','')} {f.get('description','')}".strip()
+                         for f in files if isinstance(f, dict))
+        return 'deliverable', text
+    return None, None
+
+def extract_pi(obj):
+    if str(obj.get('type') or '') != 'message': return None, None
+    message = obj.get('message') if isinstance(obj.get('message'), dict) else obj
+    role = str(message.get('role') or '')
+    if role == 'user': return 'prompt', parts_text(message.get('content'))
+    if role == 'assistant': return 'result', parts_text(message.get('content'))
+    return None, None
+
+def extract_generic(obj):
+    """归档 jsonl 等未知结构:依次尝试三种已知形状。"""
+    for extract in (extract_codex, extract_dsh, extract_pi):
+        if extract is extract_codex:
+            role, text = extract(obj.get('type'), obj)
+        else:
+            role, text = extract(obj)
+        if role: return role, text
+    return None, None
+
+def make_event(provider, session, item, stamp, kind, role, text, truncated=False):
+    """role: prompt | result | deliverable | process"""
+    text = ' '.join(str(text or '').split())
+    if len(text) > MESSAGE_CHAR_MAX:
+        text = text[:MESSAGE_CHAR_MAX]; truncated = True
+    key = hashlib.sha256(f'{provider}|{session}|{item}|{text}'.encode()).hexdigest()
+    return {'provider': provider, 'session_id': session, 'item_id': item, 'timestamp': str(stamp),
+            'kind': kind, 'role': role, 'text': text, 'truncated': truncated, 'dedupe_key': key}
+
+def keep_process():
+    """默认只保留提示词/最终文本/交付物;置 1 可回退到"过程也送、但排在最后"。"""
+    return os.getenv('DIGEST_CONTEXT_INCLUDE_PROCESS') == '1'
+
+def new_stats():
+    return {'prompt': 0, 'result': 0, 'deliverable': 0, 'process': 0, 'truncated': 0, 'chars': 0}
+
+def collect_one(stats, out, provider, session, item, stamp, kind, raw_text, role, text, include_process):
+    if role:
+        stats[role] += 1
+        if len(' '.join(str(text or '').split())) > MESSAGE_CHAR_MAX: stats['truncated'] += 1
+        event = make_event(provider, session, item, stamp, kind, role, text or '')
+        stats['chars'] += len(event['text']); out.append(event)
+    else:
+        stats['process'] += 1
+        if include_process:
+            out.append(make_event(provider, session, item, stamp, kind, 'process', raw_text or ''))
+
 def codex(root, start, end):
-    db = root / '.codex/thread_history_1.sqlite'; rows = []
+    """只抽取 userMessage(提示词)与 agentMessage(最终结果),过程记录不进入汇总。"""
+    stats = new_stats(); out = []; include = keep_process()
+    db = root / '.codex/thread_history_1.sqlite'
     if db.exists():
         con = sqlite3.connect(db)
         query = 'select thread_id, turn_id, created_at_ms, item_json, item_type from thread_items where created_at_ms >= ? and created_at_ms < ?'
         for tid, turn, created, raw, typ in con.execute(query, (int(start.timestamp()*1000), int(end.timestamp()*1000))):
             try: data = json.loads(raw)
             except json.JSONDecodeError: data = {'text': raw}
-            text = json.dumps(data, ensure_ascii=False)[:4000]
-            rows.append(event('codex', tid, turn, created, typ, text))
+            role, text = extract_codex(typ, data)
+            collect_one(stats, out, 'codex', tid, turn, created, typ, json.dumps(data, ensure_ascii=False)[:MESSAGE_CHAR_MAX], role, text, include)
         con.close()
     for f in (root/'.codex/archived_sessions').glob('*.jsonl'):
-        rows.extend(read_jsonl(f, 'codex', start, end))
-    return dedupe(rows)
+        read_jsonl(f, 'codex', start, end, stats, out, include)
+    return dedupe(out), stats
 
-def read_jsonl(path, provider, start, end):
-    out=[]
+def read_jsonl(path, provider, start, end, stats, out, include_process):
     try:
         lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-    except OSError: return out
+    except OSError: return
     sid = path.stem
     for i, line in enumerate(lines):
-        try: obj=json.loads(line)
+        try: obj = json.loads(line)
         except json.JSONDecodeError: continue
-        stamp=obj.get('timestamp') or obj.get('createdAt') or obj.get('time')
-        if in_window(stamp, start, end): out.append(event(provider, sid, str(obj.get('id', i)), stamp, obj.get('type'), json.dumps(obj, ensure_ascii=False)[:4000]))
-    return out
+        stamp = obj.get('timestamp') or obj.get('createdAt') or obj.get('time')
+        if not in_window(stamp, start, end): continue
+        role, text = extract_pi(obj)
+        if not role: role, text = extract_generic(obj)
+        collect_one(stats, out, provider, sid, str(obj.get('id', i)), stamp, obj.get('type'),
+                    json.dumps(obj, ensure_ascii=False)[:MESSAGE_CHAR_MAX], role, text, include_process)
 
 def dsh(root, start, end):
-    out=[]
+    stats = new_stats(); out = []; include = keep_process()
     for f in (root/'.dsh/sessions').glob('**/*.zstd'):
-        try: raw=subprocess.check_output(['zstd','-dc',str(f)], stderr=subprocess.DEVNULL, text=True)
+        try: raw = subprocess.check_output(['zstd','-dc',str(f)], stderr=subprocess.DEVNULL, text=True)
         except (OSError, subprocess.CalledProcessError): continue
-        for i,line in enumerate(raw.splitlines()):
-            try: obj=json.loads(line)
+        for i, line in enumerate(raw.splitlines()):
+            try: obj = json.loads(line)
             except json.JSONDecodeError: continue
-            stamp=obj.get('time') or obj.get('createdAt')
-            if in_window(stamp,start,end): out.append(event('deepseek-harness', f.parent.name, str(obj.get('seq',i)), stamp, obj.get('type'), json.dumps(obj,ensure_ascii=False)[:4000]))
-    return dedupe(out)
+            stamp = obj.get('time') or obj.get('createdAt')
+            if not in_window(stamp, start, end): continue
+            role, text = extract_dsh(obj)
+            collect_one(stats, out, 'deepseek-harness', f.parent.name, str(obj.get('seq', i)), stamp,
+                        obj.get('type'), json.dumps(obj, ensure_ascii=False)[:MESSAGE_CHAR_MAX], role, text, include)
+    return dedupe(out), stats
 
-def pi(root,start,end):
-    out=[]
-    for f in (root/'.pi/agent/sessions').glob('**/*.jsonl'): out.extend(read_jsonl(f,'pi',start,end))
-    return dedupe(out)
+def pi(root, start, end):
+    stats = new_stats(); out = []; include = keep_process()
+    for f in (root/'.pi/agent/sessions').glob('**/*.jsonl'):
+        read_jsonl(f, 'pi', start, end, stats, out, include)
+    return dedupe(out), stats
 
-def event(provider, session, item, stamp, kind, text):
-    key=hashlib.sha256(f'{provider}|{session}|{item}|{text}'.encode()).hexdigest()
-    return {'provider':provider,'session_id':session,'item_id':item,'timestamp':str(stamp),'kind':kind,'text':text,'dedupe_key':key}
+def collect(root, start, end):
+    """返回 (events, stats):events 默认只含提示词 / 最终文本 / 交付物。"""
+    events = []; stats = {}
+    for name, fn in (('codex', codex), ('pi', pi), ('dsh', dsh)):
+        got, st = fn(root, start, end)
+        events.extend(got); stats[name] = st
+    return dedupe(events), stats
 
 def dedupe(rows):
     return list({r['dedupe_key']:r for r in rows}.values())
@@ -339,6 +420,7 @@ def summarize(events, day):
         context, stats = build_context(events)
         payload['coverage']['context'] = stats
         payload['coverage']['limitations'].append(context_note(stats))
+        debug(f"context: {context_note(stats)}")
         system='''你是日报整理器。把当天所有 agent 对话按“工作主题”聚类，每个主题写成一项独立内容。只保留真实工作内容：开发、工程、运维、研究、业务；排除个人问题、娱乐、闲聊和自动化噪音。一次性处理输入并返回严格 JSON，不要 Markdown：{"work_items":[{"title":"工作主题（不超过 30 字）","desc":"该项工作的完整说明","status":"completed|in_progress|blocked","source_task_ids":["provider/session"]}],"decisions":[],"blockers":[],"next_steps":[]}.
 要求（必须遵守）：
 1. 每一项的 desc 是这一项完整而独立的说明：写清做了什么、为什么做、怎么做的、结果或产出是什么，目标 100-300 字。
@@ -365,12 +447,13 @@ def summarize(events, day):
     return payload
 
 def generate(day=None, source_root=None):
-    day=day or dt.datetime.now(TZ).date().isoformat(); root=Path(source_root or os.getenv('DIGEST_SOURCE_ROOT', str(Path.home()))); start,end=day_window(day); events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end)
+    day=day or dt.datetime.now(TZ).date().isoformat(); root=Path(source_root or os.getenv('DIGEST_SOURCE_ROOT', str(Path.home()))); start,end=day_window(day); events,collect_stats=collect(root,start,end)
     payload=summarize(events,day); previous=app_state(day); excluded={x['id'] for x in previous.get('work_items',[]) if x.get('excluded')}
     for item in payload['work_items']: item['excluded']=item['id'] in excluded
     failed=payload.get('llm_error'); state={'schema_version':'1.2','release_version':RELEASE_VERSION,'date':day,'work_items':payload['work_items'],'generated_at':dt.datetime.now(TZ).isoformat(),'report_status':'error' if failed else 'ready','last_error':failed,'reports':sorted(set(previous.get('reports',[])+[day]))}
     # 排除项不会进入上报内容,因此字数按未排除项统计。
-    state['coverage_note']=next((x for x in payload.get('coverage',{}).get('limitations',[]) if x.startswith('当天采集')), None)
+    state['coverage_note']=context_note(payload.get('coverage',{}).get('context') or {}) if payload.get('coverage',{}).get('context') else None
+    state['collect_stats']=collect_stats
     state=recount_report(state); write_state(state)
     return state
 
@@ -434,7 +517,7 @@ def main():
     if args.app_command:
         try: print(json.dumps(app_command(args.app_command, json.load(__import__('sys').stdin)), ensure_ascii=False)); return
         except Exception as exc: print(json.dumps({'error':str(exc)},ensure_ascii=False)); raise SystemExit(1)
-    start,end=day_window(args.date); root=Path(args.root); events=codex(root,start,end)+pi(root,start,end)+dsh(root,start,end); payload=summarize(events,args.date); payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
+    start,end=day_window(args.date); root=Path(args.root); events,collect_stats=collect(root,start,end); payload=summarize(events,args.date); payload['coverage']['collect']=collect_stats; payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
     out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(Path.home()/'.local/share/daily-agent-digest')))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
     out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8'); print(f'events={len(events)} raw={len(events)} output={out}')
 

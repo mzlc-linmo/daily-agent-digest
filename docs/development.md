@@ -183,7 +183,8 @@ $ ./scripts/dev.sh generate --mode=malformed
 - **codex**:`thread_history_1.sqlite`(6 轮 / 12 条 item)+ `archived_sessions/*.jsonl`(1 条)
 - **pi**:`sessions/*.jsonl`(4 条)
 - **deepseek-harness**:`sessions/<sid>/*.zstd`(3 条,真实 zstd 压缩)
-- 刻意植入的内容:跨 provider **完全重复的一句话**(验证去重折叠)、一条**生活闲聊**(验证 LLM 应排除)、一条**自动化噪音**(验证应排除)、以及 `codex` 归档会话(验证归档读取路径)。
+- **记录结构与客户端真实落盘一致**(`type`/`item_type`、`message.role`、`content[]` 分片),所以开发环境走的是生产抽取路径:codex 的 `userMessage`/`agentMessage`、dsh 的 `user/message`/`assistant/message`/`deliverables/presented`、pi 的 `message.role`。
+- 刻意植入的内容:**过程记录**(`functionCallOutput`/`reasoning`/`commandExecution`/`tool/call`/`tool/result`/`toolResult`)用来验证它们**不会进入汇总**;跨 provider 重复句、生活闲聊、`automation_update` 工具输出、以及 `codex` 归档会话。
 
 日期默认取当天(UTC+8),可用 `--date=YYYY-MM-DD` 指定。
 
