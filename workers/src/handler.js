@@ -10,6 +10,7 @@ import {
 } from './report.js';
 import * as realFeishu from './feishu.js';
 import { issueKey, listKeys, revokeKey } from './keys.js';
+import { ensureTable, recordIssued, recordRevoked, recordSubmission, REGISTRY, REQUESTS, registryFieldDefs, requestFieldDefs } from './registry.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -50,7 +51,7 @@ export async function submitDigest(request, env, feishu, now) {
   const openId = member.open_id;
   if (!openId) console.warn(`Key ${member.key_id} 未绑定 open_id,「成员」列将留空`);
   const rows = toRows(report, { ...member, open_id: openId }, submitId, fingerprint, now());
-  const existing = await feishu.findRecordsBySubmitId(env, submitId);
+  const existing = await feishu.findRecords(env, env.BITABLE_TABLE_ID, `CurrentValue.[提交ID]="${submitId}"`);
 
   const meta = {
     submission_id: `sub_${crypto.randomUUID()}`,
@@ -80,14 +81,21 @@ export async function submitDigest(request, env, feishu, now) {
   const creates = rows.slice(updateCount);
   const surplus = existing.slice(rows.length).map((record) => record.record_id);
 
-  if (updates.length) await feishu.batchUpdate(env, updates);
-  const created = creates.length ? await feishu.batchCreate(env, creates) : [];
-  if (surplus.length) await feishu.batchDelete(env, surplus);
+  if (updates.length) await feishu.batchUpdate(env, env.BITABLE_TABLE_ID, updates);
+  const created = creates.length ? await feishu.batchCreate(env, env.BITABLE_TABLE_ID, creates) : [];
+  if (surplus.length) await feishu.batchDelete(env, env.BITABLE_TABLE_ID, surplus);
 
   const records = [
     ...updates.map((row, index) => ({ index, record_id: row.record_id })),
     ...created.map((row, index) => ({ index: updateCount + index, record_id: row.record_id })),
   ];
+  // 台账回写是尽力而为:失败了也不能影响日报提交
+  try {
+    const notes = await recordSubmission(env, feishu, { key_id: member.key_id, at: meta.submitted_at });
+    if (notes.length) console.log(`registry ${member.key_id}: ${notes.join(',')}`);
+  } catch (err) {
+    console.warn(`台账回写最近提交失败:${err.message}`);
+  }
   return json({ ...meta, mode: existing.length ? 'updated' : 'created', records }, existing.length ? 200 : 201);
 }
 
@@ -101,7 +109,7 @@ export async function queryDigest(request, env, feishu, url) {
   const date = url.searchParams.get('date') ?? '';
   if (!REPORT_DATE.test(date)) throw new ValidationError('date 必须是 YYYY-MM-DD');
   const submitId = `${member.member_id}-${date}`;
-  const existing = await feishu.findRecordsBySubmitId(env, submitId);
+  const existing = await feishu.findRecords(env, env.BITABLE_TABLE_ID, `CurrentValue.[提交ID]="${submitId}"`);
   return json({
     member: member.member,
     member_id: member.member_id,
@@ -131,14 +139,28 @@ export async function bootstrap(request, env, feishu) {
     if (!found) created.push(`table:${tableName}`);
   }
 
+  // 两张管理表的字段补全(表本身就放在同一个 base 里)
+  const adminTables = {};
+  for (const [key, spec, defs] of [['registry', REGISTRY, registryFieldDefs()], ['requests', REQUESTS, requestFieldDefs()]]) {
+    try {
+      const result = await ensureTable(env, feishu, spec, defs);
+      if (!result.tableId) throw new Error('未拿到表 id');
+      adminTables[key] = result.tableId;
+      created.push(...result.created);
+    } catch (err) {
+      console.warn(`建管理表 ${spec.name} 失败:${err.message}`);
+      adminTables[key] = `failed:${err.message}`;
+    }
+  }
+
   const scoped = { ...env, BITABLE_TABLE_ID: tableId };
-  const current = await feishu.listFields(scoped);
+  const current = await feishu.listFields(env, tableId);
   const byName = new Map(current.map((field) => [field.field_name, field]));
   // 历史遗留:成员曾是文本字段,现在必须是人员字段(关联通讯录)。
   const legacyMember = byName.get(FIELDS.member);
   if (legacyMember && legacyMember.type !== 11) {
     const renamed = `${FIELDS.member}文本`;
-    await feishu.updateField(scoped, legacyMember.field_id, { field_name: renamed, type: legacyMember.type });
+    await feishu.updateField(env, legacyMember.field_id, { field_name: renamed, type: legacyMember.type }, tableId);
     byName.delete(FIELDS.member);
     byName.set(renamed, { ...legacyMember, field_name: renamed });
     created.push(`renamed:${FIELDS.member}->${renamed}`);
@@ -149,7 +171,7 @@ export async function bootstrap(request, env, feishu) {
       existingFields.push(definition.field_name);
       continue;
     }
-    await feishu.createField(scoped, definition);
+    await feishu.createField(env, definition, tableId);
     created.push(`field:${definition.field_name}`);
   }
 
@@ -159,7 +181,9 @@ export async function bootstrap(request, env, feishu) {
     table_name: tableName,
     created,
     existing_fields: existingFields,
-    next_step: `把 BITABLE_TABLE_ID="${tableId}" 写入 wrangler.toml 的 [vars] 后重新部署`,
+    registry_table_id: adminTables.registry,
+    request_table_id: adminTables.requests,
+    next_step: `把 BITABLE_TABLE_ID="${tableId}"、REGISTRY_TABLE_ID="${adminTables.registry}"、REQUEST_TABLE_ID="${adminTables.requests}" 写入 wrangler.toml 的 [vars] 后重新部署`,
   });
 }
 
@@ -173,8 +197,20 @@ export async function adminIssueKey(request, env, feishu) {
     email: body.email,
     open_id: body.open_id,
   });
+  let registry = [];
+  try {
+    registry = await recordIssued(env, feishu, {
+      member: issued.member, member_id: issued.member_id, key_id: issued.key_id,
+      // 用解析后的 open_id,而不是请求体里的(邮箱解析的情况请求体里没有)
+      open_id: issued.open_id, created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn(`登记表写入失败(Key 已签发):${err.message}`);
+    registry = [`registry:failed:${err.message}`];
+  }
   return json({
     ...issued,
+    registry,
     next_step: '把 key 发给该成员,填进 App 的「设置」;服务端只保存哈希,明文不再可查',
   }, 201);
 }
@@ -184,10 +220,17 @@ export async function adminListKeys(request, env) {
   return json({ keys: await listKeys(env) });
 }
 
-export async function adminRevokeKey(request, env) {
+export async function adminRevokeKey(request, env, feishu) {
   authenticateAdmin(request, env);
   const body = await request.json().catch(() => ({}));
-  return json(await revokeKey(env, String(body.key_id ?? '')));
+  const revoked = await revokeKey(env, String(body.key_id ?? ''));
+  let registry = [];
+  try {
+    registry = await recordRevoked(env, feishu, { key_id: revoked.key_id, revoked_at: revoked.revoked_at });
+  } catch (err) {
+    console.warn(`登记表撤销回写失败:${err.message}`);
+  }
+  return json({ ...revoked, registry });
 }
 
 export async function healthz(env, feishu) {
@@ -223,7 +266,7 @@ export async function handleRequest(request, env, deps = {}) {
       case 'GET /admin/keys':
         return await adminListKeys(request, env);
       case 'POST /admin/keys/revoke':
-        return await adminRevokeKey(request, env);
+        return await adminRevokeKey(request, env, feishu);
       default:
         return json({ error: { code: 'not_found', message: `未知接口:${route}` } }, 404);
     }

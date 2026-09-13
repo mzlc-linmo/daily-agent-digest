@@ -42,53 +42,76 @@ async function makeEnv() {
     FEISHU_APP_SECRET: 'secret',
     BITABLE_APP_TOKEN: 'bascn_test',
     BITABLE_TABLE_ID: 'tbl_test',
+    REGISTRY_TABLE_ID: 'tbl_registry',
+    REQUEST_TABLE_ID: 'tbl_requests',
   };
 }
 
 const KEY = `dag_k1_${SECRET}`;
 
-/// 假飞书客户端:只在内存里维护行,并记录调用次数以便断言"幂等时不写表"。
+/// 假飞书客户端:内存里的多表实现,足以覆盖主表 + 两张管理表。
 function fakeFeishu() {
-  const rows = new Map(); // record_id -> fields
-  const calls = { create: 0, update: 0, delete: 0, find: 0 };
-  let nextId = 0;
+  const tables = new Map(); // tableId -> { name, fields:Set, rows:Map(record_id -> fields) }
+  const calls = { create: 0, update: 0, delete: 0, find: 0, resolve: 0, registryCreate: 0, registryUpdate: 0 };
+  let seq = 0;
+  const newId = () => `rec${seq++}`;
+  const ensure = (id) => {
+    if (!tables.has(id)) tables.set(id, { name: id, fields: new Set(), rows: new Map() });
+    return tables.get(id);
+  };
+  // 支持 CurrentValue.[字段]="值" 与 CurrentValue.[字段].contains("值")
+  const matches = (fields, filter) => {
+    if (!filter) return true;
+    const equals = [...filter.matchAll(/CurrentValue\.\[([^\]]+)\]="([^"]*)"/g)];
+    const contains = [...filter.matchAll(/CurrentValue\.\[([^\]]+)\]\.contains\("([^"]*)"\)/g)];
+    return equals.every(([, k, v]) => String(fields[k] ?? '') === v)
+      && contains.every(([, k, v]) => (fields[k] ?? []).some?.((p) => p.id === v) ?? false);
+  };
   return {
-    rows, calls,
-    async findRecordsBySubmitId(_env, submitId) {
+    tables, calls,
+    async listTables() { return [...tables].map(([table_id, t]) => ({ table_id, name: t.name })); },
+    async createTable(_env, { name, fields = [] }) {
+      const id = `tbl_${name}`;
+      const t = ensure(id); t.name = name;
+      for (const f of fields) t.fields.add(f.field_name);
+      return id;
+    },
+    async listFields(_env, tableId) { return [...ensure(tableId).fields].map((field_name) => ({ field_name })); },
+    async createField(_env, field, tableId) { ensure(tableId).fields.add(field.field_name); return {}; },
+    async updateField(_env, fieldId, body, tableId) {
+      const t = ensure(tableId); t.fields.delete(fieldId); t.fields.add(body.field_name); return {};
+    },
+    async findRecords(_env, tableId, filter) {
       calls.find += 1;
-      return [...rows.entries()]
-        .filter(([, fields]) => fields[FIELDS.submitId] === submitId)
+      return [...ensure(tableId).rows].filter(([, f]) => matches(f, filter))
         .map(([record_id, fields]) => ({ record_id, fields }));
     },
-    async batchCreate(_env, newRows) {
+    async findRecordsBySubmitId(env, submitId) { return this.findRecords(env, env.BITABLE_TABLE_ID, `CurrentValue.[提交ID]="${submitId}"`); },
+    async batchCreate(_env, tableId, rows) {
       calls.create += 1;
-      return newRows.map((row) => {
-        const record_id = `rec${nextId++}`;
-        rows.set(record_id, row.fields);
-        return { record_id, fields: row.fields };
-      });
+      if (tableId !== ENV.BITABLE_TABLE_ID) calls.registryCreate += 1;
+      const t = ensure(tableId);
+      return rows.map((row) => { const record_id = newId(); t.rows.set(record_id, row.fields); return { record_id, fields: row.fields }; });
     },
-    async batchUpdate(_env, updates) {
+    async batchUpdate(_env, tableId, records) {
       calls.update += 1;
-      for (const row of updates) rows.set(row.record_id, row.fields);
-      return updates.map((row) => ({ record_id: row.record_id, fields: row.fields }));
+      if (tableId !== ENV.BITABLE_TABLE_ID) calls.registryUpdate += 1;
+      const t = ensure(tableId);
+      for (const r of records) t.rows.set(r.record_id, { ...(t.rows.get(r.record_id) ?? {}), ...r.fields });
+      return records;
     },
-    async batchDelete(_env, ids) {
+    async batchDelete(_env, tableId, ids) {
       calls.delete += 1;
-      for (const id of ids) rows.delete(id);
+      const t = ensure(tableId);
+      for (const id of ids) t.rows.delete(id);
     },
     async resolveOpenIds(_env, emails = []) {
-      calls.resolve = (calls.resolve ?? 0) + 1;
+      calls.resolve += 1;
       const out = {};
       for (const email of emails) out[email] = email === 'unlinked@example.com' ? '' : `ou_${email.split('@')[0]}`;
       return out;
     },
-    async updateField() { return {}; },
     async healthcheck() { return true; },
-    async listTables() { return [{ table_id: 'tbl_test', name: '日报明细' }]; },
-    async listFields() { return Object.values(FIELDS).map((field_name) => ({ field_name })); },
-    async createField() { return {}; },
-    async createTable() { return 'tbl_new'; },
   };
 }
 
@@ -119,8 +142,8 @@ test('首次提交创建行,一行一个工作项', async () => {
   assert.equal(res.status, 201);
   assert.equal(body.mode, 'created');
   assert.equal(body.records.length, 2);
-  assert.equal(feishu.rows.size, 2);
-  const fields = [...feishu.rows.values()][0];
+  assert.equal(feishu.tables.get('tbl_test').rows.size, 2);
+  const fields = [...feishu.tables.get('tbl_test').rows.values()][0];
   assert.equal(fields[FIELDS.submitId], 'zhangsan-2026-09-13');
   assert.deepEqual(fields[FIELDS.member], [{ id: 'ou_zhangsan' }], '成员用签发时绑定的 open_id');
   assert.equal(fields[FIELDS.memberId], 'zhangsan');
@@ -131,8 +154,8 @@ test('首次提交创建行,一行一个工作项', async () => {
 test('成员身份由 Key 决定,请求体里的名字不被采信', async () => {
   const feishu = fakeFeishu();
   await handleRequest(post('/api/v1/digests', { ...REPORT, member: '李四', member_id: 'lisi' }), ENV, { feishu });
-  assert.equal([...feishu.rows.values()][0][FIELDS.memberId], 'zhangsan');
-  assert.deepEqual([...feishu.rows.values()][0][FIELDS.member], [{ id: 'ou_zhangsan' }]);
+  assert.equal([...feishu.tables.get('tbl_test').rows.values()][0][FIELDS.memberId], 'zhangsan');
+  assert.deepEqual([...feishu.tables.get('tbl_test').rows.values()][0][FIELDS.member], [{ id: 'ou_zhangsan' }]);
 });
 
 test('同一天内容不变时幂等返回,不写表', async () => {
@@ -145,7 +168,7 @@ test('同一天内容不变时幂等返回,不写表', async () => {
   assert.equal(body.mode, 'unchanged');
   assert.equal(feishu.calls.create, before.create);
   assert.equal(feishu.calls.update, before.update);
-  assert.equal(feishu.rows.size, 2);
+  assert.equal(feishu.tables.get('tbl_test').rows.size, 2);
 });
 
 test('同一天内容变化时覆盖,行数不变', async () => {
@@ -155,8 +178,8 @@ test('同一天内容变化时覆盖,行数不变', async () => {
   const res = await handleRequest(post('/api/v1/digests', changed), ENV, { feishu });
   const body = await res.json();
   assert.equal(body.mode, 'updated');
-  assert.equal(feishu.rows.size, 1, '工作项变少时多余的行应被删除');
-  assert.equal([...feishu.rows.values()][0][FIELDS.desc], '改了内容');
+  assert.equal(feishu.tables.get('tbl_test').rows.size, 1, '工作项变少时多余的行应被删除');
+  assert.equal([...feishu.tables.get('tbl_test').rows.values()][0][FIELDS.desc], '改了内容');
 });
 
 test('签发 Key 时绑定人员:邮箱解析成 open_id 后才生成 Key', async () => {
@@ -181,7 +204,7 @@ test('签发 Key 时绑定人员:邮箱解析成 open_id 后才生成 Key', asyn
   const submitted = await submit.json();
   assert.equal(submit.status, 201);
   assert.equal(submitted.member_linked, true);
-  assert.deepEqual([...feishu.rows.values()][0][FIELDS.member], [{ id: 'ou_zhaoliu' }]);
+  assert.deepEqual([...feishu.tables.get('tbl_test').rows.values()][0][FIELDS.member], [{ id: 'ou_zhaoliu' }]);
   assert.equal(feishu.calls.resolve, 1, '只在签发时解析一次,提交时不再调用通讯录');
 });
 
@@ -210,7 +233,7 @@ test('签发时可跳过解析,直接给 open_id', async () => {
     body: JSON.stringify({ member_id: 'qianqi', member: '钱七', open_id: 'ou_qianqi' }),
   }), env, { feishu });
   assert.equal(res.status, 201);
-  assert.equal(feishu.calls.resolve, undefined, '给了 open_id 就不该再查通讯录');
+  assert.equal(feishu.calls.resolve, 0, '给了 open_id 就不该再查通讯录');
 });
 
 test('管理员可列出与撤销 Key,撤销后立即失效', async () => {
@@ -257,7 +280,7 @@ test('校验失败返回 422 且不写表', async () => {
     assert.equal(res.status, 422, JSON.stringify(payload));
   }
   assert.equal(feishu.calls.create, 0);
-  assert.equal(feishu.rows.size, 0);
+  assert.equal(feishu.tables.get('tbl_test')?.rows.size ?? 0, 0);
 });
 
 test('请求体不是 JSON 时返回 400', async () => {
@@ -317,6 +340,73 @@ test('bootstrap 需要管理口令,并返回 table_id', async () => {
   const body = await ok.json();
   assert.equal(ok.status, 200);
   assert.ok(body.table_id, 'bootstrap 必须返回 table_id');
+});
+
+test('签发时写「成员密钥」登记表,并把待处理申请标为已签发', async () => {
+  const feishu = fakeFeishu();
+  const env = await makeEnv();
+  env.KEYS = fakeKV();
+  // 造一条待处理申请
+  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
+    fields: { 申请人: [{ id: 'ou_zhaoliu' }], 状态: '待处理', 申请说明: '需要日报 Key' },
+  }]);
+  const res = await handleRequest(new Request('https://digest.example.com/admin/keys', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ member_id: 'zhaoliu', member: '赵六', email: 'zhaoliu@example.com' }),
+  }), env, { feishu });
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.ok(body.registry.some((n) => n.startsWith('registry:created')), JSON.stringify(body.registry));
+
+  const registryRows = [...feishu.tables.get(env.REGISTRY_TABLE_ID).rows.values()];
+  assert.equal(registryRows.length, 1);
+  assert.equal(registryRows[0]['KeyID'], body.key_id);
+  assert.equal(registryRows[0]['状态'], '已启用');
+  assert.deepEqual(registryRows[0]['成员'], [{ id: 'ou_zhaoliu' }]);
+
+  const requestRows = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()];
+  assert.equal(requestRows[0]['状态'], '已签发', '申请应被自动关单');
+  assert.equal(requestRows[0]['KeyID'], body.key_id);
+});
+
+test('撤销时把登记表状态改为已撤销', async () => {
+  const feishu = fakeFeishu();
+  const env = await makeEnv();
+  const auth = { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
+  await feishu.batchCreate(env, env.REGISTRY_TABLE_ID, [{ fields: { KeyID: 'k1', 成员ID: 'zhangsan', 状态: '已启用' } }]);
+  const res = await handleRequest(new Request('https://digest.example.com/admin/keys/revoke', {
+    method: 'POST', headers: auth, body: JSON.stringify({ key_id: 'k1' }),
+  }), env, { feishu });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(body.registry.some((n) => n.startsWith('registry:revoked')));
+  const row = [...feishu.tables.get(env.REGISTRY_TABLE_ID).rows.values()][0];
+  assert.equal(row['状态'], '已撤销');
+  assert.ok(row['撤销时间'] > 0);
+});
+
+test('提交成功后回写「最近提交」', async () => {
+  const feishu = fakeFeishu();
+  await feishu.batchCreate(ENV, ENV.REGISTRY_TABLE_ID, [{ fields: { KeyID: 'k1', 成员ID: 'zhangsan', 状态: '已启用' } }]);
+  const before = feishu.calls.registryUpdate;
+  const res = await handleRequest(post('/api/v1/digests', REPORT), ENV, { feishu });
+  assert.equal(res.status, 201);
+  assert.ok(feishu.calls.registryUpdate > before, '应有一次台账回写');
+  const row = [...feishu.tables.get(ENV.REGISTRY_TABLE_ID).rows.values()][0];
+  assert.ok(row['最近提交'] > 0);
+});
+
+test('台账写失败不影响日报提交', async () => {
+  const feishu = fakeFeishu();
+  const failing = { ...feishu };
+  failing.batchUpdate = async (_env, tableId, records) => {
+    if (tableId === ENV.REGISTRY_TABLE_ID) throw new Error('台账不可用');
+    return feishu.batchUpdate(_env, tableId, records);
+  };
+  const res = await handleRequest(post('/api/v1/digests', REPORT), ENV, { feishu: failing });
+  assert.equal(res.status, 201, '台账是辅助信息,不能拖垮提交');
+  assert.equal(feishu.tables.get(ENV.BITABLE_TABLE_ID).rows.size, 2);
 });
 
 test('未知路径返回 404', async () => {

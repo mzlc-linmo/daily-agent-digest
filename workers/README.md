@@ -49,36 +49,49 @@ curl -sS -X POST https://<你的>.workers.dev/admin/bootstrap \
 
 bootstrap 是幂等的:表已存在就复用,字段已存在就跳过,只补齐缺失的。
 
-## 签发成员 Key(后端签发,签发即绑定人员)
+## 成员与 Key 的映射:两张飞书表
 
-Key 由**后端**签发,签发时就把人员身份(工号、姓名、飞书 open_id)绑定进去;
-提交时服务端直接按 Key 确定身份,不再解析邮箱。
+`/admin/bootstrap` 会自动在同一个 base 里建好这两张表(幂等,已存在就复用):
+
+| 表 | 作用 | 写入方 |
+| --- | --- | --- |
+| **成员密钥** | 台账:谁有一把 Key、状态、签发/撤销/最近提交时间 | 服务端自动写入(签发/撤销/提交时) |
+| **密钥申请** | 成员自助申请;管理员签发后自动关单 | 成员填表单,服务端回写状态 |
+
+**权威仍在 KV**:鉴权只读 KV;这两张表是给人和审计看的,best-effort 写入 —— 台账写失败不会影响成员提交日报。
+
+### 成员怎么申请
+
+1. 打开表单填写(只问「申请标题 / 申请人 / 申请说明」,状态等管理字段已隐藏):
+   `https://<你的租户>.feishu.cn/share/base/<form_token>`
+2. 管理员在「密钥申请」表看到状态为 `待处理` 的行;
+3. 管理员签发(见下),服务端会把该行自动改成 `已签发` 并回填 KeyID;
+4. 管理员把返回的明文 Key 发给成员,成员填进 App 的「设置」。
+
+## 管理员签发 Key(签发即绑定人员)
 
 ```bash
-# 需要 KV:首次部署前执行一次
+# 首次部署前执行一次
 npx wrangler kv namespace create KEYS      # 把输出的 id 填进 wrangler.toml
+npx wrangler secret put ADMIN_TOKEN        # 自己定一个管理口令,妥善保存
 
-# 签发(open_id 优先;也可给 email 让服务端解析,后者需要 contact:user.id:readonly)
 curl -sS -X POST https://<你的>.workers.dev/admin/keys \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"member_id":"zhangsan","member":"张三","open_id":"ou_xxxxxxxx"}'
 ```
 
-返回里的 `key`(`dag_<key_id>_<secret>`)只出现这一次,交给该成员填进 App;服务端只保存哈希。
+返回里的 `key`(`dag_<key_id>_<secret>`)只出现这一次,交给该成员;服务端只保存哈希,台账里也只有公开的 key_id。
 
 ```bash
-# 列出(不含哈希)
-curl -sS https://<你的>.workers.dev/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"
-
-# 撤销:下一次请求立即失效
+curl -sS https://<你的>.workers.dev/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"          # 列出(不含哈希)
 curl -sS -X POST https://<你的>.workers.dev/admin/keys/revoke \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"key_id":"<key_id>"}'
+  -d '{"key_id":"<key_id>"}'                                                                     # 撤销,立即失效
 ```
 
-**怎么拿到 open_id**:最常见的是从企业已有表格的人员字段直接读(例如排期表的「负责人」),
-读到的 open_id 由同一个应用写入本表即可用;或者给 `email`,由服务端解析。
-两者都没有会被**拒绝签发**,避免生成一把无法关联通讯录的 Key。
+**怎么拿到 open_id**:从企业已有表格的人员字段读(例如「员工映射」表的「通讯录用户」列),
+读到的 open_id 由同一个应用写入本表即可用;也可以给 `email`,由服务端解析 —— 后者需要应用开通
+`contact:user.id:readonly`。两者都没有会被**拒绝签发**。
 
 ## 成员侧配置
 
@@ -126,6 +139,8 @@ ADMIN_TOKEN="dev-admin"
 | 成员报 `invalid_key` | Key 拼错,或该 Key 已被撤销(`403 key_revoked`) |
 | 签发时报「无法解析为 open_id」 | 应用未开通 `contact:user.id:readonly`,或邮箱不属于本企业;改为直接给 `open_id` |
 | 提交成功但「成员」列空白 | 该 Key 记录缺 `open_id`(手工塞进旧 `API_KEYS` 变量的条目会这样),重新用 `/admin/keys` 签发 |
+| 申请填了但一直「待处理」 | 申请人是人员字段,服务端无法用 filter 匹配人员,因此按状态取回后在本地比对;确认申请表里的「申请人」确实选中了本人 |
+| 建表报 `Unsupported field type` | 飞书不允许用人员字段作**主字段**,申请表的主字段因此是文本「申请标题」 |
 | 客户端报 `HTTP 403 error code: 1010` | Cloudflare 拦截了默认的 `Python-urllib` User-Agent;引擎已固定带 `DailyAgentDigest/<版本>` 标识,自研客户端也必须带 UA |
 | 大陆网络访问超时 | `*.workers.dev` 不可达,见设计文档 12.1;可迁到国内云函数,客户端无需改动 |
 

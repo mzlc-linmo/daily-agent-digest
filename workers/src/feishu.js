@@ -84,13 +84,15 @@ async function call(env, path, { method = 'GET', body, query, retryOnAuth = true
   return payload.data ?? {};
 }
 
-/// 用 filter 查找某天某成员已有的行(幂等的关键)。
-export async function findRecordsBySubmitId(env, submitId) {
+/// 按 filter 查找行(幂等、登记表查找都用它)。tableId 省略时用 env.BITABLE_TABLE_ID。
+export async function findRecords(env, tableId, filter) {
+  if (!tableId) throw new Error('缺少 tableId');
+  const table = tableId;
   const items = [];
   let pageToken = '';
   do {
-    const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/records`, {
-      query: { filter: `CurrentValue.[提交ID]="${submitId}"`, page_size: 500, page_token: pageToken || undefined },
+    const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${table}/records`, {
+      query: { filter, page_size: 500, page_token: pageToken || undefined },
     });
     items.push(...(data.items ?? []));
     pageToken = data.has_more ? data.page_token : '';
@@ -98,10 +100,12 @@ export async function findRecordsBySubmitId(env, submitId) {
   return items;
 }
 
-export async function batchCreate(env, rows) {
+export async function batchCreate(env, tableId, rows) {
+  if (!tableId) throw new Error('缺少 tableId');
+  const table = tableId;
   const created = [];
   for (let i = 0; i < rows.length; i += 500) {
-    const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/records/batch_create`, {
+    const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${table}/records/batch_create`, {
       method: 'POST',
       body: { records: rows.slice(i, i + 500) },
     });
@@ -110,10 +114,12 @@ export async function batchCreate(env, rows) {
   return created;
 }
 
-export async function batchUpdate(env, records) {
+export async function batchUpdate(env, tableId, records) {
+  if (!tableId) throw new Error('缺少 tableId');
+  const table = tableId;
   const updated = [];
   for (let i = 0; i < records.length; i += 500) {
-    const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/records/batch_update`, {
+    const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${table}/records/batch_update`, {
       method: 'POST',
       body: { records: records.slice(i, i + 500) },
     });
@@ -122,24 +128,29 @@ export async function batchUpdate(env, records) {
   return updated;
 }
 
-export async function batchDelete(env, recordIds) {
+export async function batchDelete(env, tableId, recordIds) {
+  if (!tableId) throw new Error('缺少 tableId');
+  const table = tableId;
   for (let i = 0; i < recordIds.length; i += 500) {
-    await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/records/batch_delete`, {
+    await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${table}/records/batch_delete`, {
       method: 'POST',
       body: { records: recordIds.slice(i, i + 500) },
     });
   }
 }
 
-export async function listFields(env) {
-  const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/fields`, {
+/// tableId 必须显式传入 —— 不再回退到主表,避免"字段建错表"这种静默错误。
+export async function listFields(env, tableId) {
+  if (!tableId) throw new Error('listFields 缺少 tableId');
+  const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${tableId}/fields`, {
     query: { page_size: 200 },
   });
   return data.items ?? [];
 }
 
-export async function updateField(env, fieldId, body) {
-  return call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/fields/${fieldId}`, {
+export async function updateField(env, fieldId, body, tableId) {
+  if (!tableId) throw new Error('updateField 缺少 tableId');
+  return call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${tableId}/fields/${fieldId}`, {
     method: 'PUT',
     body,
   });
@@ -173,8 +184,9 @@ export async function resolveOpenIds(env, emails = [], mobiles = []) {
   return resolved;
 }
 
-export async function createField(env, field) {
-  return call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${env.BITABLE_TABLE_ID}/fields`, {
+export async function createField(env, field, tableId) {
+  if (!tableId) throw new Error('createField 缺少 tableId');
+  return call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables/${tableId}/fields`, {
     method: 'POST',
     body: field,
   });

@@ -68,6 +68,7 @@ export async function issueKey(env, feishu, { member_id, member, email, open_id 
     key_id: keyId,
     member: memberName,
     member_id: memberId,
+    open_id: resolved,            // 供台账写入使用(管理端接口,不是敏感信息)
     open_id_suffix: resolved.slice(-6),
   };
 }

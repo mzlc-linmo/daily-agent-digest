@@ -288,13 +288,22 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
 | KV | `KEYS` 命名空间 `6f1b2801ee524cd7a3dab047e5c7e1a8`,存放成员 Key |
 | Key 生命周期 | **线上已验证**:签发 → 用 Key 调 `/api/v1/me` 成功 → 列表不含哈希 → 撤销后立即 `403 key_revoked` |
+| 成员↔Key 映射 | 飞书两张表:「成员密钥」(台账,自动写入)与「密钥申请」(表单申请,签发后自动关单);权威仍在 KV |
+| 申请表单 | `https://kcnld55n87yl.feishu.cn/share/base/shrcngFJnMSxeEn760KVmhEiDve`(管理字段已隐藏) |
 | 端到端 | **已完成**:本地 App → 线上 Worker → 飞书表格,今日 6 项工作的「成员」列显示 **Master Cui**(已关联通讯录) |
 | 客户端 UA | Cloudflare 会拦截 `Python-urllib`(403 / error code 1010),引擎已固定发送 `DailyAgentDigest/<版本>`;自研客户端必须带 UA |
 | open_id 获取 | **不需要新权限**:从企业已有表格的人员字段(「负责人」等)即可取到本应用可用的 open_id,实测写入「日报明细」的成员列成功(`code=0`) |
 | 已核验 | `/healthz` ok;bootstrap 幂等;鉴权边界(无 Key/错 Key → 401、未知路径 → 404);`created → unchanged → updated → unchanged` 且同日行数恒为 1;真实写入 6 行 |
 | 待办 | 应用需开通 `contact:user.id:readonly` 并重新发布,「成员」列才会关联到通讯录 |
 
-## 17. 已确认决策
+## 17. 踩过的两个飞书限制(已规避)
+
+1. **人员字段不能作主字段** —— 建表时用人员字段当第一列会报 `1254012 Unsupported field type`;申请表的主字段因此是文本「申请标题」。
+2. **人员字段不能用 filter 匹配** —— `CurrentValue.[申请人]="ou_…"` 与 `.contains("ou_…")` 实测都命中 0;改为按状态取回、在服务端本地比对人员。
+
+另外两条运维经验:`wrangler secret put` 后新值有几秒传播延迟,紧接着调用管理接口会拿到 401;KV 的 `list` 是最终一致的,刚签发完可能查不到,以 `get` 为准。
+
+## 18. 已确认决策
 
 | 编号 | 问题 | 决策 |
 | --- | --- | --- |

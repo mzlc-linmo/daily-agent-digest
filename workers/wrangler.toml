@@ -13,7 +13,9 @@ BITABLE_TABLE_ID = "tbl77oxPmPcVVyVz"
 # 飞书应用的 App ID(非敏感,来自钥匙串 zentao.mzlc.me/feishu-app-id);App Secret 用 secret 存
 FEISHU_APP_ID = "cli_aa13a11707b89bdb"
 # 成员 Key 已改由 KV 保存,通过 POST /admin/keys 签发(见 README)。
-# 仅保留为空以兼容旧部署;鉴权优先读 KV。
+# 鉴权以 KV 为准;以下两张表是给人和审计看的台账,写入是 best-effort。
+REGISTRY_TABLE_ID = "tbl8IQgaVk9ckPfd"
+REQUEST_TABLE_ID = "tblFBzvs29vNjuqN"
 
 [observability]
 enabled = true
