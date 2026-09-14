@@ -55,3 +55,45 @@ if [ -d "$app_path" ]; then
 else
   echo "App bundle not found at $app_path, skipping notarization"
 fi
+
+# ---- DMG:制作 → 签名 → 公证 → 装订 → 端到端挂载校验 -------------------------
+# 全部在 macOS 作业里做(release 作业是 Linux,没有 hdiutil / codesign / stapler)。
+dmg="dist/Daily-Agent-Digest-$BUILD_ARCH.dmg"
+if [ -d "$app_path" ]; then
+  stage="$RUNNER_TEMP/dmg-stage-$BUILD_ARCH"
+  rm -rf "$stage" "$dmg"
+  mkdir -p "$stage"
+  cp -R "$app_path" "$stage/"
+  ln -s /Applications "$stage/Applications"
+  hdiutil create -volname 'Daily Agent Digest' -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
+  echo "Built $(basename "$dmg")"
+  codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+  echo 'Submitting DMG to Apple (no wait)'
+  xcrun notarytool submit "$dmg" "${auth[@]}" --no-wait --output-format json > "$metadata/dmg-submission.json"
+  dmg_sid=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$metadata/dmg-submission.json")
+  printf 'DMG notarization submission: %s\n' "$dmg_sid"
+  xcrun notarytool wait "$dmg_sid" "${auth[@]}" --timeout 20m || true
+  xcrun notarytool info "$dmg_sid" "${auth[@]}" --output-format json > "$metadata/dmg-status.json"
+  dmg_status=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$metadata/dmg-status.json")
+  printf 'DMG notarization status: %s\n' "$dmg_status"
+  if [ "$dmg_status" != 'Accepted' ]; then
+    xcrun notarytool log "$dmg_sid" "${auth[@]}" "$metadata/dmg-log.json" 2>/dev/null || true
+    cat "$metadata/dmg-log.json" 2>/dev/null || true
+    exit 1
+  fi
+  xcrun stapler staple "$dmg"
+  xcrun stapler validate "$dmg"
+
+  # 端到端校验:挂载后确认里面的 App 已签名+公证装订、Applications 链接存在
+  mount_point=$(mktemp -d)
+  hdiutil attach "$dmg" -mountpoint "$mount_point" -nobrowse -quiet
+  embedded_app=$(find "$mount_point" -maxdepth 1 -name '*.app' | head -1)
+  test -n "$embedded_app"
+  codesign --verify --deep --strict "$embedded_app"
+  xcrun stapler validate "$embedded_app"
+  [ -L "$mount_point/Applications" ] || { echo 'DMG 缺少 Applications 快捷方式' >&2; exit 1; }
+  hdiutil detach "$mount_point" -quiet
+  echo 'DMG signed, notarized, stapled and verified'
+else
+  echo "App bundle not found, skipping DMG"
+fi
