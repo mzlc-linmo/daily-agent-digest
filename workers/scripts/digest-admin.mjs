@@ -555,7 +555,9 @@ async function cmdRevoke(flags) {
   requireLogin();
   const keyId = flags._[0];
   if (!keyId) fail('用法:revoke <key_id>');
-  const revoked = await withSpinner(`撤销 ${keyId}`, () => revokeLocally(buildEnv(flags, { withDb: false }), keyId));
+  // 撤销是写操作,必须带 DB —— 漏了它这次撤销就不会进审计日志(踩过)
+  const env = buildEnv(flags);
+  const revoked = await withSpinner(`撤销 ${keyId}`, () => revokeLocally(env, keyId));
   ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
 }
 

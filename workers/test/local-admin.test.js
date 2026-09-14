@@ -193,6 +193,21 @@ test('listKeysLocally / revokeLocally', async () => {
   assert.equal(after[0].enabled, false);
 });
 
+test('缺 D1 时写操作仍然成功,但会明确警告不会留痕', async () => {
+  const env = { KEYS: fakeKV() }; // 故意不给 DB
+  const feishu = fakeFeishu();
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    const issued = await issueLocally(env, { member_id: 'liu', member: '刘', open_id: 'ou_liu' }, feishu);
+    assert.ok(issued.key, '缺 D1 不应影响签发本身');
+  } finally {
+    console.warn = original;
+  }
+  assert.ok(warnings.some((w) => w.includes('不会记入审计日志')), JSON.stringify(warnings));
+});
+
 test('bootstrapLocally 只建主表且幂等', async () => {
   const env = { BITABLE_APP_TOKEN: 'bascn_test', BITABLE_TABLE_ID: 'tbl_main' };
   const feishu = fakeFeishu();

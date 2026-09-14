@@ -51,6 +51,11 @@ export function parseJsonLoose(text) {
 
 /* ------------------------------------------------------------------ SQL */
 
+/// 没有 D1 时明确提示,避免"操作成功了但没留痕"这种静默缺口。
+function warnNoAudit(action) {
+  console.warn(`警告:未绑定 D1,本次「${action}」不会记入审计日志`);
+}
+
 export function sqlLiteral(value) {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL';
@@ -136,6 +141,7 @@ export function d1Adapter(databaseName, wrangler) {
 /// 签发一把 Key:解析身份 → 作废旧的(一人一把)→ 存 KV → 记审计。
 /// 台账由 D1 审计日志承担(飞书侧的登记表已取消)。
 export async function issueLocally(env, { member_id, member, email, open_id }, feishu = realFeishu) {
+  if (!env.DB) warnNoAudit('签发');
   const issued = await issueKey(env, feishu, { member_id, member, email, open_id });
   const superseded = await revokeExistingFor(env, issued.open_id, issued.key_id);
   await logEvent(env, {
@@ -146,7 +152,8 @@ export async function issueLocally(env, { member_id, member, email, open_id }, f
   return { ...issued, superseded };
 }
 
-export async function revokeLocally(env, keyId) {
+export async function revokeLocally(env, keyId, feishu = realFeishu) {
+  if (!env.DB) warnNoAudit('撤销');
   const revoked = await revokeKey(env, keyId);
   await logEvent(env, {
     event: 'revoke_key', outcome: 'ok', key_id: revoked.key_id,
