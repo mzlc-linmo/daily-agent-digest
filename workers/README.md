@@ -18,50 +18,48 @@ App ──POST /api/v1/digests──▶ Worker ──tenant_access_token──�
 https://xxx.feishu.cn/base/<BITABLE_APP_TOKEN>?table=<BITABLE_TABLE_ID>
 ```
 
-## 一键部署:管理 CLI
-
-所有运维动作都在一个 CLI 里,每一步都可以单独重跑(幂等);首次使用直接跑向导:
+## 部署:一个 CLI 搞定
 
 ```bash
 cd workers
-node scripts/digest-admin.mjs install
+node scripts/digest-admin.mjs install        # 全流程引导
 ```
 
-向导依次完成:**配置飞书凭据 → 配置管理员口令 → 创建 KV/D1 并部署 → 建飞书表并回填 table id → 读取员工 → 选员工签发 Key**。
-
-也可以逐步执行:
+向导依次完成:**校验飞书凭据 → 创建 KV/D1 并部署 Worker → 建飞书表并回填 table id → 读取员工 → 选员工签发 Key**。
+每一步也可以单独重跑(幂等)。
 
 | 命令 | 作用 |
 | --- | --- |
-| `digest-admin.mjs status` | 显示当前配置缺什么、后端是否健康 |
-| `digest-admin.mjs feishu` | 配置并**校验**飞书 App ID / Secret(Secret 只经 stdin 交给 wrangler,不落盘) |
-| `digest-admin.mjs admin-token` | 配置管理员口令;`--local-only` 只存本机钥匙串、不覆盖 Cloudflare |
+| `digest-admin.mjs status` | 显示配置、Cloudflare 登录状态、后端健康(默认命令) |
+| `digest-admin.mjs feishu` | 配置并**校验**飞书 App ID / Secret |
 | `digest-admin.mjs deploy` | 创建 **KV**(存 Key)+ **D1**(存审计日志)、应用 `schema.sql`、部署 Worker |
-| `digest-admin.mjs tables` | 调 `/admin/bootstrap` 建表建字段 → **回填 table id** → 重新部署 → 配置申请表单 |
+| `digest-admin.mjs tables` | 建飞书表 → **回填 table id** → 重新部署 → 自动配好申请表单 |
 | `digest-admin.mjs employees` | 读取员工(含 open_id) |
-| `digest-admin.mjs issue` | 交互式选员工签发 Key(或 `--open-id --name --member-id`) |
+| `digest-admin.mjs issue` | 交互式选员工签发 Key(`--open-id/--email/--name/--member-id` 可非交互) |
 | `digest-admin.mjs keys` / `revoke <key_id>` | 列出 / 撤销 |
 | `digest-admin.mjs logs` | 查询审计日志(`--member --date --event --outcome --limit`) |
 
-密钥来源:飞书 App Secret 与管理员口令优先从**本机钥匙串**读(`service=daily-agent-digest`),
-其次读环境变量;因此配好一次之后,后续命令都不用再输入。
+### 安全模型(重要)
 
-手动等价命令(不想用 CLI 时):
+**Worker 上不存在任何管理接口**,公网只有三个成员接口:`/healthz`、`/api/v1/me`、`/api/v1/digests`。
+建表、发 Key、撤销、查日志**全部在本机执行**,直连 KV / D1 / 飞书。
 
-```bash
-npx wrangler secret put FEISHU_APP_SECRET   # 提示时粘贴 App Secret
-npx wrangler secret put ADMIN_TOKEN
-npx wrangler deploy
-```
+因此**没有管理员口令**,门槛是两样东西:
 
-### 环境变量(可选)
+1. 一台**已登录 Cloudflare** 的机器(`wrangler login` 或 `CLOUDFLARE_API_TOKEN`)—— 每个管理命令都会先检查;
+2. 本机钥匙串里的**飞书 App Secret**。
+
+> ⚠️ **代价**:Cloudflare 账号权限远大于"只能发 Key 的口令"(能操作账号下所有 Worker/KV/D1/secret)。
+> 所以**不要把 Cloudflare 账号访问权给非管理员**。若将来需要第二个人管理 Key,
+> 应当给他一个范围更窄的凭据(例如只能读写该 KV 的 Cloudflare API Token),而不是账号权限。
+
+### 可选环境变量
 
 | 变量 | 说明 |
 | --- | --- |
 | `WRANGLER_CMD` | 默认 `npx --yes wrangler` |
-| `DIGEST_SUBMIT_URL` | 后端地址;默认读 `wrangler.toml` 的 `SUBMIT_URL` |
-| `ADMIN_TOKEN` | 管理员口令;默认读钥匙串 |
-| `DIGEST_SCAN_BASES` | 额外扫描的 base(`token:名称`,逗号分隔);默认读 `wrangler.toml` 的 `SCAN_BASES` |
+| `CLOUDFLARE_API_TOKEN` | 免交互登录(CI 或不想用 OAuth 时) |
+| `DIGEST_SCAN_BASES` | 额外扫描的 base(`token:名称`);默认读 `wrangler.toml` 的 `SCAN_BASES` |
 
 ## 成员与 Key 的映射:两张飞书表
 
@@ -95,20 +93,20 @@ npx wrangler deploy
 > ⚠️ 如果将来要把这个 base 分享给团队看日报,请**先把这两张表拆到另一个 base**,
 > 或开启 Bitable 高级权限限制可见范围,否则 Key 会随 base 一起暴露。
 
-## 管理员签发 Key
+## 管理员签发 Key(本机执行)
 
 ```bash
-# 1) 找不到人时先查 open_id(从企业已有表格的人员字段读)
-node scripts/digest-admin.mjs employees
-
-# 2) 交互式:列出员工 → 选序号(可多选,如 1,3)→ 逐个签发
-node scripts/digest-admin.mjs issue
+node scripts/digest-admin.mjs employees      # 先看有哪些人(含 open_id)
+node scripts/digest-admin.mjs issue          # 交互式:选序号(可多选)→ 逐个签发
 
 # 或直接指定
 node scripts/digest-admin.mjs issue --open-id ou_xxxx --name 张三 --member-id zhangsan
 ```
 
-明文 Key 只在签发响应里出现一次;服务端只存 sha256,台账里也只有公开的 key_id。
+用的是与 Worker **同一批模块**(`src/keys.js` / `src/registry.js`),所以"只存 sha256"、
+"一人一把有效 Key"这些规则与本机、服务端完全一致,不存在两份实现。
+
+明文 Key 只在签发时显示一次;台账里只有公开的 key_id。
 
 ## 成员侧配置
 
@@ -121,17 +119,22 @@ App 托盘菜单 →「设置」,只填两项:
 
 保存时会调用 `GET /api/v1/me` 校验,并把服务端返回的**姓名回填显示**,确认 Key 归属正确。凭据写入 `~/.local/share/daily-agent-digest/.env`(权限 `0600`),之后定时任务与重启都自动复用,不需要再输入。
 
-## 接口
+## 接口(只有成员接口)
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/v1/digests` | 提交日报;同日重复提交按「成员+日期」覆盖,内容相同则幂等返回 |
-| GET | `/api/v1/me` | 用 Key 换成员信息(设置校验用) |
+| GET | `/healthz` | 健康检查 |
+| GET | `/api/v1/me` | 用 Key 换回成员身份(App「测试连接」用) |
 | GET | `/api/v1/digests?date=` | 查询某天是否已提交 |
-| GET | `/healthz` | 存活 + 能否拿到 tenant_access_token |
-| POST | `/admin/bootstrap` | 建表 + 建字段(需 `ADMIN_TOKEN`) |
+| POST | `/api/v1/digests` | 提交日报(幂等:同日同成员覆盖) |
 
-错误语义见设计文档第 4.2 节。**只要表格没写成功就返回非 2xx**,客户端因此不会误报"已上报"。
+`/admin/*` 已彻底移除;管理动作见上面的 CLI。
+
+## 定时任务
+
+`scheduled()` 每分钟运行:轮询「密钥申请」表,给未签发的行生成 Key 并写回该行;
+状态为「已撤销」的行则停用对应 Key;每小时清理一次过期审计日志。这部分必须留在服务端,
+所以"填表即得 Key"不需要管理员在场。
 
 ## 本地开发与测试
 

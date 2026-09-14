@@ -3,15 +3,14 @@
 // 所有飞书访问都通过注入的 feishu 客户端进行,因此这一层可以在没有 Worker 运行时、
 // 没有网络的情况下用假客户端完整测试(见 workers/test/handler.test.js)。
 
-import { authenticate, authenticateAdmin, AuthError } from './auth.js';
+import { authenticate, AuthError } from './auth.js';
 import {
   ValidationError, validatePayload, contentFingerprint, toRows, FIELDS, FIELD_DEFS,
   REPORT_DATE, MAX_BODY_BYTES,
 } from './report.js';
 import * as realFeishu from './feishu.js';
-import { issueKey, listKeys, revokeKey, revokeExistingFor } from './keys.js';
-import { logEvent, queryLogs, requestContext } from './logs.js';
-import { ensureTable, recordIssued, recordRevoked, recordSubmission, REGISTRY, REQUESTS, registryFieldDefs, requestFieldDefs } from './registry.js';
+import { logEvent, requestContext } from './logs.js';
+import { recordSubmission } from './registry.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -136,140 +135,6 @@ export async function queryDigest(request, env, feishu, url) {
   });
 }
 
-/// 管理员一次性建表 + 建字段,返回 table_id 供写入 Cloudflare vars。
-export async function bootstrap(request, env, feishu, audit = {}) {
-  authenticateAdmin(request, env);
-  if (!env.BITABLE_APP_TOKEN) throw new ValidationError('缺少 BITABLE_APP_TOKEN');
-  const tableName = env.BITABLE_TABLE_NAME || '日报明细';
-  const created = [];
-  const existingFields = [];
-
-  let tableId = env.BITABLE_TABLE_ID;
-  if (!tableId) {
-    const tables = await feishu.listTables(env);
-    const found = tables.find((table) => table.name === tableName);
-    tableId = found ? found.table_id : await feishu.createTable(env, {
-      name: tableName,
-      fields: [{ field_name: FIELDS.submitId, type: 1 }],
-    });
-    if (!found) created.push(`table:${tableName}`);
-  }
-
-  // 两张管理表的字段补全(表本身就放在同一个 base 里)
-  const adminTables = {};
-  for (const [key, spec, defs] of [['registry', REGISTRY, registryFieldDefs()], ['requests', REQUESTS, requestFieldDefs()]]) {
-    try {
-      const result = await ensureTable(env, feishu, spec, defs);
-      if (!result.tableId) throw new Error('未拿到表 id');
-      adminTables[key] = result.tableId;
-      created.push(...result.created);
-    } catch (err) {
-      console.warn(`建管理表 ${spec.name} 失败:${err.message}`);
-      adminTables[key] = `failed:${err.message}`;
-    }
-  }
-
-  const scoped = { ...env, BITABLE_TABLE_ID: tableId };
-  const current = await feishu.listFields(env, tableId);
-  const byName = new Map(current.map((field) => [field.field_name, field]));
-  // 历史遗留:成员曾是文本字段,现在必须是人员字段(关联通讯录)。
-  const legacyMember = byName.get(FIELDS.member);
-  if (legacyMember && legacyMember.type !== 11) {
-    const renamed = `${FIELDS.member}文本`;
-    await feishu.updateField(env, legacyMember.field_id, { field_name: renamed, type: legacyMember.type }, tableId);
-    byName.delete(FIELDS.member);
-    byName.set(renamed, { ...legacyMember, field_name: renamed });
-    created.push(`renamed:${FIELDS.member}->${renamed}`);
-  }
-  const present = new Set(byName.keys());
-  for (const definition of FIELD_DEFS) {
-    if (present.has(definition.field_name)) {
-      existingFields.push(definition.field_name);
-      continue;
-    }
-    await feishu.createField(env, definition, tableId);
-    created.push(`field:${definition.field_name}`);
-  }
-
-  await logEvent(env, {
-    ...audit, event: 'bootstrap', outcome: 'ok',
-    duration_ms: audit.started ? Date.now() - audit.started : null,
-    detail: JSON.stringify({ table_id: tableId, registry: adminTables.registry, requests: adminTables.requests }),
-  });
-  return json({
-    app_token: env.BITABLE_APP_TOKEN,
-    table_id: tableId,
-    table_name: tableName,
-    created,
-    existing_fields: existingFields,
-    registry_table_id: adminTables.registry,
-    request_table_id: adminTables.requests,
-    next_step: `把 BITABLE_TABLE_ID="${tableId}"、REGISTRY_TABLE_ID="${adminTables.registry}"、REQUEST_TABLE_ID="${adminTables.requests}" 写入 wrangler.toml 的 [vars] 后重新部署`,
-  });
-}
-
-/// 管理员签发 Key:此时就把人员身份(含 open_id)绑死。
-export async function adminIssueKey(request, env, feishu, audit = {}) {
-  authenticateAdmin(request, env);
-  const body = await request.json().catch(() => ({}));
-  const issued = await issueKey(env, feishu, {
-    member_id: body.member_id,
-    member: body.member,
-    email: body.email,
-    open_id: body.open_id,
-  });
-  // 一人一把:同一成员重新签发时,旧 Key 立即失效(排除刚签发的这把,台账同步标记)
-  for (const oldKeyId of await revokeExistingFor(env, issued.open_id, issued.key_id)) {
-    await recordRevoked(env, feishu, { key_id: oldKeyId, revoked_at: new Date().toISOString() });
-  }
-  let registry = [];
-  try {
-    registry = await recordIssued(env, feishu, {
-      member: issued.member, member_id: issued.member_id, key_id: issued.key_id,
-      // 用解析后的 open_id,而不是请求体里的(邮箱解析的情况请求体里没有)
-      open_id: issued.open_id, created_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.warn(`登记表写入失败(Key 已签发):${err.message}`);
-    registry = [`registry:failed:${err.message}`];
-  }
-  await logEvent(env, {
-    ...audit, event: 'issue_key', outcome: 'ok',
-    duration_ms: audit.started ? Date.now() - audit.started : null,
-    key_id: issued.key_id, member: issued.member, member_id: issued.member_id,
-    detail: JSON.stringify({ registry }),
-  });
-  return json({
-    ...issued,
-    registry,
-    next_step: '把 key 发给该成员,填进 App 的「设置」;服务端只保存哈希,明文不再可查',
-  }, 201);
-}
-
-export async function adminListKeys(request, env) {
-  authenticateAdmin(request, env);
-  return json({ keys: await listKeys(env) });
-}
-
-export async function adminRevokeKey(request, env, feishu, audit = {}) {
-  authenticateAdmin(request, env);
-  const body = await request.json().catch(() => ({}));
-  const revoked = await revokeKey(env, String(body.key_id ?? ''));
-  let registry = [];
-  try {
-    registry = await recordRevoked(env, feishu, { key_id: revoked.key_id, revoked_at: revoked.revoked_at });
-  } catch (err) {
-    console.warn(`登记表撤销回写失败:${err.message}`);
-  }
-  await logEvent(env, {
-    ...audit, event: 'revoke_key', outcome: 'ok',
-    duration_ms: audit.started ? Date.now() - audit.started : null,
-    key_id: revoked.key_id, member: revoked.member, member_id: revoked.member_id,
-    detail: JSON.stringify({ registry }),
-  });
-  return json({ ...revoked, registry });
-}
-
 export async function healthz(env, feishu) {
   try {
     await feishu.healthcheck(env);
@@ -285,14 +150,9 @@ export async function handleRequest(request, env, deps = {}) {
   const now = deps.now ?? (() => Date.now());
   const url = new URL(request.url);
   const route = `${request.method} ${url.pathname}`;
-  // 审计上下文:所有分支共用;失败也要留痕,所以放在 try 外面
+  // 审计上下文:失败也要留痕,所以放在 try 外面
   const audit = { ...requestContext(request), started: now() };
-  const auditEvent = {
-    'POST /api/v1/digests': 'submit',
-    'POST /admin/keys': 'issue_key',
-    'POST /admin/keys/revoke': 'revoke_key',
-    'POST /admin/bootstrap': 'bootstrap',
-  }[route] ?? null;
+  const auditEvent = route === 'POST /api/v1/digests' ? 'submit' : null;
 
   try {
     switch (route) {
@@ -304,22 +164,13 @@ export async function handleRequest(request, env, deps = {}) {
         return await queryDigest(request, env, feishu, url);
       case 'POST /api/v1/digests':
         return await submitDigest(request, env, feishu, now, audit);
-      case 'POST /admin/bootstrap':
-        return await bootstrap(request, env, feishu, audit);
-      case 'POST /admin/keys':
-        return await adminIssueKey(request, env, feishu, audit);
-      case 'GET /admin/keys':
-        return await adminListKeys(request, env);
-      case 'POST /admin/keys/revoke':
-        return await adminRevokeKey(request, env, feishu, audit);
-      case 'GET /admin/logs':
-        return await adminLogs(request, env, url);
       default:
+        // 管理接口已彻底移除:公网不暴露任何管理入口。
+        // 管理动作(建表/发 Key/撤销/查日志)由本机 CLI 直连 KV/D1/飞书完成。
         return json({ error: { code: 'not_found', message: `未知接口:${route}` } }, 404);
     }
   } catch (err) {
     const response = errorResponse(err);
-    // 失败的请求同样入审计日志 —— 否则"谁在什么时候提交失败了"永远查不到
     if (auditEvent) {
       await logEvent(env, {
         ...audit,
@@ -332,17 +183,4 @@ export async function handleRequest(request, env, deps = {}) {
     }
     return response;
   }
-}
-
-/// 查询审计日志(管理员)。支持 ?limit=&member_id=&date=&event=&outcome=
-export async function adminLogs(request, env, url) {
-  authenticateAdmin(request, env);
-  const rows = await queryLogs(env, {
-    limit: url.searchParams.get('limit') ?? 100,
-    memberId: url.searchParams.get('member_id') ?? undefined,
-    date: url.searchParams.get('date') ?? undefined,
-    event: url.searchParams.get('event') ?? undefined,
-    outcome: url.searchParams.get('outcome') ?? undefined,
-  });
-  return json({ count: rows.length, logs: rows });
 }

@@ -207,77 +207,9 @@ test('同一天内容变化时覆盖,行数不变', async () => {
   assert.equal([...feishu.tables.get('tbl_test').rows.values()][0][FIELDS.desc], '改了内容');
 });
 
-test('签发 Key 时绑定人员:邮箱解析成 open_id 后才生成 Key', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  const res = await handleRequest(new Request('https://digest.example.com/admin/keys', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ member_id: 'zhaoliu', member: '赵六', email: 'zhaoliu@example.com' }),
-  }), env, { feishu });
-  const body = await res.json();
-  assert.equal(res.status, 201);
-  assert.match(body.key, /^dag_[0-9a-f]{8}_/);
-  assert.equal(body.member, '赵六');
-  // 记录里存的只有哈希,且已绑定 open_id
-  const stored = await env.KEYS.get(`key:${body.key_id}`, 'json');
-  assert.ok(stored.hash && !stored.hash.includes(body.key.split('_')[2]), '不得存明文');
-  assert.equal(stored.open_id, 'ou_zhaoliu');
-  // 用签发的 Key 提交,人员列直接关联通讯录
-  const submit = await handleRequest(post('/api/v1/digests', REPORT, { key: body.key }), env, { feishu });
-  const submitted = await submit.json();
-  assert.equal(submit.status, 201);
-  assert.equal(submitted.member_linked, true);
-  assert.deepEqual([...feishu.tables.get('tbl_test').rows.values()][0][FIELDS.member], [{ id: 'ou_zhaoliu' }]);
-  assert.equal(feishu.calls.resolve, 1, '只在签发时解析一次,提交时不再调用通讯录');
-});
 
-test('邮箱解析不到人时拒绝签发(不生成无效 Key)', async () => {
-  const feishu = fakeFeishu();
-  feishu.resolveOpenIds = async (_env, emails) => Object.fromEntries(emails.map((e) => [e, '']));
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  const res = await handleRequest(new Request('https://digest.example.com/admin/keys', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ member_id: 'nobody', member: '查无此人', email: 'ghost@example.com' }),
-  }), env, { feishu });
-  assert.equal(res.status, 422);
-  assert.match((await res.json()).error.message, /contact:user.id:readonly/);
-  assert.equal((await env.KEYS.list({ prefix: 'key:' })).keys.length, 0, '失败不得留下半成品 Key');
-});
 
-test('签发时可跳过解析,直接给 open_id', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  const res = await handleRequest(new Request('https://digest.example.com/admin/keys', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ member_id: 'qianqi', member: '钱七', open_id: 'ou_qianqi' }),
-  }), env, { feishu });
-  assert.equal(res.status, 201);
-  assert.equal(feishu.calls.resolve, 0, '给了 open_id 就不该再查通讯录');
-});
 
-test('管理员可列出与撤销 Key,撤销后立即失效', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  const auth = { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
-  const list = await (await handleRequest(new Request('https://digest.example.com/admin/keys', { headers: auth }), env, { feishu })).json();
-  assert.equal(list.keys.length, 2);
-  assert.ok(list.keys.every((k) => k.hash === undefined), '列表不得返回哈希');
-
-  const revoked = await handleRequest(new Request('https://digest.example.com/admin/keys/revoke', {
-    method: 'POST', headers: auth, body: JSON.stringify({ key_id: 'k1' }),
-  }), env, { feishu });
-  assert.equal(revoked.status, 200);
-
-  const after = await handleRequest(post('/api/v1/digests', REPORT), env, { feishu });
-  assert.equal(after.status, 403);
-  assert.equal((await after.json()).error.code, 'key_revoked');
-});
 
 test('拒绝无效 Key、停用成员与格式错误的 Key', async () => {
   const feishu = fakeFeishu();
@@ -352,64 +284,8 @@ test('/api/v1/digests?date= 反映是否已提交', async () => {
   assert.equal(body.count, 2);
 });
 
-test('bootstrap 需要管理口令,并返回 table_id', async () => {
-  const feishu = fakeFeishu();
-  const env = { ...ENV, BITABLE_TABLE_ID: '' };
-  const denied = await handleRequest(post('/admin/bootstrap', {}, { key: 'wrong', headers: {} }), env, { feishu });
-  assert.equal(denied.status, 401);
 
-  const ok = await handleRequest(new Request('https://digest.example.com/admin/bootstrap', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}` },
-  }), env, { feishu });
-  const body = await ok.json();
-  assert.equal(ok.status, 200);
-  assert.ok(body.table_id, 'bootstrap 必须返回 table_id');
-});
 
-test('签发时写「成员密钥」登记表,并把待处理申请标为已签发', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  // 造一条待处理申请
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
-    fields: { 申请人: [{ id: 'ou_zhaoliu' }], 状态: '待处理', 申请说明: '需要日报 Key' },
-  }]);
-  const res = await handleRequest(new Request('https://digest.example.com/admin/keys', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ member_id: 'zhaoliu', member: '赵六', email: 'zhaoliu@example.com' }),
-  }), env, { feishu });
-  const body = await res.json();
-  assert.equal(res.status, 201);
-  assert.ok(body.registry.some((n) => n.startsWith('registry:created')), JSON.stringify(body.registry));
-
-  const registryRows = [...feishu.tables.get(env.REGISTRY_TABLE_ID).rows.values()];
-  assert.equal(registryRows.length, 1);
-  assert.equal(registryRows[0]['KeyID'], body.key_id);
-  assert.equal(registryRows[0]['状态'], '已启用');
-  assert.deepEqual(registryRows[0]['成员'], [{ id: 'ou_zhaoliu' }]);
-
-  const requestRows = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()];
-  assert.equal(requestRows[0]['状态'], '已签发', '申请应被自动关单');
-  assert.equal(requestRows[0]['KeyID'], body.key_id);
-});
-
-test('撤销时把登记表状态改为已撤销', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  const auth = { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
-  await feishu.batchCreate(env, env.REGISTRY_TABLE_ID, [{ fields: { KeyID: 'k1', 成员ID: 'zhangsan', 状态: '已启用' } }]);
-  const res = await handleRequest(new Request('https://digest.example.com/admin/keys/revoke', {
-    method: 'POST', headers: auth, body: JSON.stringify({ key_id: 'k1' }),
-  }), env, { feishu });
-  const body = await res.json();
-  assert.equal(res.status, 200);
-  assert.ok(body.registry.some((n) => n.startsWith('registry:revoked')));
-  const row = [...feishu.tables.get(env.REGISTRY_TABLE_ID).rows.values()][0];
-  assert.equal(row['状态'], '已撤销');
-  assert.ok(row['撤销时间'] > 0);
-});
 
 test('提交成功后回写「最近提交」', async () => {
   const feishu = fakeFeishu();
@@ -622,36 +498,16 @@ test('没绑定 D1 时日志静默跳过', async () => {
   assert.equal(res.status, 201);
 });
 
-test('签发与撤销也写入审计日志', async () => {
+
+
+test('管理接口已彻底移除,公网不存在任何管理入口', async () => {
   const feishu = fakeFeishu();
-  const env = { ...ENV, DB: fakeDB(), KEYS: fakeKV() };
-  const auth = { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
-  await handleRequest(new Request('https://digest.example.com/admin/keys', {
-    method: 'POST', headers: auth,
-    body: JSON.stringify({ member_id: 'zhaoliu', member: '赵六', open_id: 'ou_zhaoliu' }),
-  }), env, { feishu });
-  await handleRequest(new Request('https://digest.example.com/admin/keys/revoke', {
-    method: 'POST', headers: auth, body: JSON.stringify({ key_id: 'k1' }),
-  }), env, { feishu });
-  const events = env.DB.inserted.map((r) => r.event);
-  assert.ok(events.includes('issue_key'), JSON.stringify(events));
-  assert.ok(events.includes('revoke_key'), JSON.stringify(events));
-});
-
-test('日志查询接口需要管理口令,并能按条件过滤', async () => {
-  const feishu = fakeFeishu();
-  const env = { ...ENV, DB: fakeDB() };
-  await logEvent(env, { event: 'submit', outcome: 'ok', member_id: 'zhangsan', date: '2026-09-13' });
-
-  const denied = await handleRequest(new Request('https://digest.example.com/admin/logs'), env, { feishu });
-  assert.equal(denied.status, 401, '没有管理口令不得读日志');
-
-  const ok = await handleRequest(new Request('https://digest.example.com/admin/logs?member_id=zhangsan', {
-    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}` },
-  }), env, { feishu });
-  assert.equal(ok.status, 200);
-  const body = await ok.json();
-  assert.ok(Array.isArray(body.logs));
+  for (const path of ['/admin/keys', '/admin/keys/revoke', '/admin/bootstrap', '/admin/logs']) {
+    const get = await handleRequest(new Request(`https://digest.example.com${path}`), ENV, { feishu });
+    assert.equal(get.status, 404, `${path} 不应存在`);
+    const posted = await handleRequest(post(path, {}), ENV, { feishu });
+    assert.equal(posted.status, 404, `${path} 不应存在(POST)`);
+  }
 });
 
 test('未知路径返回 404', async () => {

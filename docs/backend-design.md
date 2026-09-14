@@ -345,7 +345,36 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 - `admin-token --local-only` 只把口令存本机(**不覆盖** Cloudflare 上的口令);
 - `--yes` 非交互模式下,若本机已有口令则**拒绝改动** Cloudflare 的 secret —— 避免自动化把线上口令冲掉。
 
-## 20. 已确认决策
+## 20. 移除公网管理接口(2026-09-14)
+
+原先 `/admin/bootstrap`、`/admin/keys`、`/admin/keys/revoke`、`/admin/logs` 都在公网上,
+靠一个共享的 `ADMIN_TOKEN` 保护。这是最弱的一环:**口令一旦泄露(截图、终端历史、日志、误贴),
+任何人都能签发 Key、读取全部审计日志**,而且它是单一因素。
+
+现在**彻底删除这些接口**,管理动作全部在**本机**完成:
+
+| 动作 | 原来 | 现在 |
+| --- | --- | --- |
+| 建表/建字段 | `POST /admin/bootstrap` | CLI 直连飞书 API(复用 `src/tables.js`) |
+| 签发 Key | `POST /admin/keys` | CLI 直连 KV(`wrangler kv`)+ 写台账 + 写 D1 |
+| 撤销 | `POST /admin/keys/revoke` | 同上 |
+| 查日志 | `GET /admin/logs` | CLI 直连 D1(`wrangler d1 execute`) |
+
+**门槛变成**:一台已登录 Cloudflare 的机器 + 本机飞书 App Secret。CLI 的每个管理命令都先 `wrangler whoami`,
+未登录直接拒绝。Worker 公网只剩 `/healthz`、`/api/v1/me`、`/api/v1/digests`。
+
+**关键约束:规则只存在一处。** CLI 不复制任何逻辑 —— 直接 import Worker 的 `src/keys.js`、`src/registry.js`、
+`src/tables.js`、`src/logs.js`,只有传输层不同(wrangler 适配器 vs Worker binding)。
+`scripts/local-admin.mjs` 把这些封成一层,并有单元测试覆盖(含"一人一把"、只存 sha256、SQL 转义)。
+
+**代价(必须记住)**:Cloudflare 账号权限远大于"只能发 Key 的口令"。因此
+**不要把 Cloudflare 账号访问权给非管理员**;若将来需要第二个人管 Key,应给范围更窄的凭据
+(例如只能读写该 KV 的 Cloudflare API Token),而不是账号权限。
+
+**安全性收益**:公网上不再存在任何管理入口,"猜口令/爆破/口令泄露"这一整类风险消失;
+同时少了一个需要轮换的长期 secret(`ADMIN_TOKEN` 已不再需要)。
+
+## 21. 已确认决策
 
 | 编号 | 问题 | 决策 |
 | --- | --- | --- |

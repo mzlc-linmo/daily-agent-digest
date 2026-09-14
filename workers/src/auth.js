@@ -71,13 +71,5 @@ export async function authenticate(request, env) {
   };
 }
 
-/// 管理员口令校验(bootstrap 用)。
-export function authenticateAdmin(request, env) {
-  const header = request.headers.get('Authorization') ?? '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const expected = env.ADMIN_TOKEN;
-  if (!expected) throw new AuthError('未配置 ADMIN_TOKEN', 503, 'not_ready');
-  if (!timingSafeEqualHex(token, expected)) throw new AuthError('管理口令不正确', 401, 'invalid_admin_token');
-}
 
 
