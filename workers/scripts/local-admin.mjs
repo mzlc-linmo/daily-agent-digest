@@ -18,6 +18,38 @@ import { bootstrapTables } from '../src/tables.js';
 import { logEvent, queryLogs } from '../src/logs.js';
 import * as realFeishu from '../src/feishu.js';
 
+/* ------------------------------------------------------------- JSON 解析 */
+
+/// 从可能夹带噪声的输出里提取第一个完整的 JSON 值。
+/// 只认 stdout 还不够保险(某些版本会在 JSON 后追加提示),所以按括号配平截取,
+/// 这样可以彻底避免 "Unexpected non-whitespace character after JSON"。
+export function parseJsonLoose(text) {
+  const source = String(text ?? '');
+  const start = source.search(/[[{]/);
+  if (start === -1) return null;
+  const open = source[start];
+  const close = open === '[' ? ']' : '}';
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return JSON.parse(source.slice(start, i + 1));
+    }
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ SQL */
 
 export function sqlLiteral(value) {
@@ -38,19 +70,21 @@ export function interpolate(sql, params = []) {
 /// 把 `wrangler kv key ... --remote` 包成 Workers KV binding 的形状。
 export function kvAdapter(namespaceId, wrangler) {
   const ns = ['--namespace-id', namespaceId, '--remote'];
+  // 只解析 stdout:npx 会把 npm notice 写到 stderr,混进来会破坏 JSON
   const run = (args, what) => {
     const r = wrangler(args);
-    if (r.code !== 0) throw new Error(`${what}失败:${(r.out ?? '').trim()}`);
-    return r.out ?? '';
+    if (r.code !== 0) throw new Error(`${what}失败:${((r.stderr || r.stdout) ?? '').trim()}`);
+    return r.stdout ?? '';
   };
   return {
     async get(key, type) {
       const r = wrangler(['kv', 'key', 'get', key, ...ns]);
+      const combined = `${r.stdout ?? ''}${r.stderr ?? ''}`;
       if (r.code !== 0) {
-        if (/not found|does not exist|404/i.test(r.out ?? '')) return null;
-        throw new Error(`读取 KV 失败:${(r.out ?? '').trim()}`);
+        if (/not found|does not exist|404/i.test(combined)) return null;
+        throw new Error(`读取 KV 失败:${((r.stderr || r.stdout) ?? '').trim()}`);
       }
-      const raw = (r.out ?? '').trim();
+      const raw = (r.stdout ?? '').trim();
       if (!raw) return null;
       return type === 'json' ? JSON.parse(raw) : raw;
     },
@@ -70,9 +104,7 @@ export function kvAdapter(namespaceId, wrangler) {
     async list({ prefix } = {}) {
       const args = ['kv', 'key', 'list', ...ns];
       if (prefix) args.push('--prefix', prefix);
-      const out = run(args, '列出 KV');
-      const start = out.indexOf('[');
-      const parsed = start === -1 ? [] : JSON.parse(out.slice(start));
+      const parsed = parseJsonLoose(run(args, '列出 KV')) ?? [];
       return { keys: parsed.map((k) => ({ name: k.name })) };
     },
   };
@@ -84,10 +116,8 @@ export function kvAdapter(namespaceId, wrangler) {
 export function d1Adapter(databaseName, wrangler) {
   const exec = (sql) => {
     const r = wrangler(['d1', 'execute', databaseName, '--remote', '--json', '--command', sql]);
-    if (r.code !== 0) throw new Error(`D1 执行失败:${(r.out ?? '').trim()}`);
-    const out = r.out ?? '';
-    const start = out.indexOf('[');
-    return start === -1 ? [] : JSON.parse(out.slice(start));
+    if (r.code !== 0) throw new Error(`D1 执行失败:${((r.stderr || r.stdout) ?? '').trim()}`);
+    return parseJsonLoose(r.stdout ?? '') ?? [];
   };
   return {
     prepare(sql) {

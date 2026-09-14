@@ -8,7 +8,7 @@ import test from 'node:test';
 
 import {
   bootstrapLocally, d1Adapter, interpolate, issueLocally, listKeysLocally,
-  kvAdapter, revokeLocally, sqlLiteral,
+  kvAdapter, parseJsonLoose, revokeLocally, sqlLiteral,
 } from '../scripts/local-admin.mjs';
 import { sha256Hex } from '../src/report.js';
 import { FIELDS } from '../src/report.js';
@@ -82,15 +82,26 @@ test('interpolate 按顺序替换占位符', () => {
   assert.equal(interpolate('SELECT * FROM t WHERE a = ? AND b = ?', ['x', 3]), "SELECT * FROM t WHERE a = 'x' AND b = 3");
 });
 
+test('parseJsonLoose 能在 JSON 后夹带噪声时正确解析', () => {
+  // 这正是线上报的错:npx 把 npm notice 写到 stderr,和 stdout 拼在一起后解析失败
+  const noisy = '[\n  {\n    "name": "key:aaaa"\n  }\n]\nnpm notice New major version of npm available!\n';
+  assert.deepEqual(parseJsonLoose(noisy), [{ name: 'key:aaaa' }]);
+  assert.deepEqual(parseJsonLoose('WARNING: proxy\n[{"results":[]}]\ntrailing'), [{ results: [] }]);
+  assert.equal(parseJsonLoose('no json here'), null);
+  // 字符串里的括号不能干扰配平
+  assert.deepEqual(parseJsonLoose('[{"a":"}{"}]extra'), [{ a: '}{' }]);
+});
+
 /* ------------------------------------------------------------- 适配器 */
 
 test('kvAdapter 把 wrangler kv 包成 KV binding 的形状', async () => {
   const calls = [];
   const fakeWrangler = (args) => {
     calls.push(args);
-    if (args[2] === 'get') return { code: 0, out: '{"member":"张三"}' };
-    if (args[2] === 'list') return { code: 0, out: '[\n  {\n    "name": "key:aaaa"\n  }\n]' };
-    return { code: 0, out: '' };
+    const ok = (stdout) => ({ code: 0, stdout, stderr: '' });
+    if (args[2] === 'get') return ok('{"member":"张三"}');
+    if (args[2] === 'list') return ok('[\n  {\n    "name": "key:aaaa"\n  }\n]');
+    return ok('');
   };
   const kv = kvAdapter('ns123', fakeWrangler);
   assert.deepEqual(await kv.get('key:aaaa', 'json'), { member: '张三' });
@@ -105,9 +116,9 @@ test('kvAdapter 把 wrangler kv 包成 KV binding 的形状', async () => {
 });
 
 test('kvAdapter 对不存在的键返回 null,其他错误抛出', async () => {
-  const missing = kvAdapter('ns', () => ({ code: 1, out: 'Value not found' }));
+  const missing = kvAdapter('ns', () => ({ code: 1, stdout: '', stderr: 'Value not found' }));
   assert.equal(await missing.get('key:none', 'json'), null);
-  const broken = kvAdapter('ns', () => ({ code: 1, out: 'boom' }));
+  const broken = kvAdapter('ns', () => ({ code: 1, stdout: '', stderr: 'boom' }));
   await assert.rejects(() => broken.get('key:x', 'json'), /读取 KV 失败/);
 });
 
@@ -115,7 +126,7 @@ test('d1Adapter 执行 SQL 并返回结果', async () => {
   const seen = [];
   const fakeWrangler = (args) => {
     seen.push(args);
-    return { code: 0, out: '[{"results":[{"n":1}],"success":true}]' };
+    return { code: 0, stdout: '[{"results":[{"n":1}],"success":true}]', stderr: '' };
   };
   const db = d1Adapter('logs-db', fakeWrangler);
   const rows = await db.prepare('SELECT ? AS n').bind(1).all();

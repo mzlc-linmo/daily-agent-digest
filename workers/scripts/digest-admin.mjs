@@ -66,7 +66,12 @@ function run(command, args = [], { input, capture = true } = {}) {
 function wrangler(args, { input, quiet = true } = {}) {
   const [cmd, ...base] = WRANGLER.split(' ').filter(Boolean);
   const result = run(cmd, [...base, ...args], { input, capture: quiet });
-  return { code: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+  const stdout = result.stdout ?? '';
+  const stderr = result.stderr ?? '';
+  // out 仅用于展示(错误信息);解析 JSON 必须只用 stdout ——
+  // `npx wrangler` 会把 npm notice 写到 stderr,拼进来会让 JSON.parse 报
+  // "Unexpected non-whitespace character after JSON"。
+  return { code: result.status, stdout, stderr, out: `${stdout}${stderr}` };
 }
 
 /// 判断 wrangler 登录状态。必须区分两种失败:
@@ -173,6 +178,37 @@ function padEndWidth(text, width) {
   return s + ' '.repeat(Math.max(0, width - displayWidth(s)));
 }
 
+/* -------------------------------------------------------------- 进度动画 */
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+let spinnerActive = false;
+
+/// 执行耗时操作时显示旋转动画(仅真终端)。非终端只打印一行,避免污染输出。
+/// 嵌套调用不再起第二个动画 —— 两个定时器抢同一行会互相覆盖成花屏。
+async function withSpinner(label, fn) {
+  if (spinnerActive) return fn();
+  spinnerActive = true;
+  const tty = Boolean(process.stdout.isTTY);
+  let index = 0;
+  let timer = null;
+  const draw = () => process.stdout.write(`\r\x1b[2m${SPINNER_FRAMES[index++ % SPINNER_FRAMES.length]} ${label}\x1b[0m`);
+  const clear = () => { if (tty) process.stdout.write('\r\x1b[0J'); };
+  if (tty) { draw(); timer = setInterval(draw, 80); } else { say(c.dim(`  ${label}…`)); }
+  try {
+    const result = await fn();
+    if (timer) clearInterval(timer);
+    clear();
+    return result;
+  } catch (err) {
+    if (timer) clearInterval(timer);
+    clear();
+    throw err;
+  } finally {
+    spinnerActive = false;
+  }
+}
+
 /* ------------------------------------------------------------------ 交互 */
 
 let rl = null;
@@ -204,6 +240,45 @@ async function confirm(question, { yes = false } = {}) {
 }
 
 const closeReader = () => { if (rl) { rl.close(); rl = null; } };
+
+/// 读取密钥类输入:终端下不回显(打 * 号),管道下按普通行读。
+async function askSecret(question) {
+  const stdin = process.stdin;
+  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') return (await ask(question)).trim();
+  closeReader();
+  if (stdin.isPaused()) stdin.resume();
+  process.stdout.write(`${c.bold('?')} ${question}: `);
+  return new Promise((resolve) => {
+    let buffer = '';
+    const finish = (value) => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.off('data', onData);
+      process.stdout.write('\n');
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk.toString('utf8')) {
+        if (ch === '\r' || ch === '\n') return finish(buffer.trim());
+        if (ch === '\u0003') { finish(''); process.exit(130); }
+        if (ch === '\u007f' || ch === '\b') { buffer = buffer.slice(0, -1); process.stdout.write('\b \b'); continue; }
+        buffer += ch;
+        process.stdout.write('*');
+      }
+    };
+    stdin.setRawMode(true);
+    stdin.on('data', onData);
+  });
+}
+
+/// 取飞书 App Secret:参数 → 环境变量 → 钥匙串 → 现场输入(只用于本次,不落盘)。
+async function ensureFeishuSecret(flags) {
+  const { appSecret } = resolvedFeishu(flags);
+  if (appSecret) return appSecret;
+  const entered = await askSecret('飞书 App Secret(仅本次使用,不保存)');
+  if (!entered) fail('缺少飞书 App Secret');
+  return entered;
+}
 
 /* ------------------------------------------------------------------ 飞书 */
 
@@ -291,9 +366,10 @@ async function listEmployees(token, extraBases = []) {
 }
 
 async function fetchEmployees(flags) {
-  const { appId, appSecret } = resolvedFeishu(flags);
-  if (!appId || !appSecret) fail('缺飞书凭据:先跑 `feishu`');
-  const token = await feishuToken(appId, appSecret);
+  const { appId } = resolvedFeishu(flags);
+  if (!appId) fail('缺飞书 App ID:先跑 `feishu`');
+  const appSecret = await ensureFeishuSecret(flags);
+  const token = await withSpinner('读取飞书通讯录', () => feishuToken(appId, appSecret));
   const extra = (flags['scan-bases'] || process.env.DIGEST_SCAN_BASES || tomlVar('SCAN_BASES') || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
   return listEmployees(token, extra);
@@ -343,12 +419,11 @@ async function cmdFeishu(flags) {
   if (!appId.startsWith('cli_')) fail(`App ID 看起来不对:${appId}(应以 cli_ 开头)`);
   const hadSecret = Boolean(appSecret);
   if (!appSecret) {
-    appSecret = (await ask('飞书 App Secret(粘贴新的;回车取消)')).trim();
+    appSecret = await askSecret('飞书 App Secret(输入不回显)');
     if (!appSecret) fail('缺少 App Secret');
   }
 
-  process.stdout.write(c.dim('  正在校验凭据…\n'));
-  await feishuToken(appId, appSecret);
+  await withSpinner('校验飞书凭据', () => feishuToken(appId, appSecret));
   ok(`飞书凭据有效(App ID ${appId.slice(0, 12)}…)`);
 
   if (tomlVar('FEISHU_APP_ID') !== appId) {
@@ -357,26 +432,21 @@ async function cmdFeishu(flags) {
   } else {
     ok(`FEISHU_APP_ID 未变(${appId}),无需改写`);
   }
-  const saveToKeychain = await confirm('把凭据存进本机钥匙串,以后免输入?', { yes: flags.yes });
-  if (saveToKeychain) {
-    keychainSet('feishu-app-id', appId);
-    if (keychainSet('feishu-app-secret', appSecret)) ok(`已存入钥匙串(service=${KEYCHAIN_SERVICE})`);
-  }
   if (hadSecret && flags['keep-secret']) {
     ok('沿用已有的 FEISHU_APP_SECRET,未改写 Cloudflare secret');
     return;
   }
-  process.stdout.write(c.dim('  正在写入 Worker secret FEISHU_APP_SECRET…\n'));
-  const r = wrangler(['secret', 'put', 'FEISHU_APP_SECRET'], { input: appSecret });
+  const r = await withSpinner('写入 Worker secret FEISHU_APP_SECRET', () => wrangler(['secret', 'put', 'FEISHU_APP_SECRET'], { input: appSecret }));
   if (r.code !== 0) fail(`写入 secret 失败:${r.out.trim()}`);
   ok('FEISHU_APP_SECRET 已写入 Cloudflare');
+  say(c.dim('  提示:本 CLI 不保存密钥;如需免输入,可自行执行'));
+  say(c.dim(`    security add-generic-password -s ${KEYCHAIN_SERVICE} -a feishu-app-secret -w`));
 }
 
 async function cmdDeploy(flags) {
   requireLogin();
   if (!hasBinding('kv_namespaces')) {
-    process.stdout.write(c.dim('  创建 KV 命名空间 KEYS…\n'));
-    const r = wrangler(['kv', 'namespace', 'create', 'KEYS']);
+    const r = await withSpinner('创建 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'create', 'KEYS']));
     const id = /id\s*=\s*"([0-9a-f]{32})"/.exec(r.out ?? '')?.[1];
     if (!id) fail(`创建 KV 失败:${(r.out ?? '').trim()}`);
     appendBinding(`# API Key 存放在 KV:签发时绑定人员,撤销即时生效。\n[[kv_namespaces]]\nbinding = "KEYS"\nid = "${id}"`);
@@ -384,21 +454,18 @@ async function cmdDeploy(flags) {
   } else ok('KV 已绑定,跳过');
 
   if (!hasBinding('d1_databases')) {
-    process.stdout.write(c.dim('  创建 D1 数据库…\n'));
-    const r = wrangler(['d1', 'create', D1_NAME]);
+    const r = await withSpinner('创建 D1 数据库', () => wrangler(['d1', 'create', D1_NAME]));
     const id = /database_id\s*=\s*"([0-9a-f-]{36})"/.exec(r.out ?? '')?.[1];
     if (!id) fail(`创建 D1 失败:${(r.out ?? '').trim()}`);
     appendBinding(`# 审计日志(提交/签发/撤销)持久化在 D1。\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${id}"`);
     ok(`D1 已创建并写入 wrangler.toml(${id})`);
   } else ok('D1 已绑定,跳过');
 
-  process.stdout.write(c.dim('  应用 schema.sql…\n'));
-  const schema = wrangler(['d1', 'execute', D1_NAME, '--remote', '--file=schema.sql']);
+  const schema = await withSpinner('应用 schema.sql(建 audit_log 表)', () => wrangler(['d1', 'execute', D1_NAME, '--remote', '--file=schema.sql']));
   if (schema.code !== 0) fail(`建表失败:${(schema.out ?? '').trim()}`);
   ok('audit_log 表已就绪');
 
-  process.stdout.write(c.dim('  部署 Worker…\n'));
-  const deploy = wrangler(['deploy']);
+  const deploy = await withSpinner('部署 Worker', () => wrangler(['deploy']));
   if (deploy.code !== 0) fail(`部署失败:${(deploy.out ?? '').trim()}`);
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deploy.out ?? '')?.[0];
   if (url) { setTomlVar('SUBMIT_URL', url); ok(`后端已部署:${url}`); }
@@ -408,8 +475,7 @@ async function cmdDeploy(flags) {
 async function cmdTables(flags) {
   requireLogin();
   const env = buildEnv(flags, { withKv: true, withDb: true });
-  process.stdout.write(c.dim('  直连飞书建表/建字段…\n'));
-  const result = await bootstrapLocally(env);
+  const result = await withSpinner('直连飞书建表 / 建字段', () => bootstrapLocally(env));
   ok(`主表 ${result.tableId} / 登记表 ${result.registryTableId} / 申请表 ${result.requestTableId}`);
   if (result.created.length) say(c.dim(`    新建:${result.created.join(', ')}`));
 
@@ -418,8 +484,7 @@ async function cmdTables(flags) {
   setTomlVar('REQUEST_TABLE_ID', result.requestTableId);
   ok('table id 已写回 wrangler.toml');
 
-  process.stdout.write(c.dim('  重新部署以让 Worker 读到这些 id…\n'));
-  const deploy = wrangler(['deploy']);
+  const deploy = await withSpinner('重新部署以让 Worker 读到这些 id', () => wrangler(['deploy']));
   if (deploy.code !== 0) fail(`部署失败:${(deploy.out ?? '').trim()}`);
   ok('已重新部署');
 
@@ -429,8 +494,9 @@ async function cmdTables(flags) {
 
 /// 把「密钥申请」表配成:表单只问「申请人」,并开启分享;同时收紧 base 可见范围。
 async function setupForm(flags) {
-  const { appId, appSecret } = resolvedFeishu(flags);
-  if (!appId || !appSecret) { warn('缺飞书凭据,跳过表单配置'); return; }
+  const { appId } = resolvedFeishu(flags);
+  if (!appId) { warn('缺飞书 App ID,跳过表单配置'); return; }
+  const appSecret = await ensureFeishuSecret(flags);
   const token = await feishuToken(appId, appSecret);
   const baseToken = tomlVar('BITABLE_APP_TOKEN');
   const table = tomlVar('REQUEST_TABLE_ID');
@@ -505,12 +571,12 @@ async function cmdIssue(flags) {
   if (flags['open-id']) {
     const memberId = flags['member-id'] || await ask('成员ID(工号/账号)', { defaultValue: String(flags['open-id']).slice(-6) });
     const name = flags.name || await ask('姓名');
-    return reportIssue(name, await issueLocally(env, { member_id: memberId, member: name, open_id: flags['open-id'] }));
+    return reportIssue(name, await withSpinner(`为「${name}」签发 Key`, () => issueLocally(env, { member_id: memberId, member: name, open_id: flags['open-id'] })));
   }
   if (flags.email) {
     const name = flags.name || await ask('姓名');
     const memberId = flags['member-id'] || await ask('成员ID(工号/账号)');
-    return reportIssue(name, await issueLocally(env, { member_id: memberId, member: name, email: flags.email }));
+    return reportIssue(name, await withSpinner(`为「${name}」签发 Key`, () => issueLocally(env, { member_id: memberId, member: name, email: flags.email })));
   }
 
   const people = await fetchEmployees(flags);
@@ -525,7 +591,7 @@ async function cmdIssue(flags) {
   for (const i of picks) {
     const person = people[i];
     const mid = await ask(`「${person.name}」的成员ID(工号/账号)`, { defaultValue: person.open_id.slice(-6) });
-    reportIssue(person.name, await issueLocally(env, { member_id: mid, member: person.name, open_id: person.open_id }));
+    reportIssue(person.name, await withSpinner(`为「${person.name}」签发 Key`, () => issueLocally(env, { member_id: mid, member: person.name, open_id: person.open_id })));
   }
 }
 
@@ -550,7 +616,7 @@ async function cmdRevoke(flags) {
   requireLogin();
   const keyId = flags._[0];
   if (!keyId) fail('用法:revoke <key_id>');
-  const revoked = await revokeLocally(buildEnv(flags, { withDb: false }), keyId);
+  const revoked = await withSpinner(`撤销 ${keyId}`, () => revokeLocally(buildEnv(flags, { withDb: false }), keyId));
   ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
 }
 
@@ -718,7 +784,7 @@ async function choose(entries, { prompt = '请选择', footer } = {}) {
 async function cmdMembers(flags) {
   requireLogin();
   const env = buildEnv(flags);
-  const [people, keys] = await Promise.all([fetchEmployees(flags), listKeysLocally(env)]);
+  const [people, keys] = await withSpinner('读取员工与 Key', () => Promise.all([fetchEmployees(flags), listKeysLocally(env)]));
   const activeByOpenId = new Map(keys.filter((k) => k.enabled).map((k) => [k.open_id, k]));
 
   const rows = [];
@@ -756,7 +822,7 @@ async function cmdMembers(flags) {
 
   if (picked.kind === 'orphan') {
     if (!await confirm(`「${picked.key.member}」不在员工名单里,撤销其 Key ${picked.key.key_id}?`)) return warn('已取消');
-    const revoked = await revokeLocally(env, picked.key.key_id);
+    const revoked = await withSpinner(`撤销 ${picked.key.key_id}`, () => revokeLocally(env, picked.key.key_id));
     return ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''})`);
   }
 
@@ -764,7 +830,7 @@ async function cmdMembers(flags) {
   if (!key) {
     if (!await confirm(`为「${person.name}」签发 Key?`)) return warn('已取消');
     const memberId = await ask('成员ID(工号/账号)', { defaultValue: person.open_id.slice(-6) });
-    const issued = await issueLocally(env, { member_id: memberId, member: person.name, open_id: person.open_id });
+    const issued = await withSpinner(`为「${person.name}」签发 Key`, () => issueLocally(env, { member_id: memberId, member: person.name, open_id: person.open_id }));
     return reportIssue(person.name, issued);
   }
 
@@ -777,7 +843,7 @@ async function cmdMembers(flags) {
   if (!action || action.value === 'cancel') return warn('已取消');
 
   if (action.value === 'revoke') {
-    const revoked = await revokeLocally(env, key.key_id);
+    const revoked = await withSpinner(`撤销 ${key.key_id}`, () => revokeLocally(env, key.key_id));
     return ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
   }
 
