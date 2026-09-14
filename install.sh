@@ -59,8 +59,33 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# .env 的读写一律交给 python3,与引擎 load_env 使用**同一种格式**:KEY=<json 字符串>。
+# 之前这里写 shell 单引号而引擎按 JSON 解析,两者不互逆(带引号的 Key 会被读坏);
+# 更严重的是 run.sh 用 `. .env` 加载配置,配置值里的 $(...) 会被 sh 直接执行。
+write_env() {
+  python3 - "$ENV_FILE" "$1" "$2" "$3" <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+pairs = (('LLM_BASE_URL', sys.argv[2]), ('LLM_MODEL', sys.argv[3]), ('LLM_API_KEY', sys.argv[4]))
+path.write_text(''.join(f'{k}={json.dumps(v)}\n' for k, v in pairs), encoding='utf-8')
+os.chmod(path, 0o600)
+PY
+}
+read_env() {
+  python3 - "$ENV_FILE" "$1" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        if line.startswith(sys.argv[2] + '='):
+            value = line.split('=', 1)[1].strip()
+            try: print(json.loads(value) if value[:1] == '"' else value.strip("'"))
+            except Exception: print(value.strip('"').strip("'"))
+            break
+PY
+}
 if [ ! -f "$ENV_FILE" ]; then
-  BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com/v1}; MODEL=${LLM_MODEL:-deepseek-flash}; API_KEY=${LLM_API_KEY:-}
   if [ -z "$API_KEY" ] && { exec 3<>/dev/tty; } 2>/dev/null; then
     tty_open=1
     printf 'LLM_API_KEY (input is hidden): ' >&3
@@ -73,22 +98,19 @@ if [ ! -f "$ENV_FILE" ]; then
   BASE_URL=${BASE_URL:-https://api.deepseek.com/v1}; MODEL=${MODEL:-deepseek-flash}
   [ -n "$API_KEY" ] || { echo "LLM_API_KEY is required" >&2; exit 1; }
   umask 077
-  { printf 'LLM_BASE_URL='; shell_quote "$BASE_URL"; printf '\nLLM_MODEL='; shell_quote "$MODEL"; printf '\nLLM_API_KEY='; shell_quote "$API_KEY"; printf '\n'; } > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
+  write_env "$BASE_URL" "$MODEL" "$API_KEY"
 else
-  # Rewrite legacy incorrectly quoted values produced by older installers.
-  . "$ENV_FILE"
-  BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com/v1}; MODEL=${LLM_MODEL:-deepseek-flash}; API_KEY=${LLM_API_KEY:-}
-  API_KEY=${API_KEY#\"}; API_KEY=${API_KEY#\'}; API_KEY=${API_KEY%\"}; API_KEY=${API_KEY%\'}
+    # 统一成引擎能读的格式(顺带修好旧安装器写坏的引号)
+    BASE_URL=$(read_env LLM_BASE_URL); BASE_URL=${BASE_URL:-https://api.deepseek.com/v1}
+    MODEL=$(read_env LLM_MODEL); MODEL=${MODEL:-deepseek-flash}
+    API_KEY=$(read_env LLM_API_KEY)
   umask 077
-  { printf 'LLM_BASE_URL='; shell_quote "$BASE_URL"; printf '\nLLM_MODEL='; shell_quote "$MODEL"; printf '\nLLM_API_KEY='; shell_quote "$API_KEY"; printf '\n'; } > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
+  write_env "$BASE_URL" "$MODEL" "$API_KEY"
 fi
 cat > "$APP_DIR/run.sh" <<EOF
 #!/bin/sh
 set -eu
-[ -f "$ENV_FILE" ] && . "$ENV_FILE"
-export LLM_BASE_URL LLM_API_KEY LLM_MODEL
+# 不再 source 配置文件:引擎自己读 .env(值里的 $(...) 因此不会被 sh 执行)
 export DIGEST_OUTPUT_DIR=\${DIGEST_OUTPUT_DIR:-"$APP_DIR"}
 # 定时任务也要写入本次安装的版本号,否则 CLI 生成的日报无法追溯引擎版本。
 export DIGEST_RELEASE_VERSION=\${DIGEST_RELEASE_VERSION:-"$release_tag"}

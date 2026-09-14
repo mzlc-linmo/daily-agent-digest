@@ -188,17 +188,18 @@ function appendBinding(block) {
 
 /* ---------------------------------------------------------------- 钥匙串 */
 
-function keychainGet(account, services = FEISHU_SERVICES) {
+/// 读钥匙串。用异步执行:同步 spawn 会阻塞事件循环 —— 它在动画期间被调用时会冻住动画。
+async function keychainGet(account, services = FEISHU_SERVICES) {
   for (const service of services) {
-    const r = run('security', ['find-generic-password', '-s', service, '-a', account, '-w']);
-    if (r.status === 0 && r.stdout.trim()) return { value: r.stdout.trim(), service };
+    const r = await runAsync('security', ['find-generic-password', '-s', service, '-a', account, '-w']);
+    if (r.code === 0 && r.stdout.trim()) return { value: r.stdout.trim(), service };
   }
   return null;
 }
 
-function keychainSet(account, value, service = KEYCHAIN_SERVICE) {
-  const r = run('security', ['add-generic-password', '-s', service, '-a', account, '-w', value, '-U']);
-  if (r.status !== 0) {
+async function keychainSet(account, value, service = KEYCHAIN_SERVICE) {
+  const r = await runAsync('security', ['add-generic-password', '-s', service, '-a', account, '-w', value, '-U']);
+  if (r.code !== 0) {
     warn(`写入钥匙串失败(${(r.stderr || '').trim().split('\n')[0]})`);
     return false;
   }
@@ -358,7 +359,7 @@ async function askSecret(question) {
 
 /// 取飞书 App Secret:参数 → 环境变量 → 钥匙串 → 现场输入(只用于本次,不落盘)。
 async function ensureFeishuSecret(flags) {
-  const { appSecret } = resolvedFeishu(flags);
+  const { appSecret } = await resolvedFeishu(flags);
   if (appSecret) return appSecret;
   const entered = await askSecret('飞书 App Secret(仅本次使用,不保存)');
   if (!entered) fail('缺少飞书 App Secret');
@@ -386,15 +387,15 @@ async function feishuApi(pathname, token, init = {}) {
   return res.json().catch(() => ({}));
 }
 
-function resolvedFeishu(flags) {
-  const appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || keychainGet('feishu-app-id')?.value || '';
-  const appSecret = flags['app-secret'] || keychainGet('feishu-app-secret')?.value || process.env.FEISHU_APP_SECRET || '';
+async function resolvedFeishu(flags) {
+  const appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || (await keychainGet('feishu-app-id'))?.value || '';
+  const appSecret = flags['app-secret'] || (await keychainGet('feishu-app-secret'))?.value || process.env.FEISHU_APP_SECRET || '';
   return { appId, appSecret };
 }
 
 /// 构造共享模块需要的 env(与 Worker 里的 env 形状一致),外加 KV / D1 适配器。
-function buildEnv(flags = {}, { withKv = true, withDb = true } = {}) {
-  const { appId, appSecret } = resolvedFeishu(flags);
+async function buildEnv(flags = {}, { withKv = true, withDb = true } = {}) {
+  const { appId, appSecret } = await resolvedFeishu(flags);
   const env = {
     BITABLE_APP_TOKEN: tomlVar('BITABLE_APP_TOKEN'),
     BITABLE_TABLE_NAME: tomlVar('BITABLE_TABLE_NAME') || '日报明细',
@@ -449,7 +450,7 @@ async function listEmployees(token, extraBases = []) {
 }
 
 async function fetchEmployees(flags) {
-  const { appId } = resolvedFeishu(flags);
+  const { appId } = await resolvedFeishu(flags);
   if (!appId) fail('缺飞书 App ID:先跑 `feishu`');
   const appSecret = await ensureFeishuSecret(flags);
   const token = await withSpinner('读取飞书通讯录', () => feishuToken(appId, appSecret));
@@ -461,7 +462,7 @@ async function fetchEmployees(flags) {
 /* ------------------------------------------------------------------ 命令 */
 
 async function cmdStatus() {
-  const feishu = resolvedFeishu({});
+  const feishu = await resolvedFeishu({});
   const auth = await wranglerAuthState();
   const loginCell = {
     'logged-in': c.green(`已登录${auth.email ? `(${auth.email})` : ''}`),
@@ -503,8 +504,8 @@ async function cmdStatus() {
 
 async function cmdFeishu(flags) {
   await requireLogin();
-  let appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || keychainGet('feishu-app-id')?.value || '';
-  let appSecret = flags['app-secret'] || keychainGet('feishu-app-secret')?.value || '';
+  let appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || (await keychainGet('feishu-app-id'))?.value || '';
+  let appSecret = flags['app-secret'] || (await keychainGet('feishu-app-secret'))?.value || '';
 
   // 已配置的值作为默认值直接显示,回车即沿用
   if (!appId) appId = (await ask('飞书 App ID (cli_…)')).trim();
@@ -566,7 +567,7 @@ async function cmdDeploy(flags) {
 
 async function cmdTables(flags) {
   await requireLogin();
-  const env = buildEnv(flags, { withKv: true, withDb: true });
+  const env = await buildEnv(flags, { withKv: true, withDb: true });
   const result = await withSpinner('直连飞书建表 / 建字段', () => bootstrapLocally(env));
   ok(`主表 ${result.tableId}`);
   if (result.created.length) say(c.dim(`    新建:${result.created.join(', ')}`));
@@ -598,7 +599,7 @@ async function cmdEmployees(flags) {
 
 async function cmdIssue(flags) {
   await requireLogin();
-  const env = buildEnv(flags);
+  const env = await buildEnv(flags);
 
   if (flags['open-id']) {
     const memberId = flags['member-id'] || await ask('成员ID(工号/账号)', { defaultValue: String(flags['open-id']).slice(-6) });
@@ -636,7 +637,7 @@ function reportIssue(label, issued) {
 
 async function cmdKeys(flags) {
   await requireLogin();
-  const keys = await withSpinner('读取 Key 列表', () => listKeysLocally(buildEnv(flags, { withDb: false })));
+  const keys = await withSpinner('读取 Key 列表', async () => listKeysLocally(await buildEnv(flags, { withDb: false })));
   say(c.bold(`\n共 ${keys.length} 把 Key`));
   say(c.dim(`  ${padEndWidth('成员', 16)}状态    Key(掩码)`));
   for (const k of keys) {
@@ -651,14 +652,14 @@ async function cmdRevoke(flags) {
   const keyId = flags._[0];
   if (!keyId) fail('用法:revoke <key_id>');
   // 撤销是写操作,必须带 DB —— 漏了它这次撤销就不会进审计日志(踩过)
-  const env = buildEnv(flags);
+  const env = await buildEnv(flags);
   const revoked = await withSpinner(`撤销 ${keyId}`, () => revokeLocally(env, keyId));
   ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
 }
 
 async function cmdLogs(flags) {
   await requireLogin();
-  const rows = await withSpinner('查询审计日志', () => logsLocally(buildEnv(flags, { withKv: false }), {
+  const rows = await withSpinner('查询审计日志', async () => logsLocally(await buildEnv(flags, { withKv: false }), {
     limit: flags.limit ?? 100,
     memberId: flags.member,
     date: flags.date,
@@ -681,11 +682,14 @@ async function cmdInstall(flags) {
   say(c.dim('已配置的步骤会显示当前值并默认跳过。\n'));
   await requireLogin(); // 未登录会自动拉起 wrangler login
 
+  // 凭据只解析一次(要读钥匙串),供下面的摘要复用
+  const creds = await resolvedFeishu(flags);
+
   // 每一步的"当前配置"摘要:已配置的直接展示出来,作为是否重做的判断依据
   const summaries = {
     feishu: () => {
       const id = tomlVar('FEISHU_APP_ID');
-      const secret = resolvedFeishu({}).appSecret;
+      const secret = creds.appSecret;
       if (!id || !secret) return null;
       return `App ID ${id};App Secret ${c.dim('已配置(钥匙串/环境变量)')}`;
     },
@@ -818,7 +822,7 @@ async function choose(entries, { prompt = '请选择', footer } = {}) {
 ///   · 已有 Key 的员工:显示 key_id 与状态,选中后问"轮换 / 撤销 / 取消"。
 async function cmdMembers(flags) {
   await requireLogin();
-  const env = buildEnv(flags);
+  const env = await buildEnv(flags);
   const [people, keys] = await withSpinner('读取员工与 Key', () => Promise.all([fetchEmployees(flags), listKeysLocally(env)]));
   const activeByOpenId = new Map(keys.filter((k) => k.enabled).map((k) => [k.open_id, k]));
 

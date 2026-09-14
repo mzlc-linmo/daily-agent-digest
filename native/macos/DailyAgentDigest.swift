@@ -3,21 +3,39 @@ import AppKit
 enum DebugLog {
     static let enabled = ProcessInfo.processInfo.environment["DIGEST_DEBUG"] == "1"
     static let path = ProcessInfo.processInfo.environment["DIGEST_DEBUG_LOG"] ?? (FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest/tray.debug.log")
+    /// 日志里可能出现上游错误体(含 token 片段),落盘前先脱敏。
+    static func redact(_ text: String) -> String {
+        var out = text
+        for pattern in ["(dag_[A-Za-z0-9_\\-]{6})[A-Za-z0-9_\\-]+", "(Bearer\\s+)[A-Za-z0-9._\\-]+"] {
+            out = out.replacingOccurrences(of: pattern, with: "$1**", options: .regularExpression)
+        }
+        return out
+    }
+
+    /// 串行队列:引擎调用都在后台线程,并发 seekToEnd+write 会互相覆盖。
+    private static let queue = DispatchQueue(label: "digest.debuglog")
+
     static func write(_ message: String) {
         guard enabled else { return }
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-        let url = URL(fileURLWithPath: path)
-        do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: path) {
-                let handle = try FileHandle(forWritingTo: url)
-                try handle.seekToEnd()
-                try handle.write(contentsOf: Data(line.utf8))
-                try handle.close()
-            } else {
-                try Data(line.utf8).write(to: url, options: .atomic)
-            }
-        } catch { }
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(redact(message))\n"
+        queue.async {
+            let url = URL(fileURLWithPath: path)
+            do {
+                // 目录 0700、文件 0600:与 .env / state.json 一致 —— 日志里可能有敏感文本
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                if FileManager.default.fileExists(atPath: path) {
+                    let handle = try FileHandle(forWritingTo: url)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: Data(line.utf8))
+                } else {
+                    try Data(line.utf8).write(to: url, options: .atomic)
+                }
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            } catch { }
+        }
     }
 }
 
@@ -178,7 +196,16 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         DebugLog.write("report refresh")
         backend.call("state") { [weak self] obj in
             guard let self = self else { return }
-            if let error = obj["error"] as? String { self.status.stringValue = "错误: \(error)"; return }
+            if let error = obj["error"] as? String {
+                // 早退也必须走一次布局:子视图的 frame 只在 relayout() 里设置,
+                // 否则引擎不可用时窗口里除左下角一行字外全是 0×0。
+                self.status.stringValue = "错误: \(error)"
+                self.items = []
+                self.stateChars = 0
+                self.table.reloadData()
+                self.relayout()
+                return
+            }
             self.items = obj["work_items"] as? [[String: Any]] ?? []
             self.stateStatus = obj["report_status"] as? String ?? "unknown"
             self.stateDay = obj["date"] as? String ?? ""
@@ -331,7 +358,6 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     }
 
     static let pad: CGFloat = 12
-    static let titleBodyGap: CGFloat = 6
     static let buttonWidth: CGFloat = 54
     static let charCountWidth: CGFloat = 50
 
@@ -437,7 +463,13 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let backend=Backend(); var statusItem:NSStatusItem!; var report:ReportController!; var timer:Timer!; var progressPanel:NSPanel?; var generationBackgrounded=false
-    func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image=NSImage(systemSymbolName:"checklist", accessibilityDescription:"Daily Agent Digest"); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); let tickTimer=Timer(timeInterval:60,repeats:true){ _ in self.backend.call("tick") { _ in } }; RunLoop.main.add(tickTimer,forMode:.common); timer=tickTimer; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_AUTOGENERATE"] == "1" { DebugLog.write("auto generate requested by DIGEST_DEBUG_AUTOGENERATE"); self.perform(#selector(self.generate), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWREPORT"] == "1" { DebugLog.write("report window requested by DIGEST_DEBUG_SHOWREPORT"); self.perform(#selector(self.show), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWABOUT"] == "1" { DebugLog.write("about requested by DIGEST_DEBUG_SHOWABOUT"); self.perform(#selector(self.about), with: nil, afterDelay: 1.0) } }
+    func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image=NSImage(systemSymbolName:"checklist", accessibilityDescription:"Daily Agent Digest"); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
+              // tick 可能触发完整的 LLM 生成(实测 40s+,超时更久):默认 60s 会被 watchdog
+              // 杀掉,state 不落盘、下一分钟重试再被杀,自动出报可能永远失败。
+              self?.backend.call("tick", [:], timeout: Backend.generateTimeout) { obj in
+                  if let error = obj["error"] as? String { DebugLog.write("tick failed: \(error)") }
+              }
+          }; RunLoop.main.add(tickTimer,forMode:.common); timer=tickTimer; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_AUTOGENERATE"] == "1" { DebugLog.write("auto generate requested by DIGEST_DEBUG_AUTOGENERATE"); self.perform(#selector(self.generate), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWREPORT"] == "1" { DebugLog.write("report window requested by DIGEST_DEBUG_SHOWREPORT"); self.perform(#selector(self.show), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWABOUT"] == "1" { DebugLog.write("about requested by DIGEST_DEBUG_SHOWABOUT"); self.perform(#selector(self.about), with: nil, afterDelay: 1.0) } }
     @objc func show(){
         report.refresh()
         report.showWindow(nil)
@@ -823,8 +855,6 @@ enum SelfTest {
         } else {
             print("PASS short text measures one line -> \(shortHeight)pt")
         }
-        let row = Backend.failureReason([:])
-        _ = row
         return passed
     }
 }

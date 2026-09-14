@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime as dt, hashlib, json, os, re, sqlite3, subprocess, ssl, urllib.request
+import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, ssl, urllib.error, urllib.request
 from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -25,12 +25,6 @@ ITEM_READABLE_FLOOR = 20     # 预算不足时正文不会被压到这个长度�
 # 模型只能看见自动化噪音,于是日报里只有自动化工作项。
 CONTEXT_CHAR_LIMIT = 90000   # 单次请求上下文字符上限(D-5 的目标值)
 EXCERPT_CHAR_MAX = 900       # 单条摘录上限
-# 高信号:人的意图与助手的叙述
-HIGH_SIGNAL_KINDS = {'userMessage', 'agentMessage', 'assistant/message', 'reasoning',
-                     'message', 'user', 'assistant', 'human'}
-# 低信号:机器输出与流程事件,只在剩余预算里补充
-LOW_SIGNAL_KINDS = {'functionCallOutput', 'commandExecution', 'mcpToolCall',
-                    'tool/call', 'tool/result', 'tool', 'step/start', 'step/end', 'system'}
 
 def char_count(text):
     return len(''.join(str(text or '').split()))
@@ -75,14 +69,6 @@ def clamp_text_hard(text, limit):
 
 def llm_config():
     return os.getenv('LLM_BASE_URL'), os.getenv('LLM_API_KEY'), os.getenv('LLM_MODEL')
-
-def strip_code_fence(text):
-    text = str(text or '').strip()
-    if text.startswith('```'):
-        lines = text.splitlines()[1:]
-        if lines and lines[-1].strip().startswith('```'): lines = lines[:-1]
-        text = '\n'.join(lines)
-    return text.strip()
 
 # 抽取层已经只留下提示词/最终文本/交付物,所以这里不再需要任何关键词匹配。
 ROLE_TIERS = ('prompt', 'result', 'deliverable', 'process')
@@ -221,7 +207,12 @@ def write_state(state):
 
 def debug(message):
     if os.getenv('DIGEST_DEBUG') == '1':
-        APP_DIR.mkdir(parents=True, exist_ok=True); with_open = open(APP_DIR/'debug.log', 'a', encoding='utf-8'); with_open.write(f'{dt.datetime.now(TZ).isoformat()} {message}\n'); with_open.close()
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        # 日志含工作内容与上游错误文本,权限必须和 state.json 一致(0600),不能跟随 umask
+        log = APP_DIR/'debug.log'
+        fd = os.open(log, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o600)
+        with os.fdopen(fd, 'a', encoding='utf-8') as fh:
+            fh.write(f'{dt.datetime.now(TZ).isoformat()} {message}\n')
 
 def tls_context():
     cert_file=os.getenv('SSL_CERT_FILE')
@@ -429,7 +420,7 @@ def summarize(events, day):
     if base and key and model:
         system='''你是日报整理器。把当天所有 agent 对话按“工作主题”聚类，每个主题写成一项独立内容。只保留真实工作内容：开发、工程、运维、研究、业务；排除个人问题、娱乐、闲聊和自动化噪音。一次性处理输入并返回严格 JSON，不要 Markdown：{"work_items":[{"title":"工作主题（不超过 30 字）","desc":"该项工作的完整说明","status":"completed|in_progress|blocked","source_task_ids":["provider/session"]}],"decisions":[],"blockers":[],"next_steps":[]}.
 要求（必须遵守）：
-1. 每一项的 desc 是这一项完整而独立的说明：写清做了什么、为什么做、怎么做的、结果或产出是什么，目标 100-300 字。
+1. 每一项的 desc 是这一项完整而独立的说明：写清做了什么、为什么做、怎么做的、结果或产出是什么，目标 {ITEM_CHAR_MIN}-{ITEM_CHAR_MAX} 字。
 2. 所有项的 title 与 desc 合计不超过 1000 字，不设下限；项多时每项相应缩短，但不要为了字数删除真实工作项。
 3. 各项 desc 之间不要重复同一件事，不要把别的项的内容写进来。
 4. title 是简短主题，不超过 30 字，不要出现 session ID，不要只是复述 desc 的第一句。
@@ -442,7 +433,7 @@ def summarize(events, day):
                 for item in parsed.get('work_items',[])[:20]:
                     title=clamp_text(item.get('title',''), TITLE_CHAR_MAX)
                     if not title: continue
-                    items.append({'id':hashlib.sha256((title+day).encode()).hexdigest()[:16],'title':title,'desc':str(item.get('desc','') or '').strip(),'status':item.get('status','observed'),'source_task_ids':item.get('source_task_ids',[]),'excluded':False})
+                    items.append({'id':hashlib.sha256(f'{day}|{len(items)}|{title}'.encode()).hexdigest()[:16],'title':title,'desc':str(item.get('desc','') or '').strip(),'status':item.get('status','observed'),'source_task_ids':item.get('source_task_ids',[]),'excluded':False})
                 if items: payload['work_items']=items
                 payload['decisions']=parsed.get('decisions',[]); payload['blockers']=parsed.get('blockers',[]); payload['next_steps']=parsed.get('next_steps',[])
         except Exception as exc: debug(f'LLM error: {type(exc).__name__}: {exc}'); payload['llm_error']=f'{type(exc).__name__}: {exc}'; payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
@@ -486,7 +477,12 @@ def app_command(command, data):
         for item in state['work_items']:
             if item['id']==ident: item['excluded']=(command=='exclude')
         # 排除就是数组过滤：不重新生成、不调用 LLM,立即可逆。
-        state=recount_report(state); write_state(state); return state
+        state=recount_report(state)
+        # 内容变了,上一次的上报结果就失效 —— 否则 submit() 会因 report_status=='submitted'
+        # 直接早退,服务端永远拿不到更新,界面却仍显示"已上报"。
+        if state.get('report_status')=='submitted':
+            state['report_status']='ready'; state['submit_status']='stale'
+        write_state(state); return state
     if command=='submit': return submit(day)
     raise ValueError('unknown app command')
 
@@ -519,6 +515,9 @@ def submit(day):
     try:
         with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
             body=json.loads(r.read() or b'{}')
+        # 合法 JSON 但不是对象(数组/字符串)时,后面的 body.get 会抛 AttributeError,
+        # 那样 submit_status/submit_error 完全没落盘,界面无法区分"未提交"和"提交失败"。
+        if not isinstance(body, dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
     except urllib.error.HTTPError as exc:
         detail=exc.read().decode('utf-8','replace')[:300]
         return fail_submit(state, day, f'HTTP {exc.code}: {detail}')
@@ -564,8 +563,10 @@ def main():
     if args.app_command:
         try: print(json.dumps(app_command(args.app_command, json.load(__import__('sys').stdin)), ensure_ascii=False)); return
         except Exception as exc: print(json.dumps({'error':str(exc)},ensure_ascii=False)); raise SystemExit(1)
+    load_env()  # 直接 CLI 路径也要读 .env:此前靠 run.sh source 配置文件,那会让配置里的 $(...) 被执行
     start,end=day_window(args.date); root=Path(args.root); events,collect_stats=collect(root,start,end); payload=summarize(events,args.date); payload['coverage']['collect']=collect_stats; payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
     out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(Path.home()/'.local/share/daily-agent-digest')))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
     out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8'); print(f'events={len(events)} raw={len(events)} output={out}')
+    os.chmod(out, 0o600)
 
 if __name__=='__main__': main()

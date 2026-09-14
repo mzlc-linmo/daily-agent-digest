@@ -5,7 +5,10 @@ ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT))
 import daily_agent_digest as engine  # noqa: E402
 
-LLM_VARS = ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "DIGEST_SUBMIT_URL")
+# 跑子进程前必须屏蔽掉所有"会让测试打真实网络"的变量。
+# DIGEST_API_KEY 曾经漏了:开发机 export 过它时,用例会带着真实 Key
+# 向测试地址发真实 POST(既污染环境又泄露密钥)。
+LLM_VARS = ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "DIGEST_SUBMIT_URL", "DIGEST_API_KEY", "DIGEST_MEMBER")
 
 
 def command(home, name, payload, source_root=None, extra_env=None):
@@ -430,6 +433,42 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
         self.assertTrue(result["submit_error"])
         self.assertEqual(stored["submit_status"], "not_configured")
         self.assertNotIn("submitted_count", stored)
+
+    def test_excluding_after_submit_makes_the_report_pending_again(self):
+        # 排除改变了内容,上一次上报就失效了。否则 submit() 会因 report_status=='submitted'
+        # 直接早退,服务端永远拿不到更新,界面却仍显示"已上报"。
+        server = StubSubmitService({"mode": "created", "submitted_at": "2026-09-13T18:00:00+08:00"})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                self.seed(home)
+                date = today()
+                submitted = command(home, "submit", {"date": date},
+                                    extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+                self.assertEqual(submitted["report_status"], "submitted")
+                item_id = submitted["work_items"][0]["id"]
+                after = command(home, "exclude", {"date": date, "id": item_id})
+        finally:
+            server.stop()
+        self.assertEqual(after["report_status"], "ready", "排除后必须重新变为待上报")
+        self.assertEqual(after["submit_status"], "stale")
+        self.assertTrue(after["work_items"][0]["excluded"])
+
+    def test_non_object_submit_response_is_recorded_as_failure(self):
+        # 服务端返回合法 JSON 但不是对象时,以前会在 body.get 上抛 AttributeError,
+        # submit_status 完全没落盘,界面无法区分"未提交"和"提交失败"。
+        server = StubSubmitService(["not", "an", "object"])
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                self.seed(home)
+                result = command(home, "submit", {"date": today()},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+        finally:
+            server.stop()
+        self.assertNotEqual(result["report_status"], "submitted")
+        self.assertEqual(result["submit_status"], "failed")
+        self.assertTrue(result["submit_error"])
 
     def test_a_failing_service_is_not_reported_as_submitted(self):
         with tempfile.TemporaryDirectory() as d:
