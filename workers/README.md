@@ -70,28 +70,33 @@ bootstrap 是幂等的:表已存在就复用,字段已存在就跳过,只补齐�
 
 ## 管理员签发 Key(签发即绑定人员)
 
-```bash
-# 首次部署前执行一次
-npx wrangler kv namespace create KEYS      # 把输出的 id 填进 wrangler.toml
-npx wrangler secret put ADMIN_TOKEN        # 自己定一个管理口令,妥善保存
+先准备一次:
 
-curl -sS -X POST https://<你的>.workers.dev/admin/keys \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"member_id":"zhangsan","member":"张三","open_id":"ou_xxxxxxxx"}'
+```bash
+npx wrangler kv namespace create KEYS        # 首次部署前:把输出的 id 填进 wrangler.toml
+npx wrangler secret put ADMIN_TOKEN          # 自己定一个管理口令
+security add-generic-password -s daily-agent-digest -a admin-token -w   # 存进钥匙串,脚本以后免输入
 ```
+
+两个脚本(不用手搓 curl):
+
+```bash
+# 1) 找人:从企业已有表格的人员字段里取 open_id
+node workers/scripts/find-openid.mjs 张三
+node workers/scripts/find-openid.mjs                     # 列出全部能找到的人
+#    若某人在共享表里而不在应用自有空间,补上 base_token:
+DIGEST_SCAN_BASES="<base_token>:名称,<base_token2>:名称" node workers/scripts/find-openid.mjs
+
+# 2) 签发 / 列出 / 撤销
+workers/scripts/admin.sh issue mastercui "Master Cui" ou_68585f59c3f462432b11334d41671ef3
+workers/scripts/admin.sh list
+workers/scripts/admin.sh revoke 8a4e4742
+```
+
+`issue` 的第三个参数给 `ou_…` 直接用 open_id,给邮箱则让服务端解析(需要
+`contact:user.id:readonly`);两者都没有会被**拒绝签发**,不会生成一把无法关联通讯录的 Key。
 
 返回里的 `key`(`dag_<key_id>_<secret>`)只出现这一次,交给该成员;服务端只保存哈希,台账里也只有公开的 key_id。
-
-```bash
-curl -sS https://<你的>.workers.dev/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"          # 列出(不含哈希)
-curl -sS -X POST https://<你的>.workers.dev/admin/keys/revoke \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"key_id":"<key_id>"}'                                                                     # 撤销,立即失效
-```
-
-**怎么拿到 open_id**:从企业已有表格的人员字段读(例如「员工映射」表的「通讯录用户」列),
-读到的 open_id 由同一个应用写入本表即可用;也可以给 `email`,由服务端解析 —— 后者需要应用开通
-`contact:user.id:readonly`。两者都没有会被**拒绝签发**。
 
 ## 成员侧配置
 
