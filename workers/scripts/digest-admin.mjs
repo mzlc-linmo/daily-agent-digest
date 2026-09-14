@@ -19,7 +19,8 @@
 //   node workers/scripts/digest-admin.mjs logs         # 查审计日志
 
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import { createInterface } from 'node:readline/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +41,58 @@ const TOML_PATH = path.join(ROOT, 'wrangler.toml');
 /// 仓库里跟踪的只有模板;真实配置写在被 .gitignore 忽略的 wrangler.toml 里,
 /// 所以 `git status` 始终干净,也不会把真实 token / 子域提交进公开仓库。
 const TOML_EXAMPLE_PATH = path.join(ROOT, 'wrangler.toml.example');
-const WRANGLER = process.env.WRANGLER_CMD ?? 'npx --yes wrangler';
+/// 实际调用 wrangler 的方式。
+///
+/// 默认的 `npx --yes wrangler` **每次**都要向 npm registry 解析版本(必要时下载约 30MB),
+/// 而 npm 的 fetch-timeout 默认 5 分钟、重试 2 次:网络一慢(或镜像不可达),整个 CLI
+/// 就卡在第一个命令上十几分钟 —— 这正是"检查 Cloudflare 登录"卡住的原因。
+///
+/// 所以优先用**本机已经存在**的 wrangler,一个字节的网络流量都不需要:
+///   1. WRANGLER_CMD 显式指定(仍支持 "npx --yes wrangler" 这种带参数写法)
+///   2. 仓库里 npm install 出来的 node_modules/.bin/wrangler
+///   3. npx 缓存里已有的 wrangler(直接用 node 跑它的 cli.js)
+///   4. 实在没有才退回 npx(需要网络,受超时保护)
+const WRANGLER_SPEC = (() => {
+  const spec = process.env.WRANGLER_CMD || localWranglerBin() || npxCachedWrangler() || 'npx --yes wrangler';
+  // WRANGLER_CMD 允许 "npx --yes wrangler" 这种带参数的写法;自动探测到的是单个路径,
+  // 但用户主目录可能含空格,所以统一按"命令 + 参数"存,不再用字符串拼接后 split。
+  const [cmd, ...base] = spec.split(' ').filter(Boolean);
+  return { cmd, base, display: spec };
+})();
+/// 仅用于展示与提示信息。
+const WRANGLER = WRANGLER_SPEC.display;
+
+/// 仓库里 npm install 出来的 wrangler(存在就用它,完全不需要网络)。
+function localWranglerBin() {
+  const localBin = path.join(ROOT, 'node_modules', '.bin', 'wrangler');
+  return existsSync(localBin) ? localBin : null;
+}
+
+/// 在 npx 缓存(~/.npm/_npx/*/node_modules/wrangler)里找一个可用的 wrangler。
+/// npx 缓存命中时不会联网,但 `npx` 自己仍可能先去 registry 问版本;直接跑 cli.js 更稳。
+function npxCachedWrangler() {
+  const roots = [];
+  const npmCache = process.env.npm_config_cache || path.join(os.homedir(), '.npm');
+  roots.push(path.join(npmCache, '_npx'));
+  for (const root of roots) {
+    let entries = [];
+    try { entries = readdirSync(root); } catch { continue; }
+    // 缓存里可能有多份(不同解析结果),取最新的那份
+    const candidates = [];
+    for (const entry of entries) {
+      const cli = path.join(root, entry, 'node_modules', 'wrangler', 'wrangler-dist', 'cli.js');
+      if (!existsSync(cli)) continue;
+      let mtime = 0;
+      try { mtime = statSync(cli).mtimeMs; } catch { /* 用 0 兜底 */ }
+      candidates.push({ cli, mtime });
+    }
+    if (candidates.length) {
+      candidates.sort((a, b) => b.mtime - a.mtime);
+      return `node ${candidates[0].cli}`;
+    }
+  }
+  return null;
+}
 const KEYCHAIN_SERVICE = 'daily-agent-digest';
 // 凭据统一存在这个服务名下(用 `digest-admin.mjs feishu` 写入)
 const FEISHU_SERVICES = [KEYCHAIN_SERVICE];
@@ -80,21 +132,44 @@ function run(command, args = [], { input, capture = true } = {}) {
 
 /// 异步执行并收集输出。
 /// **必须异步**:同步 spawn 会把事件循环整个卡住,旋转动画一帧都发不出来(卡顿根因)。
-function runAsync(command, args = [], { input } = {}) {
+/// 任何外部命令都必须有超时。
+///
+/// 之前没有:而 `npx --yes wrangler` 每次都要向 npm registry 解析版本(必要时下载 ~30MB),
+/// npm 默认 fetch-timeout 5 分钟、重试 2 次 —— 网络一慢,UI 就永远停在"检查 Cloudflare 登录"。
+/// 默认 60 秒,可用 DIGEST_WRANGLER_TIMEOUT=<秒> 放宽(慢网络/npx 首次下载)。
+function externalTimeoutMs() {
+  const seconds = Number(process.env.DIGEST_WRANGLER_TIMEOUT ?? 60);
+  return (Number.isFinite(seconds) && seconds >= 5 ? seconds : 60) * 1000;
+}
+
+function runAsync(command, args = [], { input, timeoutMs = externalTimeoutMs() } = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+    timer = setTimeout(() => {
+      const note = `\n[超过 ${Math.round(timeoutMs / 1000)} 秒没有响应,已终止:${command}]`;
+      try { child.kill('SIGKILL'); } catch { /* 已经退出 */ }
+      finish({ code: -1, timedOut: true, stdout, stderr: stderr + note, out: stdout + stderr + note });
+    }, timeoutMs);
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.on('error', (err) => resolve({ code: -1, stdout, stderr: stderr + err.message, out: stdout + stderr + err.message }));
-    child.on('close', (code) => resolve({ code, stdout, stderr, out: stdout + stderr }));
+    child.on('error', (err) => finish({ code: -1, stdout, stderr: stderr + err.message, out: stdout + stderr + err.message }));
+    child.on('close', (code) => finish({ code, stdout, stderr, out: stdout + stderr }));
     child.stdin.end(input ?? '');
   });
 }
 
 async function wrangler(args, { input } = {}) {
-  const [cmd, ...base] = WRANGLER.split(' ').filter(Boolean);
+  const { cmd, base } = WRANGLER_SPEC;
   // out 仅用于展示(错误信息);解析 JSON 必须只用 stdout ——
   // `npx wrangler` 会把 npm notice 写到 stderr,拼进来会让 JSON.parse 报
   // "Unexpected non-whitespace character after JSON"。
@@ -107,6 +182,8 @@ async function wrangler(args, { input } = {}) {
 async function wranglerAuthState() {
   const r = await withSpinner('检查 Cloudflare 登录', () => wrangler(['whoami']));
   const out = r.out ?? '';
+  // 超时单独成一类:这不是"没登录",乱提示只会把人带偏
+  if (r.timedOut) return { state: 'timeout', out };
   if (/not logged in|auth token has expired|CLOUDFLARE_API_TOKEN/i.test(out)) return { state: 'logged-out', out };
   if (r.code !== 0 || !/logged in with/i.test(out)) return { state: 'error', out };
   const email = /associated with the email ([^\s]+)/.exec(out)?.[1]?.replace(/\.$/, '');
@@ -121,8 +198,7 @@ async function autoLogin() {
   }
   say(c.yellow('!') + ' 检测到未登录 Cloudflare,正在启动 `' + `${WRANGLER} login` + '`(会打开浏览器)…');
   // stdio 交给子进程:login 要打印授权链接并等待回调
-  const [cmd, ...base] = WRANGLER.split(' ').filter(Boolean);
-  run(cmd, [...base, 'login'], { capture: false });
+  run(WRANGLER_SPEC.cmd, [...WRANGLER_SPEC.base, 'login'], { capture: false });
   const after = await wranglerAuthState();
   if (after.state !== 'logged-in') {
     fail('登录未完成。可稍后重试,或改用环境变量 CLOUDFLARE_API_TOKEN。');
@@ -137,6 +213,20 @@ async function autoLogin() {
 async function requireLogin() {
   const state = await wranglerAuthState();
   if (state.state === 'logged-in') return state;
+  if (state.state === 'timeout') {
+    // 以前的默认命令是 `npx --yes wrangler`:每次都要去 npm registry 解析版本(必要时下载 ~30MB),
+    // 而 npm 的 fetch-timeout 默认 5 分钟、重试 2 次 —— 网络一慢就表现为"检查 Cloudflare 登录"卡死。
+    fail([
+      `wrangler 在 ${Math.round(externalTimeoutMs() / 1000)} 秒内没有响应,已终止。`,
+      `    当前用的是:${WRANGLER}`,
+      `    可先手动跑一次看它慢在哪:${WRANGLER} whoami`,
+      '    常见原因:① 正在下载 wrangler(npx 首次,或 npm registry 不可达);',
+      '              ② 代理/网络不通(本机设了 http_proxy/https_proxy,或 npm 的 registry 是镜像);',
+      '              ③ Cloudflare API 无响应。',
+      '    临时放宽超时:DIGEST_WRANGLER_TIMEOUT=180 node workers/scripts/digest-admin.mjs adopt',
+      '    指定本机已有的 wrangler(零网络):WRANGLER_CMD=$(command -v wrangler) node workers/scripts/digest-admin.mjs adopt',
+    ].join('\n  '));
+  }
   if (state.state === 'error') {
     const first = (state.out ?? '').trim().split('\n').filter((l) => l.trim() && !/WARNING|Proxy environment/.test(l))[0] ?? '';
     fail(`wrangler 执行失败(不是登录问题):\n    ${first}\n  可执行 \`${WRANGLER} whoami\` 复查;常见原因是 npm 缓存目录权限(npm error code EPERM)。`);
@@ -320,10 +410,13 @@ async function withSpinner(label, fn) {
   }
 
   const tty = Boolean(process.stdout.isTTY);
-  const ctl = { label, frame: 0, interval: null, paused: false };
+  const ctl = { label, frame: 0, interval: null, paused: false, startedAt: Date.now() };
   ctl.draw = () => {
     const frame = SPINNER_FRAMES[ctl.frame++ % SPINNER_FRAMES.length];
-    process.stdout.write(`\r\x1b[2m${frame} ${ctl.label}\x1b[0m`);
+    // 超过 3 秒就把已耗时显示出来:否则"网络慢"和"真卡死"从界面上分不出来。
+    const elapsed = Math.round((Date.now() - ctl.startedAt) / 1000);
+    const suffix = elapsed >= 3 ? ` (${elapsed}s)` : '';
+    process.stdout.write(`\r\x1b[2m${frame} ${ctl.label}${suffix}\x1b[0m`);
   };
   spinnerCtl = ctl;
   if (tty) { ctl.draw(); ctl.interval = setInterval(ctl.draw, 80); } else { say(c.dim(`  ${label}…`)); }
@@ -543,6 +636,7 @@ async function cmdStatus() {
     ['定时任务', /crons\s*=/.test(readToml()) ? c.green('每小时清理日志') : c.red('未配置')],
   ];
   say(c.bold('\n当前配置'));
+  say(`  ${'wrangler'.padEnd(16)} ${WRANGLER}${/^npx/.test(WRANGLER) ? c.yellow('  ← 走 npx,每次都要问 registry,慢/易卡') : c.dim('  (本机已有)')}`);
   for (const [k, v] of rows) say(`  ${k.padEnd(16)} ${v}`);
   const tracked = localConfigTracked();
   say(`  ${'配置文件'.padEnd(16)} ${path.relative(process.cwd(), TOML_PATH)}${tracked ? c.red('  ← 被 git 跟踪,真实值有泄露风险(见 workers/README.md)') : c.dim('  (未被 git 跟踪)')}`);
@@ -1389,7 +1483,8 @@ if (!COMMANDS[command] || flags.help) {
   --scan-bases token:名  额外扫描的 base(员工在别人共享的表里时用)
   --keep-secret          飞书凭据已存在时只校验,不改写 Cloudflare secret
 
-环境变量:WRANGLER_CMD(默认 "npx --yes wrangler")、DIGEST_SUBMIT_URL、DIGEST_SCAN_BASES、CLOUDFLARE_API_TOKEN
+环境变量:WRANGLER_CMD(覆盖 wrangler 调用方式;默认优先用本机已有的 wrangler)、
+          DIGEST_WRANGLER_TIMEOUT(秒,默认 60)、DIGEST_SUBMIT_URL、DIGEST_SCAN_BASES、CLOUDFLARE_API_TOKEN
 `);
   process.exit(flags.help ? 0 : 1);
 }
