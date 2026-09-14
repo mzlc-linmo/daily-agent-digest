@@ -2,9 +2,46 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { issueReportLines, knownSubmitUrl, resolveSubmitUrl } from '../scripts/issue-report.mjs';
+import { issueReportLines, knownSubmitUrl, parseDeployedUrl, resolveSubmitUrl } from '../scripts/issue-report.mjs';
 
 const textOf = (rows) => rows.map(([, text]) => text).join('\n');
+
+// 真实的 `wrangler deploy` 输出形状(子域用占位名,不含任何真实标识)
+const DEPLOY_OUTPUT = ` ⛅️ wrangler 3.80.0
+-------------------
+Total Upload: 12.34 KiB / gzip: 3.21 KiB
+Uploaded daily-agent-digest-submit (1.23 sec)
+Deployed daily-agent-digest-submit triggers (0.45 sec)
+  https://daily-agent-digest-submit.example-subdomain.workers.dev
+Current Version ID: 1a2b3c4d-0000-1111-2222-333344445555`;
+
+test('the deployed workers.dev address is read from wrangler deploy output', () => {
+  assert.equal(
+    parseDeployedUrl(DEPLOY_OUTPUT, 'daily-agent-digest-submit'),
+    'https://daily-agent-digest-submit.example-subdomain.workers.dev',
+  );
+});
+
+test('a version preview address is not mistaken for the submit address', () => {
+  // wrangler 里存在 https://<版本号>-<worker>.<子域>.workers.dev,它钉在某个版本上。
+  const withPreview = `Deployed daily-agent-digest-submit triggers (0.45 sec)
+  https://1a2b3c4d-daily-agent-digest-submit.example-subdomain.workers.dev
+  https://daily-agent-digest-submit.example-subdomain.workers.dev`;
+  assert.equal(
+    parseDeployedUrl(withPreview, 'daily-agent-digest-submit'),
+    'https://daily-agent-digest-submit.example-subdomain.workers.dev',
+  );
+  const onlyPreview = '  https://1a2b3c4d-daily-agent-digest-submit.example-subdomain.workers.dev';
+  assert.equal(parseDeployedUrl(onlyPreview, 'daily-agent-digest-submit'), '', '只有预览地址时应当解析不出来');
+});
+
+test('a custom-domain-only deploy yields no workers.dev address', () => {
+  const onlyCustom = `Deployed daily-agent-digest-submit triggers (0.45 sec)
+  digest.example.com`;
+  assert.equal(parseDeployedUrl(onlyCustom, 'daily-agent-digest-submit'), '');
+  assert.equal(parseDeployedUrl('', 'daily-agent-digest-submit'), '');
+  assert.equal(parseDeployedUrl(DEPLOY_OUTPUT, ''), '');
+});
 
 test('template placeholders do not count as a real address', () => {
   // wrangler.toml 是随仓库分发的模板;把占位符当真实地址发出去比不显示更糟。

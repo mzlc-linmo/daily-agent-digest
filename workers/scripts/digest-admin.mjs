@@ -28,7 +28,7 @@ import {
   bootstrapLocally, d1Adapter, issueLocally, kvAdapter,
   listKeysLocally, logsLocally, revokeLocally,
 } from './local-admin.mjs';
-import { issueReportLines, resolveSubmitUrl } from './issue-report.mjs';
+import { issueReportLines, parseDeployedUrl, resolveSubmitUrl } from './issue-report.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TOML_PATH = path.join(ROOT, 'wrangler.toml');
@@ -568,7 +568,7 @@ async function cmdDeploy(flags) {
 
   const deploy = await withSpinner('部署 Worker', () => wrangler(['deploy']));
   if (deploy.code !== 0) fail(`部署失败:${(deploy.out ?? '').trim()}`);
-  const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deploy.out ?? '')?.[0];
+  const url = parseDeployedUrl(deploy.out ?? '', tomlVar('name'));
   if (url) { setTomlVar('SUBMIT_URL', url); ok(`后端已部署:${url}`); }
   else warn('部署成功但没解析到地址,请手动把 SUBMIT_URL 写进 wrangler.toml');
 }

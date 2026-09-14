@@ -1,3 +1,9 @@
+/// 提交地址工具 + 签发提示。
+///
+/// 提交地址有两件事容易出错,都在这里处理并有单测覆盖:
+///   · 仓库模板里的 `YOUR_SUBDOMAIN` 占位符不能被当成真实地址;
+///   · `wrangler deploy` 的输出要能正确解析出成员的长期提交地址。
+///
 /// 判断一个"提交地址"是否是真实可用的。
 ///
 /// wrangler.toml 是随仓库分发的模板,里面的 SUBMIT_URL 是
@@ -9,6 +15,24 @@ export function knownSubmitUrl(raw) {
   if (!url) return '';
   if (/YOUR_|REPLACE_WITH|[<>]/.test(url)) return '';
   return url;
+}
+
+/// 从 `wrangler deploy` 的输出里取出本次部署的 workers.dev 地址。
+///
+/// wrangler 在 "Deployed <worker> triggers" 之后逐行打印部署目标,例如:
+///
+///   Deployed daily-agent-digest-submit triggers (0.45 sec)
+///     https://daily-agent-digest-submit.<账号的 workers.dev 子域>.workers.dev
+///
+/// 子域来自 Cloudflare 账号设置(不是登录时算出来的),worker 名来自 wrangler.toml。
+/// 只认**以 worker 名开头**的地址:wrangler 里还有形如
+/// `https://<版本号>-<worker>.<子域>.workers.dev` 的版本预览地址,它钉在某个版本上,
+/// 不适合当成员长期使用的提交地址。
+export function parseDeployedUrl(output, workerName) {
+  const name = String(workerName ?? '').trim();
+  if (!name) return '';
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`https://${escaped}\\.[a-z0-9.-]+\\.workers\\.dev`).exec(String(output ?? ''))?.[0] ?? '';
 }
 
 /// 决定"当前该用哪个提交地址":优先 wrangler.toml(部署时写入),其次环境变量。
