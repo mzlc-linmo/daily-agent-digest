@@ -59,3 +59,18 @@ notarize_and_staple() {
 
 notarize_and_staple "dist/Daily Agent Digest $BUILD_ARCH.app" "app-$BUILD_ARCH"
 notarize_and_staple "dist/Daily-Agent-Digest-$BUILD_ARCH.dmg" "dmg-$BUILD_ARCH"
+
+# ---- DMG 端到端校验(只在 macOS 上可行)------------------------------------
+dmg="dist/Daily-Agent-Digest-$BUILD_ARCH.dmg"
+if [ -f "$dmg" ]; then
+  mount_point=$(mktemp -d)
+  hdiutil attach "$dmg" -mountpoint "$mount_point" -nobrowse -quiet
+  dmg_app=$(find "$mount_point" -maxdepth 1 -name '*.app' | head -1)
+  codesign --verify --deep --strict "$dmg_app"
+  xcrun stapler validate "$dmg_app"
+  [ -L "$mount_point/Applications" ] || { echo 'DMG 缺少 Applications 快捷方式' >&2; exit 1; }
+  hdiutil detach "$mount_point" -quiet
+  codesign --verify --verbose=2 "$dmg"
+  xcrun stapler validate "$dmg"
+  echo 'DMG 校验通过(签名 / 公证装订 / 拖拽安装布局)'
+fi
