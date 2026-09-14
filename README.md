@@ -181,7 +181,14 @@ pretending the digest was delivered.
 
 > Removed along with the Worker: member keys and their issuance CLI, the D1 audit log, the
 > Feishu Bitable writer, and the deployment/recovery tooling. If a future server is built,
-> the four endpoints above are all it has to provide.
+> the endpoints above are all it has to provide.
+
+**The full contract for that server — API-key issuance requirements, request/response shapes,
+field limits, idempotency and overwrite semantics, failure handling, a minimal acceptance
+checklist and ready-to-run `curl` examples — is written up in
+[`docs/backend-api.md`](docs/backend-api.md) (Chinese).** It deliberately prescribes nothing
+about the backend's stack, storage or hosting: it only fixes what the client already sends and
+what it needs back.
 
 ## 日报 Markdown
 
@@ -225,6 +232,7 @@ scripts/ci-notarize.sh       Notarize + staple the engine, the app and the DMG
 scripts/dev.sh               Isolated local development harness
 scripts/release-audit.sh     Pre-release audit of release artifacts
 tests/test_core.py           Engine protocol tests
+docs/backend-api.md          Contract for the (future) submission server
 docs/                        Requirements baseline and development notes
 ```
 
