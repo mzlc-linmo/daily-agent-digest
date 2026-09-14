@@ -61,10 +61,13 @@ export async function issueKey(env, feishu, { member_id, member, email, open_id 
     enabled: true,
     created_at: new Date().toISOString(),
     revoked_at: null,
+    // 只留末 4 位用于列表里做掩码显示;它不是可用凭据,也拼不出完整密钥。
+    // 完整明文只在签发那一刻返回一次,服务端不留。
+    secret_tail: secret.slice(-4),
   };
   await writeKey(env, keyId, record);
   return {
-    key: `dag_${keyId}_${secret}`, // 只在这里返回一次,服务端只留哈希
+    key: `dag_${keyId}_${secret}`, // 只在这里返回一次
     key_id: keyId,
     member: memberName,
     member_id: memberId,
@@ -94,6 +97,13 @@ export async function revokeExistingFor(env, open_id, exceptKeyId = '') {
   return revoked;
 }
 
+/// 掩码显示:首(dag_<key_id>_)与尾(末 4 位)可见,中间打星号。
+/// 密钥本体不可还原 —— 服务端只有哈希和这 4 位。
+export function maskedKey(keyId, secretTail) {
+  const tail = secretTail ? String(secretTail) : '';
+  return `dag_${keyId}_${'*'.repeat(8)}${tail}`;
+}
+
 /// 列出所有 Key(绝不返回哈希与明文)。
 export async function listKeys(env) {
   if (!env.KEYS) return [];
@@ -108,6 +118,7 @@ export async function listKeys(env) {
       member_id: record.member_id,
       // open_id 用于把 Key 关联回员工列表(仅本机管理侧使用,不是敏感信息)
       open_id: record.open_id ?? '',
+      masked: maskedKey(item.name.slice(KEY_PREFIX.length), record.secret_tail),
       linked: Boolean(record.open_id),
       enabled: record.enabled !== false,
       created_at: record.created_at ?? null,

@@ -145,7 +145,15 @@ test('issueLocally:签发 → 写台账 → 记审计,并且一人一把', async
   assert.equal(first.superseded.length, 0);
   const stored = await env.KEYS.get(`key:${first.key_id}`, 'json');
   assert.equal(stored.open_id, 'ou_zhangsan');
-  assert.equal(stored.hash, await sha256Hex(first.key.split('_').slice(2).join('_')), '只存 sha256');
+  const secret = first.key.split('_').slice(2).join('_');
+  assert.equal(stored.hash, await sha256Hex(secret), '只存 sha256');
+  assert.equal(stored.key, undefined, 'KV 里绝不能存明文 Key');
+  assert.equal(stored.secret_tail, secret.slice(-4), '只留末 4 位用于掩码');
+  const listed = (await listKeysLocally(env))[0];
+  assert.ok(listed.masked.startsWith(`dag_${first.key_id}_`), listed.masked);
+  assert.ok(listed.masked.endsWith(secret.slice(-4)), listed.masked);
+  assert.ok(!listed.masked.includes(secret), '掩码不得泄露完整密钥');
+  assert.match(listed.masked, /\*{8}/, '中间应以星号代替');
 
   // 第二把:旧的必须作废
   const second = await issueLocally(env, { member_id: 'zhangsan', member: '张三', open_id: 'ou_zhangsan' }, feishu);

@@ -535,6 +535,7 @@ async function cmdIssue(flags) {
 function reportIssue(label, issued) {
   ok(`「${label}」的 Key(只显示这一次):`);
   say(`    ${c.bold(issued.key)}`);
+  say(c.dim('    请立即发给本人;列表里只会显示掩码。丢失请在「员工与 Key」里轮换。'));
   if (issued.superseded?.length) say(c.dim(`    已作废旧 Key:${issued.superseded.join(', ')}(一人一把)`));
 }
 
@@ -542,9 +543,10 @@ async function cmdKeys(flags) {
   requireLogin();
   const keys = await listKeysLocally(buildEnv(flags, { withDb: false }));
   say(c.bold(`\n共 ${keys.length} 把 Key`));
+  say(c.dim(`  ${padEndWidth('成员', 16)}状态    Key(掩码)`));
   for (const k of keys) {
     const state = k.enabled ? c.green('启用') : c.dim('已撤销');
-    say(`  ${k.key_id}  ${padEndWidth(k.member, 16)}${padEndWidth(k.member_id, 14)}${state}  ${c.dim(k.created_at ?? '')}`);
+    say(`  ${padEndWidth(k.member, 16)}${state}  ${c.dim(k.masked ?? '(无掩码)')}`);
   }
   say('');
 }
@@ -730,7 +732,7 @@ async function cmdMembers(flags) {
       person,
       key,
       label: key
-        ? `${padEndWidth(person.name, 16)}${c.green('已签发')}  ${c.dim(key.key_id)}`
+        ? `${padEndWidth(person.name, 16)}${c.green('已签发')}  ${c.dim(key.masked ?? key.key_id)}`
         : `${padEndWidth(person.name, 16)}${c.dim('未签发')}`,
     });
   }
@@ -739,7 +741,7 @@ async function cmdMembers(flags) {
     rows.push({
       kind: 'orphan',
       key,
-      label: `${padEndWidth(key.member, 16)}${c.yellow('有 Key 但不在员工名单')}  ${c.dim(key.key_id)}`,
+      label: `${padEndWidth(key.member, 16)}${c.yellow('有 Key 但不在员工名单')}  ${c.dim(key.masked ?? key.key_id)}`,
     });
   }
   if (!rows.length) return warn('没有可管理的人(员工名单为空且没有已签发的 Key)');
@@ -769,12 +771,19 @@ async function cmdMembers(flags) {
   }
 
   const action = await choose([
-    { label: `轮换:签发新 Key,旧的(${key.key_id})立即失效`, value: 'rotate' },
-    { label: `撤销:停用 ${key.key_id},该成员将无法提交`, value: 'revoke' },
+    { label: '查看 Key(仅掩码,完整值无法还原)', value: 'show' },
+    { label: '轮换:签发新 Key,旧的立即失效', value: 'rotate' },
+    { label: '撤销:停用,该成员将无法提交', value: 'revoke' },
     { label: '取消', value: 'cancel' },
   ], { prompt: `「${person.name}」已有 Key`, footer: '↑/↓ 移动 · Enter 确认 · q 取消' });
 
   if (!action || action.value === 'cancel') return warn('已取消');
+
+  if (action.value === 'show') {
+    say(`  ${padEndWidth(person.name, 16)}${c.dim(key.masked ?? key.key_id)}`);
+    say(c.dim('    完整 Key 只在签发时显示过一次;成员弄丢就选「轮换」重新签发。'));
+    return;
+  }
 
   if (action.value === 'revoke') {
     const revoked = await withSpinner(`撤销 ${key.key_id}`, () => revokeLocally(env, key.key_id));
