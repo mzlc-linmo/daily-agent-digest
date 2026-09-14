@@ -10,7 +10,6 @@ import {
 } from './report.js';
 import * as realFeishu from './feishu.js';
 import { logEvent, requestContext } from './logs.js';
-import { recordSubmission } from './registry.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -89,13 +88,6 @@ export async function submitDigest(request, env, feishu, now, audit = {}) {
     ...updates.map((row, index) => ({ index, record_id: row.record_id })),
     ...created.map((row, index) => ({ index: updateCount + index, record_id: row.record_id })),
   ];
-  // 台账回写是尽力而为:失败了也不能影响日报提交
-  try {
-    const notes = await recordSubmission(env, feishu, { key_id: member.key_id, at: meta.submitted_at });
-    if (notes.length) console.log(`registry ${member.key_id}: ${notes.join(',')}`);
-  } catch (err) {
-    console.warn(`台账回写最近提交失败:${err.message}`);
-  }
   const mode = existing.length ? 'updated' : 'created';
   await logEvent(env, {
     ...audit,

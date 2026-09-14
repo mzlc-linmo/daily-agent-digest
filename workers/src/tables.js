@@ -1,17 +1,16 @@
-// 飞书表的建表/建字段逻辑。
+// 飞书表的建表/建字段逻辑(只涉及主表「日报明细」)。
 //
-// 抽成独立模块的原因:`/admin/*` 已从 Worker 上彻底移除,现在由**本机 CLI**
-// 直连飞书 API 建表。CLI 直接 import 这里的函数,和 Worker 用**同一份**定义 ——
-// 规则只存在一处,不会出现"两边漂移"。
+// 由本机 CLI 直连飞书 API 调用 —— Worker 上没有任何管理接口。
+// 这个模块不依赖 Worker 专有 API(只用 fetch + env),Node 18+ 可直接运行。
 //
-// 这个模块不依赖任何 Worker 专有 API(只用 fetch + env),Node 18+ 可直接运行。
+// 设计变更(2026-09-14):「成员密钥」登记表与「密钥申请」表已删除,
+// 成员自助填表申请 Key 的流程也一并取消。Key 只由管理员用本机 CLI 签发,
+// 台账由 D1 的审计日志承担。
 
 import { FIELDS, FIELD_DEFS } from './report.js';
-import { ensureTable, registryFieldDefs, requestFieldDefs, REGISTRY, REQUESTS } from './registry.js';
 
-/// 幂等地把主表 + 两张管理表建好,并补齐所有字段。
-/// 返回 { tableId, registryTableId, requestTableId, created, existingFields }。
-export async function bootstrapTables(env, feishu) {
+/// 幂等地建好主表并补齐所有字段。返回 { tableId, created, existingFields }。
+export async function bootstrapMainTable(env, feishu) {
   if (!env.BITABLE_APP_TOKEN) throw new Error('缺少 BITABLE_APP_TOKEN');
   const tableName = env.BITABLE_TABLE_NAME || '日报明细';
   const created = [];
@@ -26,15 +25,6 @@ export async function bootstrapTables(env, feishu) {
       fields: [{ field_name: FIELDS.submitId, type: 1 }],
     });
     if (!found) created.push(`table:${tableName}`);
-  }
-
-  // 两张管理表(与主表同一个 base)
-  const adminTables = {};
-  for (const [key, spec, defs] of [['registry', REGISTRY, registryFieldDefs()], ['requests', REQUESTS, requestFieldDefs()]]) {
-    const result = await ensureTable(env, feishu, spec, defs);
-    if (!result.tableId) throw new Error(`建表 ${spec.name} 失败:未拿到表 id`);
-    adminTables[key] = result.tableId;
-    created.push(...result.created);
   }
 
   const current = await feishu.listFields(env, tableId);
@@ -58,11 +48,5 @@ export async function bootstrapTables(env, feishu) {
     created.push(`field:${definition.field_name}`);
   }
 
-  return {
-    tableId,
-    registryTableId: adminTables.registry,
-    requestTableId: adminTables.requests,
-    created,
-    existingFields,
-  };
+  return { tableId, created, existingFields };
 }

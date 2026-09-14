@@ -17,8 +17,6 @@ BITABLE_TABLE_ID = "tbl77oxPmPcVVyVz"
 FEISHU_APP_ID = "cli_aa13a11707b89bdb"
 # 成员 Key 已改由 KV 保存,通过 POST /admin/keys 签发(见 README)。
 # 鉴权以 KV 为准;以下两张表是给人和审计看的台账,写入是 best-effort。
-REGISTRY_TABLE_ID = "tbl8IQgaVk9ckPfd"
-REQUEST_TABLE_ID = "tblFBzvs29vNjuqN"
 
 [observability]
 enabled = true

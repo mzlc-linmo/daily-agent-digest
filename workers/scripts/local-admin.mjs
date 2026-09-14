@@ -13,8 +13,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { issueKey, listKeys, revokeKey, revokeExistingFor } from '../src/keys.js';
-import { recordIssued, recordRevoked } from '../src/registry.js';
-import { bootstrapTables } from '../src/tables.js';
+import { bootstrapMainTable } from '../src/tables.js';
 import { logEvent, queryLogs } from '../src/logs.js';
 import * as realFeishu from '../src/feishu.js';
 
@@ -134,33 +133,25 @@ export function d1Adapter(databaseName, wrangler) {
 
 /* ------------------------------------------------------------ 管理动作 */
 
-/// 签发一把 Key:解析身份 → 作废旧的(一人一把)→ 存 KV → 写台账 → 记审计。
+/// 签发一把 Key:解析身份 → 作废旧的(一人一把)→ 存 KV → 记审计。
+/// 台账由 D1 审计日志承担(飞书侧的登记表已取消)。
 export async function issueLocally(env, { member_id, member, email, open_id }, feishu = realFeishu) {
   const issued = await issueKey(env, feishu, { member_id, member, email, open_id });
-  const superseded = [];
-  for (const oldId of await revokeExistingFor(env, issued.open_id, issued.key_id)) {
-    await recordRevoked(env, feishu, { key_id: oldId, revoked_at: new Date().toISOString() });
-    superseded.push(oldId);
-  }
-  const registry = await recordIssued(env, feishu, {
-    member: issued.member, member_id: issued.member_id, key_id: issued.key_id,
-    open_id: issued.open_id, created_at: new Date().toISOString(),
-  });
+  const superseded = await revokeExistingFor(env, issued.open_id, issued.key_id);
   await logEvent(env, {
     event: 'issue_key', outcome: 'ok', key_id: issued.key_id,
     member: issued.member, member_id: issued.member_id,
-    detail: JSON.stringify({ registry, superseded, via: 'cli' }),
+    detail: JSON.stringify({ superseded, via: 'cli' }),
   });
   return { ...issued, superseded };
 }
 
-export async function revokeLocally(env, keyId, feishu = realFeishu) {
+export async function revokeLocally(env, keyId) {
   const revoked = await revokeKey(env, keyId);
-  const registry = await recordRevoked(env, feishu, { key_id: revoked.key_id, revoked_at: revoked.revoked_at });
   await logEvent(env, {
     event: 'revoke_key', outcome: 'ok', key_id: revoked.key_id,
     member: revoked.member, member_id: revoked.member_id,
-    detail: JSON.stringify({ registry, via: 'cli' }),
+    detail: JSON.stringify({ via: 'cli' }),
   });
   return revoked;
 }
@@ -169,11 +160,12 @@ export async function listKeysLocally(env) {
   return listKeys(env);
 }
 
+/// 建飞书主表(仅「日报明细」)。
 export async function bootstrapLocally(env, feishu = realFeishu) {
-  const result = await bootstrapTables(env, feishu);
+  const result = await bootstrapMainTable(env, feishu);
   await logEvent(env, {
     event: 'bootstrap', outcome: 'ok',
-    detail: JSON.stringify({ table_id: result.tableId, registry: result.registryTableId, requests: result.requestTableId, via: 'cli' }),
+    detail: JSON.stringify({ table_id: result.tableId, via: 'cli' }),
   });
   return result;
 }

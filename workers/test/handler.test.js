@@ -6,10 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/handler.js';
-import { processRequests, requestFieldDefs, registryFieldDefs, REQUESTS, REGISTRY } from '../src/registry.js';
-import { logEvent, queryLogs } from '../src/logs.js';
-import { sha256Hex } from '../src/report.js';
-import { FIELDS } from '../src/report.js';
+import { logEvent } from '../src/logs.js';
+import { sha256Hex, FIELDS, FIELD_DEFS } from '../src/report.js';
 
 const SECRET = 'test-secret-value';
 let ENV;
@@ -287,174 +285,23 @@ test('/api/v1/digests?date= 反映是否已提交', async () => {
 
 
 
-test('提交成功后回写「最近提交」', async () => {
-  const feishu = fakeFeishu();
-  await feishu.batchCreate(ENV, ENV.REGISTRY_TABLE_ID, [{ fields: { KeyID: 'k1', 成员ID: 'zhangsan', 状态: '已启用' } }]);
-  const before = feishu.calls.registryUpdate;
-  const res = await handleRequest(post('/api/v1/digests', REPORT), ENV, { feishu });
-  assert.equal(res.status, 201);
-  assert.ok(feishu.calls.registryUpdate > before, '应有一次台账回写');
-  const row = [...feishu.tables.get(ENV.REGISTRY_TABLE_ID).rows.values()][0];
-  assert.ok(row['最近提交'] > 0);
-});
 
-test('台账写失败不影响日报提交', async () => {
-  const feishu = fakeFeishu();
-  const failing = { ...feishu };
-  failing.batchUpdate = async (_env, tableId, records) => {
-    if (tableId === ENV.REGISTRY_TABLE_ID) throw new Error('台账不可用');
-    return feishu.batchUpdate(_env, tableId, records);
-  };
-  const res = await handleRequest(post('/api/v1/digests', REPORT), ENV, { feishu: failing });
-  assert.equal(res.status, 201, '台账是辅助信息,不能拖垮提交');
-  assert.equal(feishu.tables.get(ENV.BITABLE_TABLE_ID).rows.size, 2);
-});
 
-test('定时任务:待处理申请自动签发并写回 Key', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
-    fields: { 申请标题: '日报 Key 申请', 申请人: [{ id: 'ou_zhaoliu', name: '赵六' }], 账号: 'zhaoliu', 状态: '待处理' },
-  }]);
-  const result = await processRequests(env, feishu);
-  assert.equal(result.issued, 1);
-  const row = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0];
-  assert.equal(row['状态'], '已签发');
-  assert.match(row['Key'], /^dag_[0-9a-f]{8}_/, '表单行里应直接出现明文 Key');
-  assert.equal(row['KeyID'], row['Key'].split('_')[1]);
-  // KV 里存了哈希,且能用来鉴权
-  const stored = await env.KEYS.get(`key:${row['KeyID']}`, 'json');
-  assert.equal(stored.member, '赵六');
-  assert.equal(stored.open_id, 'ou_zhaoliu');
-  const who = await handleRequest(new Request('https://digest.example.com/api/v1/me', {
-    headers: { Authorization: `Bearer ${row['Key']}` },
-  }), env, { feishu });
-  assert.equal((await who.json()).member, '赵六');
-  // 登记表也有了
-  assert.equal(feishu.tables.get(env.REGISTRY_TABLE_ID).rows.size, 1);
-});
 
-test('定时任务:状态改为已撤销时撤销对应 Key', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
-    fields: { 申请标题: 'x', 申请人: [{ id: 'ou_zhaoliu', name: '赵六' }], 账号: 'zhaoliu', 状态: '待处理' },
-  }]);
-  await processRequests(env, feishu);
-  const rowId = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.keys()][0];
-  const keyId = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['KeyID'];
-  const key = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['Key'];
 
-  await feishu.batchUpdate(env, env.REQUEST_TABLE_ID, [{ record_id: rowId, fields: { 状态: '已撤销' } }]);
-  const result = await processRequests(env, feishu);
-  assert.equal(result.revoked, 1);
-  const stored = await env.KEYS.get(`key:${keyId}`, 'json');
-  assert.equal(stored.enabled, false, 'KV 里应已失效');
-  const after = await handleRequest(new Request('https://digest.example.com/api/v1/me', {
-    headers: { Authorization: `Bearer ${key}` },
-  }), env, { feishu });
-  assert.equal(after.status, 403);
-});
 
-test('定时任务:表单提交后状态为空也应签发(表单隐藏了状态字段)', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  // 模拟真实表单提交:没有状态、没有 Key
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
-    fields: { 申请标题: 'My-key', 申请人: [{ id: 'ou_mastercui', name: 'Master Cui' }], 账号: 'mastercui' },
-  }]);
-  const result = await processRequests(env, feishu);
-  assert.equal(result.issued, 1, '空状态必须被视为待处理');
-  const row = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0];
-  assert.match(row['Key'], /^dag_/);
-  assert.equal(row['状态'], '已签发');
-});
 
-test('定时任务:已签发的行不会被重复签发', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
-    fields: { 申请标题: 'x', 申请人: [{ id: 'ou_a', name: 'A' }], 账号: 'a' },
-  }]);
-  await processRequests(env, feishu);
-  const first = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['Key'];
-  const second = await processRequests(env, feishu);
-  assert.equal(second.issued, 0);
-  assert.equal([...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['Key'], first, 'Key 不得被覆盖');
-  assert.equal(env.KEYS.store.size, 1, '不应产生第二把 Key');
-});
 
-test('同一成员重新申请时,旧 Key 立即失效(一人一把)', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  const person = [{ id: 'ou_zhaoliu', name: '赵六' }];
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{ fields: { 申请人: person } }]);
-  await processRequests(env, feishu);
-  const firstKey = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['Key'];
-  const firstId = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['KeyID'];
 
-  // 第二次申请(同一个人)
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{ fields: { 申请人: person } }]);
-  const result = await processRequests(env, feishu);
-  assert.equal(result.issued, 1);
-  const rows = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()];
-  const secondKey = rows[1]['Key'];
-  assert.notEqual(secondKey, firstKey, '应生成新的 Key');
-
-  // 旧 Key 失效
-  const old = await handleRequest(new Request('https://digest.example.com/api/v1/me', {
-    headers: { Authorization: `Bearer ${firstKey}` },
-  }), env, { feishu });
-  assert.equal(old.status, 403, '旧 Key 必须立即失效');
-  const fresh = await handleRequest(new Request('https://digest.example.com/api/v1/me', {
-    headers: { Authorization: `Bearer ${secondKey}` },
-  }), env, { feishu });
-  assert.equal(fresh.status, 200, '新 Key 可用');
-  // 台账:旧的那把被标为已撤销
-  const statuses = [...feishu.tables.get(env.REGISTRY_TABLE_ID).rows.values()].map((r) => r['状态']);
-  assert.ok(statuses.includes('已撤销') && statuses.includes('已启用'), JSON.stringify(statuses));
-  assert.ok(firstId);
-});
-
-test('定时任务:申请人不是恰好一人时跳过(不猜身份)', async () => {
-  const feishu = fakeFeishu();
-  const env = await makeEnv();
-  env.KEYS = fakeKV();
-  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
-    fields: { 申请人: [{ id: 'ou_a', name: 'A' }, { id: 'ou_b', name: 'B' }] },
-  }]);
-  const result = await processRequests(env, feishu);
-  assert.equal(result.issued, 0, '多选时不应签发');
-  assert.equal(env.KEYS.store.size, 0);
-  const row = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0];
-  assert.equal(row['Key'], undefined);
-});
-
-test('建表字段定义必须覆盖运行时用到的每一个字段', async () => {
-  // 这组断言是为了防"补丁静默没生效":字段定义漏了,重新 bootstrap 出来的表就会缺列,
-  // 而运行时照旧往那一列写 —— 只有重建表时才会暴露,平时看不出来。
-  const requestNames = requestFieldDefs().map((d) => d.field_name);
-  for (const name of Object.values(REQUESTS.fields)) {
-    assert.ok(requestNames.includes(name), `申请表定义缺少字段「${name}」`);
+test('主表字段定义必须覆盖运行时用到的每一个字段', () => {
+  // 防"补丁静默没生效":定义漏了字段,重新 bootstrap 出来的表就会缺列
+  const names = new Set(FIELD_DEFS.map((d) => d.field_name));
+  for (const name of Object.values(FIELDS)) {
+    assert.ok(names.has(name), `主表定义缺少字段「${name}」`);
   }
-  const registryNames = registryFieldDefs().map((d) => d.field_name);
-  for (const name of Object.values(REGISTRY.fields)) {
-    assert.ok(registryNames.includes(name), `登记表定义缺少字段「${name}」`);
-  }
-  // 申请人是单选人员字段
-  const applicant = requestFieldDefs().find((d) => d.field_name === REQUESTS.fields.applicant);
-  assert.equal(applicant.type, 11);
-  assert.equal(applicant.property.multiple, false, '申请人必须是单选');
-  // 状态选项必须包含运行时实际写入的三个值
-  const options = requestFieldDefs().find((d) => d.field_name === REQUESTS.fields.status).property.options.map((o) => o.name);
-  for (const needed of ['待处理', '已签发', '已撤销']) {
-    assert.ok(options.includes(needed), `状态缺少选项「${needed}」`);
-  }
+  // 成员必须是人员字段(关联通讯录)
+  const member = FIELD_DEFS.find((d) => d.field_name === FIELDS.member);
+  assert.equal(member.type, 11);
 });
 
 test('成功提交写入审计日志', async () => {

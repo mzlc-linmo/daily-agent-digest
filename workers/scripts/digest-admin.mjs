@@ -314,8 +314,6 @@ function buildEnv(flags = {}, { withKv = true, withDb = true } = {}) {
     BITABLE_APP_TOKEN: tomlVar('BITABLE_APP_TOKEN'),
     BITABLE_TABLE_NAME: tomlVar('BITABLE_TABLE_NAME') || '日报明细',
     BITABLE_TABLE_ID: tomlVar('BITABLE_TABLE_ID'),
-    REGISTRY_TABLE_ID: tomlVar('REGISTRY_TABLE_ID'),
-    REQUEST_TABLE_ID: tomlVar('REQUEST_TABLE_ID'),
     FEISHU_APP_ID: appId,
     FEISHU_APP_SECRET: appSecret,
   };
@@ -392,9 +390,7 @@ async function cmdStatus() {
     ['KV 命名空间', hasBinding('kv_namespaces') ? c.green('已绑定') : c.red('缺失')],
     ['D1 数据库', hasBinding('d1_databases') ? c.green('已绑定') : c.red('缺失')],
     ['主表 ID', tomlVar('BITABLE_TABLE_ID') || c.red('缺失')],
-    ['登记表 ID', tomlVar('REGISTRY_TABLE_ID') || c.red('缺失')],
-    ['申请表 ID', tomlVar('REQUEST_TABLE_ID') || c.red('缺失')],
-    ['定时任务', /crons\s*=/.test(readToml()) ? c.green('每分钟') : c.red('未配置')],
+    ['定时任务', /crons\s*=/.test(readToml()) ? c.green('每小时清理日志') : c.red('未配置')],
   ];
   say(c.bold('\n当前配置'));
   for (const [k, v] of rows) say(`  ${k.padEnd(16)} ${v}`);
@@ -476,78 +472,19 @@ async function cmdTables(flags) {
   requireLogin();
   const env = buildEnv(flags, { withKv: true, withDb: true });
   const result = await withSpinner('直连飞书建表 / 建字段', () => bootstrapLocally(env));
-  ok(`主表 ${result.tableId} / 登记表 ${result.registryTableId} / 申请表 ${result.requestTableId}`);
+  ok(`主表 ${result.tableId}`);
   if (result.created.length) say(c.dim(`    新建:${result.created.join(', ')}`));
 
-  setTomlVar('BITABLE_TABLE_ID', result.tableId);
-  setTomlVar('REGISTRY_TABLE_ID', result.registryTableId);
-  setTomlVar('REQUEST_TABLE_ID', result.requestTableId);
-  ok('table id 已写回 wrangler.toml');
+  if (tomlVar('BITABLE_TABLE_ID') !== result.tableId) {
+    setTomlVar('BITABLE_TABLE_ID', result.tableId);
+    ok(`已写回 wrangler.toml(BITABLE_TABLE_ID=${result.tableId})`);
+  } else {
+    ok(`BITABLE_TABLE_ID 未变(${result.tableId}),无需改写`);
+  }
 
-  const deploy = await withSpinner('重新部署以让 Worker 读到这些 id', () => wrangler(['deploy']));
+  const deploy = await withSpinner('重新部署以让 Worker 读到表 id', () => wrangler(['deploy']));
   if (deploy.code !== 0) fail(`部署失败:${(deploy.out ?? '').trim()}`);
   ok('已重新部署');
-
-  if (flags['skip-form']) { warn('按要求跳过表单配置'); return; }
-  await setupForm(flags);
-}
-
-/// 把「密钥申请」表配成:表单只问「申请人」,并开启分享;同时收紧 base 可见范围。
-async function setupForm(flags) {
-  const { appId } = resolvedFeishu(flags);
-  if (!appId) { warn('缺飞书 App ID,跳过表单配置'); return; }
-  const appSecret = await ensureFeishuSecret(flags);
-  const token = await feishuToken(appId, appSecret);
-  const baseToken = tomlVar('BITABLE_APP_TOKEN');
-  const table = tomlVar('REQUEST_TABLE_ID');
-  if (!baseToken || !table) { warn('缺 base/表 id,跳过表单配置'); return; }
-
-  const views = (await feishuApi(`/bitable/v1/apps/${baseToken}/tables/${table}/views?page_size=50`, token)).data?.items ?? [];
-  let form = views.find((v) => v.view_type === 'form');
-  if (!form) {
-    const created = await feishuApi(`/bitable/v1/apps/${baseToken}/tables/${table}/views`, token, {
-      method: 'POST', body: JSON.stringify({ view_name: '密钥申请表单', view_type: 'form' }),
-    });
-    if (created.code !== 0) { warn(`建表单视图失败:${created.msg}`); return; }
-    form = created.data?.view;
-    ok(`表单视图已创建(${form.view_id})`);
-  } else ok(`复用已有表单视图(${form.view_id})`);
-
-  const fields = (await feishuApi(`/bitable/v1/apps/${baseToken}/tables/${table}/fields?page_size=100`, token)).data?.items ?? [];
-  const nameOf = Object.fromEntries(fields.map((f) => [f.field_id, f.field_name]));
-  const formPath = `/bitable/v1/apps/${baseToken}/tables/${table}/forms/${form.view_id}`;
-  for (const item of (await feishuApi(`${formPath}/fields`, token)).data?.items ?? []) {
-    if (nameOf[item.field_id] === '申请人') {
-      await feishuApi(`${formPath}/fields/${item.field_id}`, token, { method: 'PATCH', body: JSON.stringify({ visible: true, required: true }) });
-      continue;
-    }
-    if (item.visible === false && item.required === false) continue;
-    // 隐藏字段不允许直接改 required:先显示并取消必填,再隐藏
-    if (item.required) {
-      await feishuApi(`${formPath}/fields/${item.field_id}`, token, { method: 'PATCH', body: JSON.stringify({ visible: true, required: false }) });
-    }
-    await feishuApi(`${formPath}/fields/${item.field_id}`, token, { method: 'PATCH', body: JSON.stringify({ visible: false }) });
-  }
-  ok('表单只保留「申请人」');
-
-  const shared = await feishuApi(formPath, token, { method: 'PATCH', body: JSON.stringify({ shared: true }) });
-  const url = shared.data?.form?.shared_url;
-  if (url) ok(`表单地址:${url}`); else warn(`表单分享开启失败:${shared.msg ?? ''}`);
-
-  const closed = await feishuApi(`/drive/v1/permissions/${baseToken}/public?type=bitable`, token, {
-    method: 'PATCH', body: JSON.stringify({ link_share_entity: 'closed' }),
-  });
-  ok(closed.code === 0 ? 'base 链接分享已关闭(Key 只有管理员可见)' : `关闭链接分享失败:${closed.msg}`);
-
-  const adminOpenId = flags['admin-open-id'] || process.env.DIGEST_ADMIN_OPEN_ID;
-  if (adminOpenId) {
-    const added = await feishuApi(`/drive/v1/permissions/${baseToken}/members?type=bitable&need_notification=false`, token, {
-      method: 'POST', body: JSON.stringify({ member_type: 'openid', member_id: adminOpenId, perm: 'full_access' }),
-    });
-    ok(added.code === 0 ? '管理员已加为 base 协作者' : `添加协作者失败:${added.msg}`);
-  } else {
-    warn('未提供 --admin-open-id,跳过"把管理员加为协作者"');
-  }
 }
 
 async function cmdEmployees(flags) {
@@ -662,10 +599,7 @@ async function cmdInstall(flags) {
     },
     tables: () => {
       const main = tomlVar('BITABLE_TABLE_ID');
-      const reg = tomlVar('REGISTRY_TABLE_ID');
-      const req = tomlVar('REQUEST_TABLE_ID');
-      if (!main || !reg || !req) return null;
-      return `主表 ${main};登记表 ${reg};申请表 ${req}`;
+      return main ? `主表 ${main}` : null;
     },
   };
 
@@ -977,7 +911,6 @@ if (!COMMANDS[command] || flags.help) {
   --app-id/--app-secret  直接给飞书凭据
   --admin-open-id        配置表单时把该用户加为 base 协作者
   --scan-bases token:名  额外扫描的 base(员工在别人共享的表里时用)
-  --skip-form            只建表,不配置表单
   --keep-secret          飞书凭据已存在时只校验,不改写 Cloudflare secret
 
 环境变量:WRANGLER_CMD(默认 "npx --yes wrangler")、DIGEST_SUBMIT_URL、DIGEST_SCAN_BASES、CLOUDFLARE_API_TOKEN

@@ -12,7 +12,6 @@ import {
 } from '../scripts/local-admin.mjs';
 import { sha256Hex } from '../src/report.js';
 import { FIELDS } from '../src/report.js';
-import { REGISTRY } from '../src/registry.js';
 
 /* ------------------------------------------------------------- 假实现 */
 
@@ -138,7 +137,7 @@ test('d1Adapter 执行 SQL 并返回结果', async () => {
 /* --------------------------------------------------------- 管理动作 */
 
 test('issueLocally:签发 → 写台账 → 记审计,并且一人一把', async () => {
-  const env = { KEYS: fakeKV(), REGISTRY_TABLE_ID: 'tbl_reg' };
+  const env = { KEYS: fakeKV() };
   const feishu = fakeFeishu();
   // 第一把
   const first = await issueLocally(env, { member_id: 'zhangsan', member: '张三', open_id: 'ou_zhangsan' }, feishu);
@@ -154,13 +153,14 @@ test('issueLocally:签发 → 写台账 → 记审计,并且一人一把', async
   const old = await env.KEYS.get(`key:${first.key_id}`, 'json');
   assert.equal(old.enabled, false, '旧 Key 必须立即失效');
 
-  // 台账两行:一启用一撤销
-  const statuses = [...feishu.tables.get('tbl_reg').rows.values()].map((r) => r[REGISTRY.fields.status]);
-  assert.deepEqual(statuses.sort(), ['已启用', '已撤销']);
+  // KV 里只剩新那把可用(一人一把)
+  const enabled = [...env.KEYS.store.values()].map((v) => JSON.parse(v)).filter((r) => r.enabled !== false);
+  assert.equal(enabled.length, 1);
+  assert.equal(enabled[0].member_id, 'zhangsan');
 });
 
 test('issueLocally:邮箱解析不到人时拒绝签发', async () => {
-  const env = { KEYS: fakeKV(), REGISTRY_TABLE_ID: 'tbl_reg' };
+  const env = { KEYS: fakeKV() };
   const feishu = fakeFeishu();
   feishu.resolveOpenIds = async () => ({ 'ghost@example.com': '' });
   await assert.rejects(
@@ -171,7 +171,7 @@ test('issueLocally:邮箱解析不到人时拒绝签发', async () => {
 });
 
 test('listKeysLocally / revokeLocally', async () => {
-  const env = { KEYS: fakeKV(), REGISTRY_TABLE_ID: 'tbl_reg' };
+  const env = { KEYS: fakeKV() };
   const feishu = fakeFeishu();
   const issued = await issueLocally(env, { member_id: 'lisi', member: '李四', open_id: 'ou_lisi' }, feishu);
   const keys = await listKeysLocally(env);
@@ -185,12 +185,12 @@ test('listKeysLocally / revokeLocally', async () => {
   assert.equal(after[0].enabled, false);
 });
 
-test('bootstrapLocally 幂等建表并返回三个 id', async () => {
+test('bootstrapLocally 只建主表且幂等', async () => {
   const env = { BITABLE_APP_TOKEN: 'bascn_test', BITABLE_TABLE_ID: 'tbl_main' };
   const feishu = fakeFeishu();
   const first = await bootstrapLocally(env, feishu);
   assert.equal(first.tableId, 'tbl_main');
-  assert.ok(first.registryTableId && first.requestTableId);
+  assert.equal(first.registryTableId, undefined, '登记表已取消');
   const second = await bootstrapLocally(env, feishu);
   assert.equal(second.tableId, first.tableId, '重复执行应复用同一张表');
 });
