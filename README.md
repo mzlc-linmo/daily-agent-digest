@@ -80,6 +80,11 @@ Automatic behaviour, driven by a 60-second tick (so no scheduler of its own is n
 - after **18:00** it submits once, and only if the report is ready, unmodified and a
   submission address is configured.
 
+For this to happen the app has to be running, so it registers itself as a login item on
+first launch; 开机自启 turns that off and on. A DMG install therefore needs no scheduler
+setup at all, while the script install also gets a `launchd` job that runs at 18:00 even if
+nobody is signed in to the menu bar app.
+
 Both times are UTC+8. Work done after the cutoff is not included; press 生成今日总结 later
 for a complete day.
 
