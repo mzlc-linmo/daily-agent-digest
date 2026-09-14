@@ -482,9 +482,20 @@ async function cmdStatus() {
   const url = tomlVar('SUBMIT_URL') || process.env.DIGEST_SUBMIT_URL || '';
   if (url) {
     // 用异步执行:同期的 curl 也会阻塞事件循环,把动画冻住
-    const r = await withSpinner('检查后端健康', () => runAsync('curl', ['-sS', `${url.replace(/\/$/, '')}/healthz`]));
+    // 注意:runAsync 返回 code(不是 spawnSync 的 status)—— 这里曾写错,导致恒显示"不可达"
+    const r = await withSpinner('检查后端健康', () => runAsync('curl', ['-sS', '-w', '\n%{http_code}', `${url.replace(/\/$/, '')}/healthz`]));
     say(`  ${'后端地址'.padEnd(16)} ${url}`);
-    say(`  ${'后端健康'.padEnd(16)} ${r.status === 0 ? r.stdout.trim().replace(/\s+/g, ' ') : c.red('不可达')}`);
+    const healthLines = (r.stdout ?? '').trim().split('\n');
+    const httpCode = (healthLines.pop() ?? '').trim();
+    const healthBody = healthLines.join(' ').replace(/\s+/g, ' ').trim();
+    if (r.code !== 0) {
+      const reason = (r.stderr ?? '').trim().split('\n')[0] || `curl 退出码 ${r.code}`;
+      say(`  ${'后端健康'.padEnd(16)} ${c.red('不可达')} ${c.dim(reason)}`);
+    } else if (httpCode && httpCode !== '200') {
+      say(`  ${'后端健康'.padEnd(16)} ${c.red(`HTTP ${httpCode}`)} ${c.dim(healthBody.slice(0, 100))}`);
+    } else {
+      say(`  ${'后端健康'.padEnd(16)} ${c.green('正常')} ${c.dim(healthBody.slice(0, 100))}`);
+    }
   } else {
     say(`  ${'后端地址'.padEnd(16)} ${c.red('未知(部署后写入 wrangler.toml 的 SUBMIT_URL)')}`);
   }
