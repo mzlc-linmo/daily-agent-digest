@@ -86,18 +86,51 @@ function wranglerAuthState() {
   return { state: 'logged-in', email, out };
 }
 
+/// 未登录时自动拉起 `wrangler login`(会打开浏览器),登录成功后返回。
+/// 只在真终端里尝试:非交互环境跑 login 只会挂住。
+async function autoLogin() {
+  if (!process.stdin.isTTY) {
+    fail(`未登录 Cloudflare,且当前不是交互终端,无法自动登录。请先执行:\n    ${WRANGLER} login\n  (或设置 CLOUDFLARE_API_TOKEN)`);
+  }
+  say(c.yellow('!') + ' 检测到未登录 Cloudflare,正在启动 `' + `${WRANGLER} login` + '`(会打开浏览器)…');
+  // stdio 交给子进程:login 要打印授权链接并等待回调
+  const [cmd, ...base] = WRANGLER.split(' ').filter(Boolean);
+  run(cmd, [...base, 'login'], { capture: false });
+  const after = wranglerAuthState();
+  if (after.state !== 'logged-in') {
+    fail('登录未完成。可稍后重试,或改用环境变量 CLOUDFLARE_API_TOKEN。');
+  }
+  ok(`已登录 Cloudflare${after.email ? `(${after.email})` : ''}`);
+  return after;
+}
+
 /// 管理动作的前置条件:必须已登录 Cloudflare。
 /// 这正是本设计的安全门槛 —— 没有 wrangler 凭据就动不了后端。
-function requireLogin() {
-  const { state, email, out } = wranglerAuthState();
-  if (state === 'logged-out') {
-    fail(`未登录 Cloudflare。请先执行:\n    ${WRANGLER} login\n  (或在环境变量里设置 CLOUDFLARE_API_TOKEN)`);
-  }
-  if (state === 'error') {
-    const first = (out ?? '').trim().split('\n').filter((l) => l.trim() && !/WARNING|Proxy environment/.test(l))[0] ?? '';
+/// 未登录时不再直接退出,而是先尝试自动登录(见 autoLogin)。
+async function requireLogin() {
+  const state = wranglerAuthState();
+  if (state.state === 'logged-in') return state;
+  if (state.state === 'error') {
+    const first = (state.out ?? '').trim().split('\n').filter((l) => l.trim() && !/WARNING|Proxy environment/.test(l))[0] ?? '';
     fail(`wrangler 执行失败(不是登录问题):\n    ${first}\n  可执行 \`${WRANGLER} whoami\` 复查;常见原因是 npm 缓存目录权限(npm error code EPERM)。`);
   }
-  return { email, raw: out };
+  return autoLogin();
+}
+
+/// 启动时自动补登录;失败只提示,不阻断(有些功能不需要 Cloudflare)。
+async function tryAutoLogin() {
+  const state = wranglerAuthState();
+  if (state.state === 'logged-in') return state;
+  if (state.state === 'error') {
+    warn('wrangler 执行失败(不是登录问题),请先修好再使用管理功能');
+    return null;
+  }
+  try {
+    return await autoLogin();
+  } catch (err) {
+    warn(err instanceof CliError ? err.message : String(err.message ?? err));
+    return null;
+  }
 }
 
 function readToml() {
@@ -406,7 +439,7 @@ async function cmdStatus() {
 }
 
 async function cmdFeishu(flags) {
-  requireLogin();
+  await requireLogin();
   let appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || keychainGet('feishu-app-id')?.value || '';
   let appSecret = flags['app-secret'] || keychainGet('feishu-app-secret')?.value || '';
 
@@ -440,7 +473,7 @@ async function cmdFeishu(flags) {
 }
 
 async function cmdDeploy(flags) {
-  requireLogin();
+  await requireLogin();
   if (!hasBinding('kv_namespaces')) {
     const r = await withSpinner('创建 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'create', 'KEYS']));
     const id = /id\s*=\s*"([0-9a-f]{32})"/.exec(r.out ?? '')?.[1];
@@ -469,7 +502,7 @@ async function cmdDeploy(flags) {
 }
 
 async function cmdTables(flags) {
-  requireLogin();
+  await requireLogin();
   const env = buildEnv(flags, { withKv: true, withDb: true });
   const result = await withSpinner('直连飞书建表 / 建字段', () => bootstrapLocally(env));
   ok(`主表 ${result.tableId}`);
@@ -502,7 +535,7 @@ async function cmdEmployees(flags) {
 }
 
 async function cmdIssue(flags) {
-  requireLogin();
+  await requireLogin();
   const env = buildEnv(flags);
 
   if (flags['open-id']) {
@@ -540,7 +573,7 @@ function reportIssue(label, issued) {
 }
 
 async function cmdKeys(flags) {
-  requireLogin();
+  await requireLogin();
   const keys = await listKeysLocally(buildEnv(flags, { withDb: false }));
   say(c.bold(`\n共 ${keys.length} 把 Key`));
   say(c.dim(`  ${padEndWidth('成员', 16)}状态    Key(掩码)`));
@@ -552,7 +585,7 @@ async function cmdKeys(flags) {
 }
 
 async function cmdRevoke(flags) {
-  requireLogin();
+  await requireLogin();
   const keyId = flags._[0];
   if (!keyId) fail('用法:revoke <key_id>');
   // 撤销是写操作,必须带 DB —— 漏了它这次撤销就不会进审计日志(踩过)
@@ -562,7 +595,7 @@ async function cmdRevoke(flags) {
 }
 
 async function cmdLogs(flags) {
-  requireLogin();
+  await requireLogin();
   const rows = await logsLocally(buildEnv(flags, { withKv: false }), {
     limit: flags.limit ?? 100,
     memberId: flags.member,
@@ -584,7 +617,7 @@ async function cmdLogs(flags) {
 async function cmdInstall(flags) {
   say(c.bold('\n日报上报后端 · 安装向导'));
   say(c.dim('管理动作全部在本机执行,需要先登录 Cloudflare;已配置的步骤会显示当前值并默认跳过。\n'));
-  requireLogin();
+  await requireLogin(); // 未登录会自动拉起 wrangler login
 
   // 每一步的"当前配置"摘要:已配置的直接展示出来,作为是否重做的判断依据
   const summaries = {
@@ -720,7 +753,7 @@ async function choose(entries, { prompt = '请选择', footer } = {}) {
 ///   · 没有 Key 的员工:只显示名字,选中后问"是否签发";
 ///   · 已有 Key 的员工:显示 key_id 与状态,选中后问"轮换 / 撤销 / 取消"。
 async function cmdMembers(flags) {
-  requireLogin();
+  await requireLogin();
   const env = buildEnv(flags);
   const [people, keys] = await withSpinner('读取员工与 Key', () => Promise.all([fetchEmployees(flags), listKeysLocally(env)]));
   const activeByOpenId = new Map(keys.filter((k) => k.enabled).map((k) => [k.open_id, k]));
@@ -821,6 +854,7 @@ const MENU_SECTIONS = [
 ];
 
 async function cmdMenu(flags) {
+  await tryAutoLogin(); // 启动即检查:未登录就自动拉起登录,成功后继续
   const items = [];
   for (const [section, entries] of MENU_SECTIONS) {
     items.push({ header: section });

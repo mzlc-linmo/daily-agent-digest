@@ -27,6 +27,9 @@ cd workers
 node scripts/digest-admin.mjs
 ```
 
+**启动时会自动检查 Cloudflare 登录状态**:未登录就先拉起 `wrangler login`(会打开浏览器),
+登录成功后自动回到脚本,不用手动先跑一遍。
+
 **用 ↑/↓ 选择、Enter 确认、q 退出**(非终端场景自动退回"输入编号",脚本仍可用):
 
 ```
