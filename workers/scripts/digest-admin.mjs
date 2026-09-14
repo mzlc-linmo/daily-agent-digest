@@ -338,20 +338,33 @@ async function cmdFeishu(flags) {
   let appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || keychainGet('feishu-app-id')?.value || '';
   let appSecret = flags['app-secret'] || keychainGet('feishu-app-secret')?.value || '';
 
-  if (!appId) appId = await ask('飞书 App ID (cli_…)');
+  // 已配置的值作为默认值直接显示,回车即沿用
+  if (!appId) appId = (await ask('飞书 App ID (cli_…)')).trim();
   if (!appId.startsWith('cli_')) fail(`App ID 看起来不对:${appId}(应以 cli_ 开头)`);
-  if (!appSecret) appSecret = await ask('飞书 App Secret(也可先存进钥匙串)');
-  if (!appSecret) fail('缺少 App Secret');
+  const hadSecret = Boolean(appSecret);
+  if (!appSecret) {
+    appSecret = (await ask('飞书 App Secret(粘贴新的;回车取消)')).trim();
+    if (!appSecret) fail('缺少 App Secret');
+  }
 
   process.stdout.write(c.dim('  正在校验凭据…\n'));
   await feishuToken(appId, appSecret);
   ok(`飞书凭据有效(App ID ${appId.slice(0, 12)}…)`);
 
-  setTomlVar('FEISHU_APP_ID', appId);
-  ok('已写入 wrangler.toml 的 FEISHU_APP_ID');
-  if (await confirm('把凭据存进本机钥匙串,以后免输入?', { yes: flags.yes })) {
+  if (tomlVar('FEISHU_APP_ID') !== appId) {
+    setTomlVar('FEISHU_APP_ID', appId);
+    ok(`已写入 wrangler.toml 的 FEISHU_APP_ID(${appId})`);
+  } else {
+    ok(`FEISHU_APP_ID 未变(${appId}),无需改写`);
+  }
+  const saveToKeychain = await confirm('把凭据存进本机钥匙串,以后免输入?', { yes: flags.yes });
+  if (saveToKeychain) {
     keychainSet('feishu-app-id', appId);
     if (keychainSet('feishu-app-secret', appSecret)) ok(`已存入钥匙串(service=${KEYCHAIN_SERVICE})`);
+  }
+  if (hadSecret && flags['keep-secret']) {
+    ok('沿用已有的 FEISHU_APP_SECRET,未改写 Cloudflare secret');
+    return;
   }
   process.stdout.write(c.dim('  正在写入 Worker secret FEISHU_APP_SECRET…\n'));
   const r = wrangler(['secret', 'put', 'FEISHU_APP_SECRET'], { input: appSecret });
@@ -563,45 +576,260 @@ async function cmdLogs(flags) {
 
 async function cmdInstall(flags) {
   say(c.bold('\n日报上报后端 · 安装向导'));
-  say(c.dim('管理动作全部在本机执行,需要先登录 Cloudflare;已完成的步骤会自动跳过。\n'));
+  say(c.dim('管理动作全部在本机执行,需要先登录 Cloudflare;已配置的步骤会显示当前值并默认跳过。\n'));
   requireLogin();
-  await cmdStatus();
+
+  // 每一步的"当前配置"摘要:已配置的直接展示出来,作为是否重做的判断依据
+  const summaries = {
+    feishu: () => {
+      const id = tomlVar('FEISHU_APP_ID');
+      const secret = resolvedFeishu({}).appSecret;
+      if (!id || !secret) return null;
+      return `App ID ${id};App Secret ${c.dim('已配置(钥匙串/环境变量)')}`;
+    },
+    deploy: () => {
+      const kv = kvNamespaceId();
+      const d1 = d1DatabaseName();
+      const url = tomlVar('SUBMIT_URL');
+      if (!kv || !d1) return null;
+      return `KV ${kv.slice(0, 8)}…;D1 ${d1}${url ? `;地址 ${url}` : ''}`;
+    },
+    tables: () => {
+      const main = tomlVar('BITABLE_TABLE_ID');
+      const reg = tomlVar('REGISTRY_TABLE_ID');
+      const req = tomlVar('REQUEST_TABLE_ID');
+      if (!main || !reg || !req) return null;
+      return `主表 ${main};登记表 ${reg};申请表 ${req}`;
+    },
+  };
 
   const steps = [
-    ['配置飞书应用凭据', () => cmdFeishu(flags)],
-    ['创建 KV/D1 并部署后端', () => cmdDeploy(flags)],
-    ['建飞书表并回填 table id', () => cmdTables(flags)],
+    ['配置飞书应用凭据', 'feishu', (f) => cmdFeishu(f)],
+    ['创建 KV/D1 并部署后端', 'deploy', (f) => cmdDeploy(f)],
+    ['建飞书表并回填 table id', 'tables', (f) => cmdTables(f)],
   ];
-  for (const [label, fn] of steps) {
-    if (!(await confirm(`执行「${label}」?`, { yes: flags.yes }))) { warn(`跳过「${label}」`); continue; }
-    say(c.bold(`\n▶ ${label}`));
-    await fn();
+  for (const [label, key, fn] of steps) {
+    const current = summaries[key]();
+    if (current) {
+      say(`\n▶ ${label} —— ${c.green('已配置')}`);
+      say(c.dim(`    当前值:${current}`));
+      if (!await confirm('已配置,是否重新执行?', { yes: false })) { warn(`保留现有配置,跳过「${label}」`); continue; }
+    } else {
+      say(`\n▶ ${label} —— ${c.yellow('未配置')}`);
+      if (!await confirm('现在执行?', { yes: flags.yes })) { warn(`跳过「${label}」`); continue; }
+    }
+    await fn(flags);
   }
 
-  say(c.bold('\n▶ 读取员工'));
-  const people = await fetchEmployees(flags);
-  say(`  共 ${people.length} 人`);
-  if (people.length && await confirm('现在为员工签发 Key?', { yes: false })) await cmdIssue(flags);
-
   await cmdStatus();
-  say('完成。下一步:把后端地址 + Key 填进 App 的「设置」面板。\n');
+  say(c.bold('\n▶ 员工与 Key'));
+  const people = await fetchEmployees(flags);
+  say(`  员工名单:${people.length} 人`);
+  if (people.length && await confirm('现在管理员工与 Key(签发 / 轮换 / 撤销)?', { yes: false })) {
+    await cmdMembers(flags);
+  }
+  say('\n完成。下一步:把后端地址 + Key 填进 App 的「设置」面板。\n');
+}
+
+/* ---------------------------------------------------------- 方向键选择器 */
+
+/// 上下箭头选择(仅真终端):返回被选中的条目,取消返回 null。
+/// 管道/重定向等非终端场景返回 null,由调用方退回"输入编号"的方式,保证脚本可用。
+function selectMenu(entries, { footer = '↑/↓ 移动 · Enter 确认 · q 退出' } = {}) {
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') return Promise.resolve(null);
+
+  // readline 与 raw mode 不能同时读 stdin,先把 readline 收起来
+  closeReader();
+  if (stdin.isPaused()) stdin.resume();
+
+  let cursor = entries.findIndex((e) => !e.header);
+  let printedLines = 0;
+  const render = () => {
+    const buf = [];
+    if (printedLines) buf.push(`\x1b[${printedLines}A`); // 回到菜单顶部
+    buf.push('\x1b[0J'); // 清掉旧内容
+    let lines = 0;
+    for (const [i, e] of entries.entries()) {
+      if (e.header) {
+        buf.push(`  \x1b[2m── ${e.header} ──\x1b[0m\n`);
+      } else {
+        const row = `  ${i === cursor ? '❯' : ' '} ${e.label}`;
+        buf.push(i === cursor ? `\x1b[7m${row}\x1b[0m\n` : `${row}\n`);
+      }
+      lines += 1;
+    }
+    buf.push(`\x1b[2m  ${footer}\x1b[0m\n`);
+    lines += 1;
+    stdout.write(buf.join(''));
+    printedLines = lines;
+  };
+  render();
+
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.off('data', onData);
+      stdout.write('\n');
+      resolve(value);
+    };
+    const move = (delta) => {
+      let next = cursor;
+      do { next = (next + delta + entries.length) % entries.length; } while (entries[next].header);
+      cursor = next;
+      render();
+    };
+    const onData = (chunk) => {
+      const key = chunk.toString('utf8');
+      if (key === '\u001b[A' || key === '\u001bOA') return move(-1);
+      if (key === '\u001b[B' || key === '\u001bOB') return move(1);
+      if (key === '\r' || key === '\n') return finish(entries[cursor]);
+      if (key === 'q' || key === '\u0003' || key === '\u001b') return finish(null);
+    };
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('data', onData);
+  });
+}
+
+/// 有真终端就用方向键;否则让用户输编号。返回 null 表示取消/退出。
+async function choose(entries, { prompt = '请选择', footer } = {}) {
+  const picked = await selectMenu(entries, footer ? { footer } : {});
+  if (picked !== null) return picked;
+  if (process.stdin.isTTY) return null; // 真终端里取消了
+  // 非终端:退回编号输入,方便脚本与自动化
+  const selectable = entries.filter((e) => !e.header);
+  selectable.forEach((e, i) => say(`  ${String(i + 1).padStart(3)}) ${e.label}`));
+  const answer = (await ask(`${prompt}编号(回车退出)`)).trim().toLowerCase();
+  if (!answer || ['0', 'q', 'quit', 'exit'].includes(answer)) return null;
+  const index = Number(answer) - 1;
+  if (!selectable[index]) { warn(`没有编号 ${answer}`); return null; }
+  return selectable[index];
 }
 
 /* ---------------------------------------------------------------- 管理台 */
 
-/// 管理台里撤销 Key:先列出启用中的 Key 让管理员挑,不用手输 key_id。
-async function cmdRevokeMenu(flags) {
+/// 员工与 Key 合并视图:一个入口完成 列出 / 签发 / 轮换 / 撤销。
+///
+///   · 没有 Key 的员工:只显示名字,选中后问"是否签发";
+///   · 已有 Key 的员工:显示 key_id 与状态,选中后问"轮换 / 撤销 / 取消"。
+async function cmdMembers(flags) {
   requireLogin();
-  const env = buildEnv(flags, { withDb: false });
-  const keys = (await listKeysLocally(env)).filter((k) => k.enabled);
-  if (!keys.length) { warn('当前没有启用中的 Key'); return; }
-  say(c.bold('\n启用中的 Key:'));
-  keys.forEach((k, i) => say(`  ${String(i + 1).padStart(2)}. ${k.key_id}  ${padEndWidth(k.member, 16)}${c.dim(k.member_id)}`));
-  const answer = (await ask('要撤销的编号(或直接输入 key_id,留空取消)')).trim();
-  if (!answer) { warn('已取消'); return; }
-  const keyId = keys[Number(answer) - 1]?.key_id ?? answer;
-  const revoked = await revokeLocally(buildEnv(flags, { withDb: false }), keyId);
-  ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
+  const env = buildEnv(flags);
+  const [people, keys] = await Promise.all([fetchEmployees(flags), listKeysLocally(env)]);
+  const activeByOpenId = new Map(keys.filter((k) => k.enabled).map((k) => [k.open_id, k]));
+
+  const rows = [];
+  for (const person of people) {
+    const key = activeByOpenId.get(person.open_id);
+    if (key) activeByOpenId.delete(person.open_id); // 已配对,剩下的就是"库里有 Key 但名单里没有"的
+    rows.push({
+      kind: 'person',
+      person,
+      key,
+      label: key
+        ? `${padEndWidth(person.name, 16)}${c.green('已签发')}  ${c.dim(key.key_id)}`
+        : `${padEndWidth(person.name, 16)}${c.dim('未签发')}`,
+    });
+  }
+  // 名单抓不到、但 KV 里有 Key 的人(例如换了表格或已离职)
+  for (const key of activeByOpenId.values()) {
+    rows.push({
+      kind: 'orphan',
+      key,
+      label: `${padEndWidth(key.member, 16)}${c.yellow('有 Key 但不在员工名单')}  ${c.dim(key.key_id)}`,
+    });
+  }
+  if (!rows.length) return warn('没有可管理的人(员工名单为空且没有已签发的 Key)');
+
+  const entries = [
+    { header: `员工与 Key(共 ${rows.length} 人)` },
+    ...rows.map((row) => ({ ...row, label: row.label })),
+  ];
+  const picked = await choose(entries, {
+    prompt: '选择员工',
+    footer: '↑/↓ 移动 · Enter 选择 · q 返回',
+  });
+  if (!picked) { warn('已取消'); return; }
+
+  if (picked.kind === 'orphan') {
+    if (!await confirm(`「${picked.key.member}」不在员工名单里,撤销其 Key ${picked.key.key_id}?`)) return warn('已取消');
+    const revoked = await revokeLocally(env, picked.key.key_id);
+    return ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''})`);
+  }
+
+  const { person, key } = picked;
+  if (!key) {
+    if (!await confirm(`为「${person.name}」签发 Key?`)) return warn('已取消');
+    const memberId = await ask('成员ID(工号/账号)', { defaultValue: person.open_id.slice(-6) });
+    const issued = await issueLocally(env, { member_id: memberId, member: person.name, open_id: person.open_id });
+    return reportIssue(person.name, issued);
+  }
+
+  const action = await choose([
+    { label: `轮换:签发新 Key,旧的(${key.key_id})立即失效`, value: 'rotate' },
+    { label: `撤销:停用 ${key.key_id},该成员将无法提交`, value: 'revoke' },
+    { label: '取消', value: 'cancel' },
+  ], { prompt: `「${person.name}」已有 Key`, footer: '↑/↓ 移动 · Enter 确认 · q 取消' });
+
+  if (!action || action.value === 'cancel') return warn('已取消');
+
+  if (action.value === 'revoke') {
+    const revoked = await revokeLocally(env, key.key_id);
+    return ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
+  }
+
+  const issued = await issueLocally(env, {
+    member_id: key.member_id || person.open_id.slice(-6),
+    member: person.name,
+    open_id: person.open_id,
+  });
+  reportIssue(person.name, issued);
+}
+
+/// 管理条目:分组 + 标题,交给方向键选择器渲染。
+const MENU_SECTIONS = [
+  ['初次安装', [
+    ['一键全流程(校验凭据 → 部署 → 建表 → 员工与 Key)', (f) => cmdInstall(f)],
+  ]],
+  ['配置与部署', [
+    ['查看状态(配置 / Cloudflare 登录 / 后端健康)', (f) => cmdStatus(f)],
+    ['配置飞书应用凭据(App ID / Secret)', (f) => cmdFeishu(f)],
+    ['创建 KV / D1 并部署 Worker', (f) => cmdDeploy(f)],
+    ['建飞书表并回填 table id(含配置申请表单)', (f) => cmdTables(f)],
+  ]],
+  ['成员与 Key', [
+    ['员工与 Key(列出 / 签发 / 轮换 / 撤销)', (f) => cmdMembers(f)],
+  ]],
+  ['审计日志', [
+    ['查看最近日志', (f) => cmdLogs({ ...f, limit: 20 })],
+    ['按条件查日志(成员 / 日期 / 成功失败)', (f) => cmdLogsMenu(f)],
+  ]],
+];
+
+async function cmdMenu(flags) {
+  const items = [];
+  for (const [section, entries] of MENU_SECTIONS) {
+    items.push({ header: section });
+    for (const [label, run] of entries) items.push({ label, run });
+  }
+
+  say(c.bold('\n日报上报后端 · 管理台'));
+  say(c.dim('  管理动作在本机执行(直连 KV / D1 / 飞书),需要已登录 Cloudflare;Worker 上没有任何管理接口。'));
+  for (;;) {
+    say('');
+    const picked = await choose(items, { prompt: '请选择功能', footer: '↑/↓ 移动 · Enter 确认 · q 退出' });
+    if (!picked) { say('已退出。'); return; }
+    say('');
+    try {
+      await picked.run(flags);
+    } catch (err) {
+      // 单个操作失败(含未登录、缺配置)只提示,不退出管理台
+      warn(err instanceof CliError ? err.message : `执行出错:${err.message ?? err}`);
+    }
+  }
 }
 
 /// 管理台里按条件查日志:逐项询问,留空即不限制。
@@ -616,61 +844,6 @@ async function cmdLogsMenu(flags) {
     outcome: outcome || undefined,
     limit: flags.limit ?? 50,
   });
-}
-
-/// 管理项目录:管理员按编号选择,执行完回到菜单。
-const MENU_SECTIONS = [
-  ['初次安装', [
-    ['一键全流程(校验凭据 → 部署 → 建表 → 读取员工)', (f) => cmdInstall(f)],
-  ]],
-  ['配置与部署', [
-    ['查看状态(配置 / Cloudflare 登录 / 后端健康)', (f) => cmdStatus(f)],
-    ['配置飞书应用凭据(App ID / Secret)', (f) => cmdFeishu(f)],
-    ['创建 KV / D1 并部署 Worker', (f) => cmdDeploy(f)],
-    ['建飞书表并回填 table id(含配置申请表单)', (f) => cmdTables(f)],
-  ]],
-  ['成员与 Key', [
-    ['列出员工(含 open_id)', (f) => cmdEmployees(f)],
-    ['为员工签发 Key', (f) => cmdIssue(f)],
-    ['列出已签发的 Key', (f) => cmdKeys(f)],
-    ['撤销某把 Key', (f) => cmdRevokeMenu(f)],
-  ]],
-  ['审计日志', [
-    ['查看最近日志', (f) => cmdLogs({ ...f, limit: 20 })],
-    ['按条件查日志(成员 / 日期 / 成功失败)', (f) => cmdLogsMenu(f)],
-  ]],
-];
-
-async function cmdMenu(flags) {
-  // 扁平化成"编号 → 动作",同时保留分组标题
-  const items = [];
-  for (const [section, entries] of MENU_SECTIONS) {
-    items.push({ section });
-    for (const [label, run] of entries) items.push({ number: items.filter((i) => i.number).length + 1, label, run });
-  }
-
-  say(c.bold('\n日报上报后端 · 管理台'));
-  say(c.dim('  管理动作在本机执行(直连 KV / D1 / 飞书),需要已登录 Cloudflare;Worker 上没有任何管理接口。'));
-  for (;;) {
-    say('');
-    for (const item of items) {
-      if (item.section) say(c.dim(`  ── ${item.section} ──`));
-      else say(`  ${String(item.number).padStart(3)}) ${item.label}`);
-    }
-    say(`  ${String(0).padStart(3)}) 退出`);
-    const answer = (await ask('请选择编号')).trim().toLowerCase();
-    if (!answer || ['0', 'q', 'quit', 'exit'].includes(answer)) { say('已退出。'); return; }
-    const target = items.find((i) => String(i.number) === answer);
-    if (!target) { warn(`没有编号 ${answer},请重新选择`); continue; }
-    say('');
-    try {
-      await target.run(flags);
-    } catch (err) {
-      // 单个操作失败(含未登录、缺配置)只提示,不退出管理台
-      if (err instanceof CliError) warn(err.message);
-      else { warn(`执行出错:${err.message ?? err}`); }
-    }
-  }
 }
 
 /* -------------------------------------------------------------------- 入口 */
@@ -696,6 +869,7 @@ const COMMANDS = {
   feishu: cmdFeishu,
   deploy: cmdDeploy,
   tables: cmdTables,
+  members: cmdMembers,
   employees: cmdEmployees,
   issue: cmdIssue,
   keys: cmdKeys,
@@ -715,13 +889,14 @@ if (!COMMANDS[command] || flags.help) {
 用法:node workers/scripts/digest-admin.mjs <命令> [选项]
 
 命令:
-  menu             管理台:列出全部管理项目,按编号选择(交互终端下的默认命令)
+  menu             管理台:↑/↓ 选择功能,Enter 确认(交互终端下的默认命令)
   install          全流程引导(非交互等价于 menu 的一次性版本)
   status           显示配置与 Cloudflare 登录状态
   feishu           配置并校验飞书应用凭据(App ID/Secret)
   deploy           创建 KV + D1、应用日志表结构、部署 Worker
   tables           建飞书表 → 回填 table id → 重新部署 → 配置表单
-  employees        读取员工(含 open_id)
+  members          员工与 Key 合并视图(列出 / 签发 / 轮换 / 撤销)
+  employees        只列出员工(含 open_id 与来源)
   issue            选员工生成 Key(交互式;或 --open-id/--email/--name/--member-id)
   keys             列出已签发的 Key
   revoke <key_id>  撤销某把 Key
@@ -737,6 +912,7 @@ if (!COMMANDS[command] || flags.help) {
   --admin-open-id        配置表单时把该用户加为 base 协作者
   --scan-bases token:名  额外扫描的 base(员工在别人共享的表里时用)
   --skip-form            只建表,不配置表单
+  --keep-secret          飞书凭据已存在时只校验,不改写 Cloudflare secret
 
 环境变量:WRANGLER_CMD(默认 "npx --yes wrangler")、DIGEST_SUBMIT_URL、DIGEST_SCAN_BASES、CLOUDFLARE_API_TOKEN
 `);

@@ -27,30 +27,54 @@ cd workers
 node scripts/digest-admin.mjs
 ```
 
-它列出全部管理项目,按编号选择,执行完自动回到菜单(单个操作失败只提示,不退出):
+**用 ↑/↓ 选择、Enter 确认、q 退出**(非终端场景自动退回"输入编号",脚本仍可用):
 
 ```
 日报上报后端 · 管理台
 
   ── 初次安装 ──
-    1) 一键全流程(校验凭据 → 部署 → 建表 → 读取员工)
+  ❯ 一键全流程(校验凭据 → 部署 → 建表 → 员工与 Key)
   ── 配置与部署 ──
-    2) 查看状态(配置 / Cloudflare 登录 / 后端健康)
-    3) 配置飞书应用凭据(App ID / Secret)
-    4) 创建 KV / D1 并部署 Worker
-    5) 建飞书表并回填 table id(含配置申请表单)
+    查看状态(配置 / Cloudflare 登录 / 后端健康)
+    配置飞书应用凭据(App ID / Secret)
+    创建 KV / D1 并部署 Worker
+    建飞书表并回填 table id(含配置申请表单)
   ── 成员与 Key ──
-    6) 列出员工(含 open_id)
-    7) 为员工签发 Key
-    8) 列出已签发的 Key
-    9) 撤销某把 Key
+    员工与 Key(列出 / 签发 / 轮换 / 撤销)
   ── 审计日志 ──
-   10) 查看最近日志
-   11) 按条件查日志(成员 / 日期 / 成功失败)
-    0) 退出
+    查看最近日志
+    按条件查日志(成员 / 日期 / 成功失败)
 ```
 
-在 CI / 脚本里(非交互)也可以直接用子命令,见下表。
+### 「员工与 Key」一个入口管到底
+
+列出所有员工并带上 Key 状态,**没 Key 的只显示名字**:
+
+```
+  ── 员工与 Key(共 23 人)──
+❯ 阿树            未签发
+  源源            已签发  7c1f9a02
+  Master Cui      已签发  14a59ada
+  张三            有 Key 但不在员工名单  aaaaaaaa
+```
+
+选中后按状态给出不同操作:
+
+| 选中的人 | 提示 |
+| --- | --- |
+| 没有 Key | 是否**签发**?答是 → 生成并把明文 Key 显示一次 |
+| 已有 Key | **轮换**(签发新 Key,旧的立即失效)/ **撤销** / 取消 |
+| 有 Key 但不在员工名单 | 是否撤销其 Key |
+
+### 向导会显示已配置的值
+
+`一键全流程` 里每一步先打印当前配置,已配置的**默认跳过**(回车即可),
+
+```
+▶ 创建 KV/D1 并部署后端 —— 已配置
+    当前值:KV 6f1b2801…;D1 daily-agent-digest-logs;地址 https://….workers.dev
+? 已配置,是否重新执行? [y/N]:
+```
 
 ## 子命令(等价能力)
 
@@ -67,8 +91,9 @@ node scripts/digest-admin.mjs install        # 全流程引导
 | `digest-admin.mjs feishu` | 配置并**校验**飞书 App ID / Secret |
 | `digest-admin.mjs deploy` | 创建 **KV**(存 Key)+ **D1**(存审计日志)、应用 `schema.sql`、部署 Worker |
 | `digest-admin.mjs tables` | 建飞书表 → **回填 table id** → 重新部署 → 自动配好申请表单 |
-| `digest-admin.mjs employees` | 读取员工(含 open_id) |
-| `digest-admin.mjs issue` | 交互式选员工签发 Key(`--open-id/--email/--name/--member-id` 可非交互) |
+| `digest-admin.mjs members` | **员工与 Key 合并视图**(列出 / 签发 / 轮换 / 撤销) |
+| `digest-admin.mjs employees` | 只列出员工(含 open_id 与来源) |
+| `digest-admin.mjs issue` | 直接签发(`--open-id/--email/--name/--member-id` 可非交互) |
 | `digest-admin.mjs keys` / `revoke <key_id>` | 列出 / 撤销 |
 | `digest-admin.mjs logs` | 查询审计日志(`--member --date --event --outcome --limit`) |
 

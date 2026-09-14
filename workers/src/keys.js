@@ -106,6 +106,8 @@ export async function listKeys(env) {
       key_id: item.name.slice(KEY_PREFIX.length),
       member: record.member,
       member_id: record.member_id,
+      // open_id 用于把 Key 关联回员工列表(仅本机管理侧使用,不是敏感信息)
+      open_id: record.open_id ?? '',
       linked: Boolean(record.open_id),
       enabled: record.enabled !== false,
       created_at: record.created_at ?? null,
