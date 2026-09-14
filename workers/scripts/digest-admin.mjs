@@ -18,7 +18,7 @@
 //   node workers/scripts/digest-admin.mjs revoke <id>  # 撤销
 //   node workers/scripts/digest-admin.mjs logs         # 查审计日志
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import path from 'node:path';
@@ -63,22 +63,34 @@ function run(command, args = [], { input, capture = true } = {}) {
   return result;
 }
 
-function wrangler(args, { input, quiet = true } = {}) {
+/// 异步执行并收集输出。
+/// **必须异步**:同步 spawn 会把事件循环整个卡住,旋转动画一帧都发不出来(卡顿根因)。
+function runAsync(command, args = [], { input } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (err) => resolve({ code: -1, stdout, stderr: stderr + err.message, out: stdout + stderr + err.message }));
+    child.on('close', (code) => resolve({ code, stdout, stderr, out: stdout + stderr }));
+    child.stdin.end(input ?? '');
+  });
+}
+
+async function wrangler(args, { input } = {}) {
   const [cmd, ...base] = WRANGLER.split(' ').filter(Boolean);
-  const result = run(cmd, [...base, ...args], { input, capture: quiet });
-  const stdout = result.stdout ?? '';
-  const stderr = result.stderr ?? '';
   // out 仅用于展示(错误信息);解析 JSON 必须只用 stdout ——
   // `npx wrangler` 会把 npm notice 写到 stderr,拼进来会让 JSON.parse 报
   // "Unexpected non-whitespace character after JSON"。
-  return { code: result.status, stdout, stderr, out: `${stdout}${stderr}` };
+  return runAsync(cmd, [...base, ...args], { input });
 }
 
 /// 判断 wrangler 登录状态。必须区分两种失败:
 ///   · 确实没登录      → 提示去 login
 ///   · wrangler 没跑起来(npm 缓存权限、网络等)→ 提示真实原因,不能笼统说"未登录"
-function wranglerAuthState() {
-  const r = wrangler(['whoami']);
+async function wranglerAuthState() {
+  const r = await wrangler(['whoami']);
   const out = r.out ?? '';
   if (/not logged in|auth token has expired|CLOUDFLARE_API_TOKEN/i.test(out)) return { state: 'logged-out', out };
   if (r.code !== 0 || !/logged in with/i.test(out)) return { state: 'error', out };
@@ -96,7 +108,7 @@ async function autoLogin() {
   // stdio 交给子进程:login 要打印授权链接并等待回调
   const [cmd, ...base] = WRANGLER.split(' ').filter(Boolean);
   run(cmd, [...base, 'login'], { capture: false });
-  const after = wranglerAuthState();
+  const after = await wranglerAuthState();
   if (after.state !== 'logged-in') {
     fail('登录未完成。可稍后重试,或改用环境变量 CLOUDFLARE_API_TOKEN。');
   }
@@ -108,7 +120,7 @@ async function autoLogin() {
 /// 这正是本设计的安全门槛 —— 没有 wrangler 凭据就动不了后端。
 /// 未登录时不再直接退出,而是先尝试自动登录(见 autoLogin)。
 async function requireLogin() {
-  const state = wranglerAuthState();
+  const state = await wranglerAuthState();
   if (state.state === 'logged-in') return state;
   if (state.state === 'error') {
     const first = (state.out ?? '').trim().split('\n').filter((l) => l.trim() && !/WARNING|Proxy environment/.test(l))[0] ?? '';
@@ -119,7 +131,7 @@ async function requireLogin() {
 
 /// 启动时自动补登录;失败只提示,不阻断(有些功能不需要 Cloudflare)。
 async function tryAutoLogin() {
-  const state = wranglerAuthState();
+  const state = await wranglerAuthState();
   if (state.state === 'logged-in') return state;
   if (state.state === 'error') {
     warn('wrangler 执行失败(不是登录问题),请先修好再使用管理功能');
@@ -218,24 +230,30 @@ const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 let spinnerActive = false;
 
 /// 执行耗时操作时显示旋转动画(仅真终端)。非终端只打印一行,避免污染输出。
-/// 嵌套调用不再起第二个动画 —— 两个定时器抢同一行会互相覆盖成花屏。
+///   · **立即开始**转动,不延迟;
+///   · 动画由 setInterval 驱动,所以被等待的调用**必须异步** ——
+///     同步 spawn 会阻塞事件循环,动画会"画一帧就冻住"。
+///   · 嵌套调用不再起第二个动画 —— 两个定时器抢同一行会互相覆盖成花屏。
 async function withSpinner(label, fn) {
   if (spinnerActive) return fn();
   spinnerActive = true;
   const tty = Boolean(process.stdout.isTTY);
+  const interval = tty ? setInterval(() => draw(), 80) : null;
   let index = 0;
-  let timer = null;
-  const draw = () => process.stdout.write(`\r\x1b[2m${SPINNER_FRAMES[index++ % SPINNER_FRAMES.length]} ${label}\x1b[0m`);
-  const clear = () => { if (tty) process.stdout.write('\r\x1b[0J'); };
-  if (tty) { draw(); timer = setInterval(draw, 80); } else { say(c.dim(`  ${label}…`)); }
+  function draw() {
+    process.stdout.write(`\r\x1b[2m${SPINNER_FRAMES[index++ % SPINNER_FRAMES.length]} ${label}\x1b[0m`);
+  }
+  if (tty) draw(); else say(c.dim(`  ${label}…`));
+  const stop = () => {
+    if (interval) clearInterval(interval);
+    if (tty) process.stdout.write('\r\x1b[0J');
+  };
   try {
     const result = await fn();
-    if (timer) clearInterval(timer);
-    clear();
+    stop();
     return result;
   } catch (err) {
-    if (timer) clearInterval(timer);
-    clear();
+    stop();
     throw err;
   } finally {
     spinnerActive = false;
@@ -410,7 +428,7 @@ async function fetchEmployees(flags) {
 
 async function cmdStatus() {
   const feishu = resolvedFeishu({});
-  const auth = wranglerAuthState();
+  const auth = await wranglerAuthState();
   const loginCell = {
     'logged-in': c.green(`已登录${auth.email ? `(${auth.email})` : ''}`),
     'logged-out': c.red('未登录(需要 wrangler login)'),

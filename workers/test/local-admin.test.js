@@ -208,6 +208,22 @@ test('缺 D1 时写操作仍然成功,但会明确警告不会留痕', async () 
   assert.ok(warnings.some((w) => w.includes('不会记入审计日志')), JSON.stringify(warnings));
 });
 
+test('适配器支持异步 wrangler,且调用期间事件循环不被阻塞', async () => {
+  // 这条测试针对"进度动画卡住"的根因:如果实现里用同步 spawn,
+  // 定时器在调用期间根本无法触发(动画会画一帧就冻住)。
+  let ticks = 0;
+  const timer = setInterval(() => { ticks += 1; }, 15);
+  const asyncWrangler = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return { code: 0, stdout: '[{"name":"key:aaaa"}]', stderr: '' };
+  };
+  const kv = kvAdapter('ns', asyncWrangler);
+  const listed = await kv.list({ prefix: 'key:' });
+  clearInterval(timer);
+  assert.deepEqual(listed.keys, [{ name: 'key:aaaa' }]);
+  assert.ok(ticks >= 3, `调用期间定时器应持续触发,实际 ${ticks} 次`);
+});
+
 test('bootstrapLocally 只建主表且幂等', async () => {
   const env = { BITABLE_APP_TOKEN: 'bascn_test', BITABLE_TABLE_ID: 'tbl_main' };
   const feishu = fakeFeishu();

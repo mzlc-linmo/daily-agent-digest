@@ -75,14 +75,15 @@ export function interpolate(sql, params = []) {
 export function kvAdapter(namespaceId, wrangler) {
   const ns = ['--namespace-id', namespaceId, '--remote'];
   // 只解析 stdout:npx 会把 npm notice 写到 stderr,混进来会破坏 JSON
-  const run = (args, what) => {
-    const r = wrangler(args);
+  // wrangler() 是异步的:同步 spawn 会阻塞事件循环,导致进度动画无法刷新。
+  const run = async (args, what) => {
+    const r = await wrangler(args);
     if (r.code !== 0) throw new Error(`${what}失败:${((r.stderr || r.stdout) ?? '').trim()}`);
     return r.stdout ?? '';
   };
   return {
     async get(key, type) {
-      const r = wrangler(['kv', 'key', 'get', key, ...ns]);
+      const r = await wrangler(['kv', 'key', 'get', key, ...ns]);
       const combined = `${r.stdout ?? ''}${r.stderr ?? ''}`;
       if (r.code !== 0) {
         if (/not found|does not exist|404/i.test(combined)) return null;
@@ -97,18 +98,18 @@ export function kvAdapter(namespaceId, wrangler) {
       const file = path.join(dir, 'value');
       try {
         writeFileSync(file, String(value), { mode: 0o600 });
-        run(['kv', 'key', 'put', key, '--path', file, ...ns], `写入 KV ${key}`);
+        await run(['kv', 'key', 'put', key, '--path', file, ...ns], `写入 KV ${key}`);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
     },
     async delete(key) {
-      run(['kv', 'key', 'delete', key, ...ns], `删除 KV ${key}`);
+      await run(['kv', 'key', 'delete', key, ...ns], `删除 KV ${key}`);
     },
     async list({ prefix } = {}) {
       const args = ['kv', 'key', 'list', ...ns];
       if (prefix) args.push('--prefix', prefix);
-      const parsed = parseJsonLoose(run(args, '列出 KV')) ?? [];
+      const parsed = parseJsonLoose(await run(args, '列出 KV')) ?? [];
       return { keys: parsed.map((k) => ({ name: k.name })) };
     },
   };
@@ -118,8 +119,8 @@ export function kvAdapter(namespaceId, wrangler) {
 
 /// 把 `wrangler d1 execute ... --remote --json` 包成 D1 binding 的形状。
 export function d1Adapter(databaseName, wrangler) {
-  const exec = (sql) => {
-    const r = wrangler(['d1', 'execute', databaseName, '--remote', '--json', '--command', sql]);
+  const exec = async (sql) => {
+    const r = await wrangler(['d1', 'execute', databaseName, '--remote', '--json', '--command', sql]);
     if (r.code !== 0) throw new Error(`D1 执行失败:${((r.stderr || r.stdout) ?? '').trim()}`);
     return parseJsonLoose(r.stdout ?? '') ?? [];
   };
@@ -128,8 +129,8 @@ export function d1Adapter(databaseName, wrangler) {
       let params = [];
       const stmt = {
         bind(...values) { params = values; return stmt; },
-        async run() { exec(interpolate(sql, params)); return { meta: { changes: 1 } }; },
-        async all() { return { results: exec(interpolate(sql, params))[0]?.results ?? [] }; },
+        async run() { await exec(interpolate(sql, params)); return { meta: { changes: 1 } }; },
+        async all() { return { results: (await exec(interpolate(sql, params)))[0]?.results ?? [] }; },
       };
       return stmt;
     },
