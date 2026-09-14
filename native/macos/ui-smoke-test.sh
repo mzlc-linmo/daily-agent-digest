@@ -43,4 +43,26 @@ case "$RESOLVED" in
 esac
 
 echo
+echo "== menu structure =="
+MENU=$("$BIN" --dump-menu)
+printf '%s\n' "$MENU" | sed 's/^/  /'
+printf '%s\n' "$MENU" | grep -q '^开机自启|toggleLoginItem|' || {
+  echo "smoke: 菜单缺少「开机自启」项" >&2; exit 1; }
+# 对勾必须与系统里登录项的真实状态一致(读的是 SMAppService,不是我们的意图)
+DECLARED=$(printf '%s\n' "$MENU" | awk -F'|' '/^login-item-enabled/{print $2}')
+SHOWN=$(printf '%s\n' "$MENU" | awk -F'|' '/^开机自启/{print $3}')
+[ "$DECLARED" = "$SHOWN" ] || {
+  echo "smoke: 「开机自启」对勾与系统状态不一致(菜单=$SHOWN,系统=$DECLARED)" >&2; exit 1; }
+case "$SHOWN" in
+  on|off) echo "login item checkmark=$SHOWN (matches SMAppService)" ;;
+  *) echo "smoke: 对勾状态无法识别 -> $SHOWN" >&2; exit 1 ;;
+esac
+# 对勾必须真的会变:不然上面那条断言在"本来就关着"的环境里会空过
+CHECK_ON=$(printf '%s\n' "$MENU" | awk -F'|' '/^checkmark-when-enabled/{print $2}')
+CHECK_OFF=$(printf '%s\n' "$MENU" | awk -F'|' '/^checkmark-when-disabled/{print $2}')
+[ "$CHECK_ON" = on ] || { echo "smoke: 开启状态下没有打对勾 -> $CHECK_ON" >&2; exit 1; }
+[ "$CHECK_OFF" = off ] || { echo "smoke: 关闭状态下仍有对勾 -> $CHECK_OFF" >&2; exit 1; }
+echo "checkmark follows state: enabled->on, disabled->off"
+
+echo
 echo "ui smoke test passed"

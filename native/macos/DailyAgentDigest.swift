@@ -521,8 +521,10 @@ extension Notification.Name {
     static let digestReportChanged = Notification.Name("digestReportChanged")
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     let backend=Backend(); var statusItem:NSStatusItem!; var report:ReportController!; var timer:Timer!; var progressPanel:NSPanel?; var generationBackgrounded=false
+    /// 「开机自启」菜单项:用对勾显示当前是否已开启。
+    var loginItemMenuItem:NSMenuItem!
     /// 自动 tick 的节流状态:上一次真正调用引擎的时间,以及已确认提交成功的日期。
     var lastTickAt:Date?; var submittedTickDay:String?
 
@@ -574,7 +576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return image
             }
             return NSImage(systemSymbolName: "checklist", accessibilityDescription: "Daily Agent Digest")
-        }(); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"开机自启", action:#selector(toggleLoginItem), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); ensureLoginItem(); NotificationCenter.default.addObserver(forName: .digestReportChanged, object: nil, queue: .main) { [weak self] _ in self?.rearmAutoTick() }; let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
+        }(); let m=makeMenu(); statusItem.menu=m; report=ReportController(backend:backend); ensureLoginItem(); refreshLoginItemState(); NotificationCenter.default.addObserver(forName: .digestReportChanged, object: nil, queue: .main) { [weak self] _ in self?.rearmAutoTick() }; let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
               // 每分钟都起一个引擎进程是纯粹的浪费(实测每次启动秒级):只有进入当天
               // 自动窗口后才调用,且提交成功后当天不再调用。是否该调用由纯函数决定,
               // 便于 --self-test 断言。
@@ -972,9 +974,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// 开机自启:用 SMAppService 注册为登录项,不再依赖 launchd plist。
-    private func loginItemEnabled() -> Bool {
+    func loginItemEnabled() -> Bool {
         if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
         return false
+    }
+
+    /// 菜单对勾跟随**真实**状态:读的是 SMAppService,而不是"我们以为设置成了什么"。
+    /// 注册可能被系统拒绝或被用户在系统设置里改掉,那时对勾必须如实显示。
+    func applyLoginItemState(enabled: Bool) {
+        loginItemMenuItem?.state = enabled ? .on : .off
+    }
+
+    func refreshLoginItemState() {
+        applyLoginItemState(enabled: loginItemEnabled())
+    }
+
+    /// 每次打开菜单都重读一次:用户可能在「系统设置 → 通用 → 登录项」里改过。
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshLoginItemState()
+    }
+
+    /// 菜单单独成方法,好让 --dump-menu 在无头环境下检查结构(含「开机自启」的对勾)。
+    func makeMenu() -> NSMenu {
+        let m=NSMenu()
+        m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:""))
+        m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:""))
+        m.addItem(NSMenuItem.separator())
+        m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:","))
+        let loginItem=NSMenuItem(title:"开机自启", action:#selector(toggleLoginItem), keyEquivalent:"")
+        m.addItem(loginItem)
+        loginItemMenuItem=loginItem
+        m.addItem(NSMenuItem.separator())
+        m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:""))
+        m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q"))
+        m.delegate=self
+        return m
     }
 
     private func ensureLoginItem() {
@@ -991,6 +1025,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if loginItemEnabled() { try SMAppService.mainApp.unregister(); showInfo("已关闭", "已取消开机自启。") }
             else { try SMAppService.mainApp.register(); showInfo("已开启", "开机后会随登录自动启动。") }
         } catch { showInfo("设置失败", error.localizedDescription) }
+        // 不论成功失败都以系统状态为准刷新对勾:注册失败时不能显示成已开启。
+        refreshLoginItemState()
+        DebugLog.write("login item toggled enabled=\(loginItemEnabled())")
     }
 
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }
@@ -1149,6 +1186,28 @@ if CommandLine.arguments.contains("--check-version") {
     _ = semaphore.wait(timeout: .now() + 20)
     print(output)
     exit(output.hasPrefix("检查失败") ? 1 : 0)
+}
+
+if CommandLine.arguments.contains("--dump-menu") {
+    // 无头检查菜单结构:菜单是纯 GUI 的,不然「开机自启」的对勾只能靠肉眼确认。
+    // 输出 `标题|动作|状态`,并额外给出系统里登录项的真实状态供断言比对。
+    _ = NSApplication.shared
+    let delegate = AppDelegate()
+    let menu = delegate.makeMenu()
+    delegate.refreshLoginItemState()
+    print("login-item-enabled|\(delegate.loginItemEnabled() ? "on" : "off")")
+    // 两种取值都驱动一遍,证明对勾确实跟着状态变(不触碰真实的登录项注册)。
+    delegate.applyLoginItemState(enabled: true)
+    print("checkmark-when-enabled|\(delegate.loginItemMenuItem.state == .on ? "on" : "off")")
+    delegate.applyLoginItemState(enabled: false)
+    print("checkmark-when-disabled|\(delegate.loginItemMenuItem.state == .on ? "on" : "off")")
+    delegate.refreshLoginItemState()
+    for item in menu.items {
+        let action = item.action.map { NSStringFromSelector($0) } ?? "-"
+        let state = item.isSeparatorItem ? "separator" : (item.state == .on ? "on" : "off")
+        print("\(item.title)|\(action)|\(state)")
+    }
+    exit(0)
 }
 
 if CommandLine.arguments.contains("--engine-path") {

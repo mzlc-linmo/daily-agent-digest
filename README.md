@@ -70,7 +70,7 @@ configuration.
 | 查看今日总结 | Opens the report window |
 | 生成今日总结 | Regenerates today's report (always refreshes) |
 | 设置 | LLM and submission settings, with an inline connection test |
-| 开机自启 | Toggles "launch at login" |
+| 开机自启 | Toggles "launch at login"; a checkmark shows whether it is currently on |
 | 关于 | Version, engine path and data directory |
 | 退出 | Quits the app |
 
