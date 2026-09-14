@@ -74,6 +74,8 @@ jobs:
           path: ${{ runner.temp }}/notarization-${{ matrix.arch }}/
           if-no-files-found: warn
   release:
+    permissions:
+      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:
