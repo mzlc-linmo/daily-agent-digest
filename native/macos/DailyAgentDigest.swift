@@ -93,6 +93,13 @@ final class Backend {
     static func childEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = mergePath(env["PATH"] ?? "")
+        // DMG 安装没有 launchd plist 注入版本号,引擎会自报 "dev";这里补上 App 自己的
+        // 版本,状态与上报里才看得出是哪个版本产出的(install.sh 安装已由 plist 提供)。
+        if (env["DIGEST_RELEASE_VERSION"] ?? "").isEmpty,
+           let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           !version.isEmpty {
+            env["DIGEST_RELEASE_VERSION"] = version
+        }
         return env
     }
 
