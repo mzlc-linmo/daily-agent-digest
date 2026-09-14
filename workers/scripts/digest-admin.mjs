@@ -2,9 +2,9 @@
 // 日报上报后端 · 管理 CLI
 //
 // 安全模型(重要):
-//   · Worker 只暴露成员接口(/healthz、/api/v1/me、/api/v1/digests),**没有任何管理接口**;
+//   · Worker 只暴露成员接口(/healthz、/api/v1/me、/api/v1/digests);
 //   · 所有管理动作(建表、发 Key、撤销、查日志)都在**本机**完成,直连 KV / D1 / 飞书;
-//   · 因此不需要管理员口令,门槛是:一台已登录 Cloudflare(wrangler)的机器 + 本机飞书 App Secret;
+//   · 门槛:一台已登录 Cloudflare(wrangler)的机器 + 本机飞书 App Secret;
 //   · 代价:Cloudflare 账号权限比"只能发 Key 的口令"大得多,不要把账号访问权给非管理员。
 //
 //   node workers/scripts/digest-admin.mjs install      # 全流程引导(首次推荐)
@@ -453,7 +453,6 @@ async function cmdStatus() {
   } else {
     say(`  ${'后端地址'.padEnd(16)} ${c.red('未知(部署后写入 wrangler.toml 的 SUBMIT_URL)')}`);
   }
-  say(c.dim('  管理动作在本机执行,不需要管理员口令。\n'));
 }
 
 async function cmdFeishu(flags) {
@@ -477,16 +476,16 @@ async function cmdFeishu(flags) {
     setTomlVar('FEISHU_APP_ID', appId);
     ok(`已写入 wrangler.toml 的 FEISHU_APP_ID(${appId})`);
   } else {
-    ok(`FEISHU_APP_ID 未变(${appId}),无需改写`);
+    ok(`FEISHU_APP_ID:${appId}`);
   }
   if (hadSecret && flags['keep-secret']) {
-    ok('沿用已有的 FEISHU_APP_SECRET,未改写 Cloudflare secret');
+    ok('沿用现有的 FEISHU_APP_SECRET');
     return;
   }
   const r = await withSpinner('写入 Worker secret FEISHU_APP_SECRET', () => wrangler(['secret', 'put', 'FEISHU_APP_SECRET'], { input: appSecret }));
   if (r.code !== 0) fail(`写入 secret 失败:${r.out.trim()}`);
   ok('FEISHU_APP_SECRET 已写入 Cloudflare');
-  say(c.dim('  提示:本 CLI 不保存密钥;如需免输入,可自行执行'));
+  say(c.dim('  免输入可选:'));
   say(c.dim(`    security add-generic-password -s ${KEYCHAIN_SERVICE} -a feishu-app-secret -w`));
 }
 
@@ -530,7 +529,7 @@ async function cmdTables(flags) {
     setTomlVar('BITABLE_TABLE_ID', result.tableId);
     ok(`已写回 wrangler.toml(BITABLE_TABLE_ID=${result.tableId})`);
   } else {
-    ok(`BITABLE_TABLE_ID 未变(${result.tableId}),无需改写`);
+    ok(`BITABLE_TABLE_ID:${result.tableId}`);
   }
 
   const deploy = await withSpinner('重新部署以让 Worker 读到表 id', () => wrangler(['deploy']));
@@ -547,8 +546,7 @@ async function cmdEmployees(flags) {
     const where = p.sources.length > 1 ? `${p.sources[0]} 等${p.sources.length}处` : p.sources[0];
     say(`  ${padEndWidth(p.name, 16)}${p.open_id}   ${c.dim(where)}`);
   }
-  say(c.dim('  第三列是"这份 open_id 从哪张表读到的":飞书不允许跨应用使用 open_id,'));
-  say(c.dim('  所以只能从企业已有表格的人员字段里取,标出来源便于核对。'));
+  say(c.dim('  第三列:该 open_id 读自哪张表。'));
   say('');
 }
 
@@ -586,7 +584,7 @@ async function cmdIssue(flags) {
 function reportIssue(label, issued) {
   ok(`「${label}」的 Key(只显示这一次):`);
   say(`    ${c.bold(issued.key)}`);
-  say(c.dim('    请立即发给本人;列表里只会显示掩码。丢失请在「员工与 Key」里轮换。'));
+  say(c.dim('    请立即发给本人;丢失在「员工与 Key」里轮换。'));
   if (issued.superseded?.length) say(c.dim(`    已作废旧 Key:${issued.superseded.join(', ')}(一人一把)`));
 }
 
@@ -634,7 +632,7 @@ async function cmdLogs(flags) {
 
 async function cmdInstall(flags) {
   say(c.bold('\n日报上报后端 · 安装向导'));
-  say(c.dim('管理动作全部在本机执行,需要先登录 Cloudflare;已配置的步骤会显示当前值并默认跳过。\n'));
+  say(c.dim('已配置的步骤会显示当前值并默认跳过。\n'));
   await requireLogin(); // 未登录会自动拉起 wrangler login
 
   // 每一步的"当前配置"摘要:已配置的直接展示出来,作为是否重做的判断依据
@@ -834,7 +832,7 @@ async function cmdMembers(flags) {
 
   if (action.value === 'show') {
     say(`  ${padEndWidth(person.name, 16)}${c.dim(key.masked ?? key.key_id)}`);
-    say(c.dim('    完整 Key 只在签发时显示过一次;成员弄丢就选「轮换」重新签发。'));
+    say(c.dim('    要重新发放请选「轮换」。'));
     return;
   }
 
@@ -880,7 +878,7 @@ async function cmdMenu(flags) {
   }
 
   say(c.bold('\n日报上报后端 · 管理台'));
-  say(c.dim('  管理动作在本机执行(直连 KV / D1 / 飞书),需要已登录 Cloudflare;Worker 上没有任何管理接口。'));
+  say(c.dim('  直连 KV / D1 / 飞书执行。'));
   for (;;) {
     say('');
     const picked = await choose(items, { prompt: '请选择功能', footer: '↑/↓ 移动 · Enter 确认 · q 退出' });
@@ -965,9 +963,8 @@ if (!COMMANDS[command] || flags.help) {
   revoke <key_id>  撤销某把 Key
   logs             查询审计日志(--member/--date/--event/--outcome/--limit)
 
-安全:本 CLI 没有"管理员口令" —— 建表/发 Key/撤销/查日志都在本机直连 KV/D1/飞书,
-      前提是已登录 Cloudflare(wrangler login 或 CLOUDFLARE_API_TOKEN)+ 本机飞书 App Secret。
-      Worker 上不存在任何管理接口。
+安全:建表/发 Key/撤销/查日志均在本机直连 KV / D1 / 飞书,
+      需要 Cloudflare 登录(wrangler login 或 CLOUDFLARE_API_TOKEN)与本机飞书 App Secret。
 
 选项:
   --yes                  全部确认(非交互)
