@@ -69,15 +69,29 @@ function wrangler(args, { input, quiet = true } = {}) {
   return { code: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` };
 }
 
+/// 判断 wrangler 登录状态。必须区分两种失败:
+///   · 确实没登录      → 提示去 login
+///   · wrangler 没跑起来(npm 缓存权限、网络等)→ 提示真实原因,不能笼统说"未登录"
+function wranglerAuthState() {
+  const r = wrangler(['whoami']);
+  const out = r.out ?? '';
+  if (/not logged in|auth token has expired|CLOUDFLARE_API_TOKEN/i.test(out)) return { state: 'logged-out', out };
+  if (r.code !== 0 || !/logged in with/i.test(out)) return { state: 'error', out };
+  const email = /associated with the email ([^\s]+)/.exec(out)?.[1]?.replace(/\.$/, '');
+  return { state: 'logged-in', email, out };
+}
+
 /// 管理动作的前置条件:必须已登录 Cloudflare。
 /// 这正是本设计的安全门槛 —— 没有 wrangler 凭据就动不了后端。
 function requireLogin() {
-  const r = wrangler(['whoami']);
-  const out = r.out ?? '';
-  if (r.code !== 0 || /not logged in|expired|CLOUDFLARE_API_TOKEN/i.test(out)) {
+  const { state, email, out } = wranglerAuthState();
+  if (state === 'logged-out') {
     fail(`未登录 Cloudflare。请先执行:\n    ${WRANGLER} login\n  (或在环境变量里设置 CLOUDFLARE_API_TOKEN)`);
   }
-  const email = /associated with the email (\S+?)[.\s]/.exec(out)?.[1];
+  if (state === 'error') {
+    const first = (out ?? '').trim().split('\n').filter((l) => l.trim() && !/WARNING|Proxy environment/.test(l))[0] ?? '';
+    fail(`wrangler 执行失败(不是登录问题):\n    ${first}\n  可执行 \`${WRANGLER} whoami\` 复查;常见原因是 npm 缓存目录权限(npm error code EPERM)。`);
+  }
   return { email, raw: out };
 }
 
@@ -259,10 +273,14 @@ async function fetchEmployees(flags) {
 
 async function cmdStatus() {
   const feishu = resolvedFeishu({});
-  const login = wrangler(['whoami']);
-  const loggedIn = login.code === 0 && !/not logged in|expired|CLOUDFLARE_API_TOKEN/i.test(login.out ?? '');
+  const auth = wranglerAuthState();
+  const loginCell = {
+    'logged-in': c.green(`已登录${auth.email ? `(${auth.email})` : ''}`),
+    'logged-out': c.red('未登录(需要 wrangler login)'),
+    error: c.red('wrangler 执行失败(非登录问题,详情见 whoami 输出)'),
+  }[auth.state];
   const rows = [
-    ['Cloudflare 登录', loggedIn ? c.green('已登录') : c.red('未登录(需要 wrangler login)')],
+    ['Cloudflare 登录', loginCell],
     ['飞书 App ID', tomlVar('FEISHU_APP_ID') ? c.green('已配置') : c.red('缺失')],
     ['飞书 App Secret', feishu.appSecret ? c.green('已配置(钥匙串/环境变量)') : c.red('缺失')],
     ['KV 命名空间', hasBinding('kv_namespaces') ? c.green('已绑定') : c.red('缺失')],
