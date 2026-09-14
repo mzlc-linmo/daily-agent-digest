@@ -17,7 +17,7 @@
 
 | 项目 | 开发版 | 正式版(已停用,保留可回滚) |
 | --- | --- | --- |
-| 应用数据目录 | `<repo>/.dev/home` | `~/.local/share/daily-agent-digest` |
+| 应用数据目录 | `<repo>/.dev/home` | `~/Library/Application Support/Daily Agent Digest` |
 | 引擎 | `.dev/bin/dev-engine` → 直接执行 `daily_agent_digest.py` | 打包二进制 |
 | 托盘应用 | `.dev/app/Daily Agent Digest Dev.app` | `~/.../Daily Agent Digest arm64.app` |
 | Bundle ID | `com.daily-agent-digest.tray.dev` | `com.daily-agent-digest.tray` |

@@ -245,7 +245,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 
 | 环节 | 行为 |
 | --- | --- |
-| 存储位置 | `~/.local/share/daily-agent-digest/.env`,新增 `DIGEST_SUBMIT_URL` 与 `DIGEST_API_KEY`,文件权限 `0600`(与现有 `LLM_*` 同文件) |
+| 存储位置 | `~/Library/Application Support/Daily Agent Digest/.env`,新增 `DIGEST_SUBMIT_URL` 与 `DIGEST_API_KEY`,文件权限 `0600`(与现有 `LLM_*` 同文件) |
 | 录入方式 | 托盘菜单 →「设置」新增两个输入框:提交地址、API Key(密码样式);保存后写入 `.env` |
 | 不重复输入 | 引擎每次启动 `load_env()` 读取;定时任务、托盘生成、重启后都直接复用 |
 | 不回显 | `settings` 命令只返回 `submit_url` 与 `api_key_set: true/false`,**绝不回显 Key 明文**(沿用 FR-11.3);设置界面显示「已配置」而不是明文 |

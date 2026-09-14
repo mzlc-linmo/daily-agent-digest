@@ -1,9 +1,18 @@
 import AppKit
 import ServiceManagement
 
+/// 应用数据目录的唯一来源,必须和引擎的 `APP_DIR` 默认值一致
+/// (`DIGEST_HOME`,否则 `~/Library/Application Support/Daily Agent Digest`)。
+/// 这里曾经有三份各自硬编码的 `~/.local/share/daily-agent-digest`:
+/// 引擎配置目录迁走之后,它们会让界面显示一个并不存放配置的目录。
+enum DigestPaths {
+    static let dataDirectory: String = ProcessInfo.processInfo.environment["DIGEST_HOME"]
+        ?? FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support/Daily Agent Digest"
+}
+
 enum DebugLog {
     static let enabled = ProcessInfo.processInfo.environment["DIGEST_DEBUG"] == "1"
-    static let path = ProcessInfo.processInfo.environment["DIGEST_DEBUG_LOG"] ?? (FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest/tray.debug.log")
+    static let path = ProcessInfo.processInfo.environment["DIGEST_DEBUG_LOG"] ?? (DigestPaths.dataDirectory + "/tray.debug.log")
     /// 日志里可能出现上游错误体(含 token 片段),落盘前先脱敏。
     static func redact(_ text: String) -> String {
         var out = text
@@ -53,7 +62,7 @@ final class Backend {
     static let generateTimeout: TimeInterval = 600
     init() {
         // 优先用 App 包内的引擎(DMG 安装后开箱即用);其次环境变量(开发版);
-        // 最后才是旧安装路径(兼容 install.sh 装出来的布局)。
+        // 最后是 install.sh 的布局:引擎装在数据目录里。
         // 两处都认:CI 把引擎放在 Contents/MacOS(与主程序同级,签名顺序更简单),
         // 本地/未来布局可能放 Contents/Resources。
         let bundleRoot = Bundle.main.bundleURL
@@ -63,7 +72,7 @@ final class Backend {
         ]
         executable = ProcessInfo.processInfo.environment["DIGEST_ENGINE"]
             ?? bundledCandidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-            ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest/daily-agent-digest"
+            ?? DigestPaths.dataDirectory + "/daily-agent-digest"
         DebugLog.write("backend executable=\(executable)")
     }
     func call(_ command: String, _ input: [String: Any] = [:], timeout: TimeInterval = Backend.defaultTimeout, completion: @escaping ([String: Any]) -> Void) {
@@ -645,8 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func releaseInfo() -> [(String, String)] {
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let uiBuild = Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") as? String ?? "unknown"
-        let home = ProcessInfo.processInfo.environment["DIGEST_HOME"]
-            ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest"
+        let home = DigestPaths.dataDirectory
         return [
             ("应用版本", appVersion),
             ("UI 构建", uiBuild),

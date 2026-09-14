@@ -68,7 +68,7 @@
 | 成员身份(member) | 上报载荷中的提交人标识(姓名或工号),本期新增 |
 | 引擎(engine) | `daily_agent_digest.py` 及其打包后的 `daily-agent-digest` |
 | 应用(app) | macOS 托盘控制器 `Daily Agent Digest *.app` |
-| DIGEST_HOME | 应用数据目录,默认 `~/.local/share/daily-agent-digest`(`:6`) |
+| DIGEST_HOME | 应用数据目录,默认 `~/Library/Application Support/Daily Agent Digest`(`:6`) |
 
 ## 5. 需求
 
@@ -329,7 +329,7 @@ Content-Type: application/json
 
 | 变量 | 作用 | 默认 |
 | --- | --- | --- |
-| `DIGEST_HOME` | 应用数据目录 | `~/.local/share/daily-agent-digest` |
+| `DIGEST_HOME` | 应用数据目录 | `~/Library/Application Support/Daily Agent Digest` |
 | `DIGEST_SOURCE_ROOT` | 采集根目录 | `$HOME` |
 | `DIGEST_OUTPUT_DIR` | 报告输出目录 | `APP_DIR` |
 | `DIGEST_RELEASE_VERSION` | 写入状态的版本号 | `dev` |

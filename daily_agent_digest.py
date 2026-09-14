@@ -630,7 +630,7 @@ def main():
             print(json.dumps({'error':str(exc)},ensure_ascii=False)); raise SystemExit(1)
     load_env()  # 直接 CLI 路径也要读 .env:此前靠 run.sh source 配置文件,那会让配置里的 $(...) 被执行
     start,end=day_window(args.date); root=Path(args.root); events,collect_stats=collect(root,start,end); payload=summarize(events,args.date); payload['coverage']['collect']=collect_stats; payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
-    out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(Path.home()/'.local/share/daily-agent-digest')))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
+    out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(APP_DIR)))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
     out.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8'); print(f'events={len(events)} raw={len(events)} output={out}')
     os.chmod(out, 0o600)
 

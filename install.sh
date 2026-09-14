@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
-APP_DIR=${DIGEST_HOME:-"$HOME/.local/share/daily-agent-digest"}
+# 必须与引擎 APP_DIR、托盘 App 的 DigestPaths 使用同一个目录:引擎从
+# $APP_DIR/.env 读配置,这里写到别处就等于配置从未生效。
+APP_DIR=${DIGEST_HOME:-"$HOME/Library/Application Support/Daily Agent Digest"}
 RELEASE_BASE=${DIGEST_RELEASE_BASE:-https://github.com/mzlc-linmo/daily-agent-digest/releases/latest/download}
 ENV_FILE=$APP_DIR/.env
 PLIST=$HOME/Library/LaunchAgents/com.daily-agent-digest.plist

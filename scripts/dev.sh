@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DEV=${DIGEST_DEV_HOME:-$REPO/.dev}
-PROD_HOME=${DIGEST_PROD_HOME:-$HOME/.local/share/daily-agent-digest}
+PROD_HOME=${DIGEST_PROD_HOME:-"$HOME/Library/Application Support/Daily Agent Digest"}
 DEV_HOME=$DEV/home
 DEV_MOCK_HOME=$DEV/mock-home
 DEV_SOURCE=$DEV/source
