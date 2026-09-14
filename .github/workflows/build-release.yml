@@ -153,7 +153,13 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag 已存在:覆盖产物并更新说明"
             gh release upload "$tag" "${assets[@]}" --clobber
-            gh release edit "$tag" --notes "$notes"
+            if [ "$RELEASE_SIGNED" = true ]; then
+              # 早先失败或未签名的构建可能留下同名草稿;只覆盖产物的话它仍是草稿,
+              # 公网下载不到,所以这里显式转成正式发布。
+              gh release edit "$tag" --draft=false --prerelease=false --notes "$notes"
+            else
+              gh release edit "$tag" --notes "$notes"
+            fi
           else
             gh release create "$tag" "${assets[@]}" "${create_args[@]}" --notes "$notes"
           fi
