@@ -90,7 +90,7 @@ async function wrangler(args, { input } = {}) {
 ///   · 确实没登录      → 提示去 login
 ///   · wrangler 没跑起来(npm 缓存权限、网络等)→ 提示真实原因,不能笼统说"未登录"
 async function wranglerAuthState() {
-  const r = await wrangler(['whoami']);
+  const r = await withSpinner('检查 Cloudflare 登录', () => wrangler(['whoami']));
   const out = r.out ?? '';
   if (/not logged in|auth token has expired|CLOUDFLARE_API_TOKEN/i.test(out)) return { state: 'logged-out', out };
   if (r.code !== 0 || !/logged in with/i.test(out)) return { state: 'error', out };
@@ -447,7 +447,8 @@ async function cmdStatus() {
   for (const [k, v] of rows) say(`  ${k.padEnd(16)} ${v}`);
   const url = tomlVar('SUBMIT_URL') || process.env.DIGEST_SUBMIT_URL || '';
   if (url) {
-    const r = run('curl', ['-sS', `${url.replace(/\/$/, '')}/healthz`]);
+    // 用异步执行:同期的 curl 也会阻塞事件循环,把动画冻住
+    const r = await withSpinner('检查后端健康', () => runAsync('curl', ['-sS', `${url.replace(/\/$/, '')}/healthz`]));
     say(`  ${'后端地址'.padEnd(16)} ${url}`);
     say(`  ${'后端健康'.padEnd(16)} ${r.status === 0 ? r.stdout.trim().replace(/\s+/g, ' ') : c.red('不可达')}`);
   } else {
@@ -538,7 +539,7 @@ async function cmdTables(flags) {
 }
 
 async function cmdEmployees(flags) {
-  const people = await fetchEmployees(flags);
+  const people = await withSpinner('读取员工名单', () => fetchEmployees(flags));
   if (!people.length) fail('没找到任何员工(人员字段为空?)');
   say(c.bold(`\n共 ${people.length} 人`));
   say(c.dim(`  ${padEndWidth('姓名', 16)}${padEndWidth('open_id', 38)}读到的位置`));
@@ -590,7 +591,7 @@ function reportIssue(label, issued) {
 
 async function cmdKeys(flags) {
   await requireLogin();
-  const keys = await listKeysLocally(buildEnv(flags, { withDb: false }));
+  const keys = await withSpinner('读取 Key 列表', () => listKeysLocally(buildEnv(flags, { withDb: false })));
   say(c.bold(`\n共 ${keys.length} 把 Key`));
   say(c.dim(`  ${padEndWidth('成员', 16)}状态    Key(掩码)`));
   for (const k of keys) {
@@ -612,13 +613,13 @@ async function cmdRevoke(flags) {
 
 async function cmdLogs(flags) {
   await requireLogin();
-  const rows = await logsLocally(buildEnv(flags, { withKv: false }), {
+  const rows = await withSpinner('查询审计日志', () => logsLocally(buildEnv(flags, { withKv: false }), {
     limit: flags.limit ?? 100,
     memberId: flags.member,
     date: flags.date,
     event: flags.event,
     outcome: flags.outcome,
-  });
+  }));
   say(c.bold(`\n共 ${rows.length} 条`));
   for (const row of rows) {
     const tag = row.outcome === 'ok' ? c.green('ok  ') : c.red('err ');
@@ -676,7 +677,7 @@ async function cmdInstall(flags) {
 
   await cmdStatus();
   say(c.bold('\n▶ 员工与 Key'));
-  const people = await fetchEmployees(flags);
+  const people = await withSpinner('读取员工名单', () => fetchEmployees(flags));
   say(`  员工名单:${people.length} 人`);
   if (people.length && await confirm('现在管理员工与 Key(签发 / 轮换 / 撤销)?', { yes: false })) {
     await cmdMembers(flags);
@@ -822,19 +823,12 @@ async function cmdMembers(flags) {
   }
 
   const action = await choose([
-    { label: '查看 Key(仅掩码,完整值无法还原)', value: 'show' },
     { label: '轮换:签发新 Key,旧的立即失效', value: 'rotate' },
     { label: '撤销:停用,该成员将无法提交', value: 'revoke' },
     { label: '取消', value: 'cancel' },
   ], { prompt: `「${person.name}」已有 Key`, footer: '↑/↓ 移动 · Enter 确认 · q 取消' });
 
   if (!action || action.value === 'cancel') return warn('已取消');
-
-  if (action.value === 'show') {
-    say(`  ${padEndWidth(person.name, 16)}${c.dim(key.masked ?? key.key_id)}`);
-    say(c.dim('    要重新发放请选「轮换」。'));
-    return;
-  }
 
   if (action.value === 'revoke') {
     const revoked = await withSpinner(`撤销 ${key.key_id}`, () => revokeLocally(env, key.key_id));
@@ -858,7 +852,7 @@ const MENU_SECTIONS = [
     ['查看状态(配置 / Cloudflare 登录 / 后端健康)', (f) => cmdStatus(f)],
     ['配置飞书应用凭据(App ID / Secret)', (f) => cmdFeishu(f)],
     ['创建 KV / D1 并部署 Worker', (f) => cmdDeploy(f)],
-    ['建飞书表并回填 table id(含配置申请表单)', (f) => cmdTables(f)],
+    ['建飞书表并回填 table id', (f) => cmdTables(f)],
   ]],
   ['成员与 Key', [
     ['员工与 Key(列出 / 签发 / 轮换 / 撤销)', (f) => cmdMembers(f)],
@@ -870,7 +864,6 @@ const MENU_SECTIONS = [
 ];
 
 async function cmdMenu(flags) {
-  await tryAutoLogin(); // 启动即检查:未登录就自动拉起登录,成功后继续
   const items = [];
   for (const [section, entries] of MENU_SECTIONS) {
     items.push({ header: section });
@@ -879,6 +872,7 @@ async function cmdMenu(flags) {
 
   say(c.bold('\n日报上报后端 · 管理台'));
   say(c.dim('  直连 KV / D1 / 飞书执行。'));
+  await tryAutoLogin(); // 横幅之后再检查:未登录会自动拉起 wrangler login
   for (;;) {
     say('');
     const picked = await choose(items, { prompt: '请选择功能', footer: '↑/↓ 移动 · Enter 确认 · q 退出' });
