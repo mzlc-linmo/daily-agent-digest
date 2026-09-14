@@ -618,7 +618,13 @@ def check_submit(data=None):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); ap.add_argument('--app-command'); args=ap.parse_args()
     if args.app_command:
-        try: print(json.dumps(app_command(args.app_command, json.load(__import__('sys').stdin)), ensure_ascii=False)); return
+        try:
+            # App 会写 {} 到 stdin,但手工执行 `--app-command settings` 时 stdin 往往是空的。
+            # 此前空输入会被当成坏 JSON,而这个失败还会被写进 state(把当天标成 failed),
+            # 等于一次手动查看就污染了托盘状态。空输入按"无参数"处理。
+            raw=__import__('sys').stdin.read()
+            data=json.loads(raw) if raw.strip() else {}
+            print(json.dumps(app_command(args.app_command, data), ensure_ascii=False)); return
         except Exception as exc:
             # 失败也要落盘:否则 state 停在 generating、last_error 为空,
             # 界面只能弹一次错误框,托盘却永远显示"生成中"。

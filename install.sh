@@ -104,10 +104,12 @@ else
   umask 077
   write_env "$BASE_URL" "$MODEL" "$API_KEY"
 fi
+# 这个 heredoc 必须展开变量,因此其中的 $ 都要留意:注释里出现未转义的命令替换
+# 会被 installer 自己执行(此前就报过 `...: command not found`)。
 cat > "$APP_DIR/run.sh" <<EOF
 #!/bin/sh
 set -eu
-# 不再 source 配置文件:引擎自己读 .env(值里的 $(...) 因此不会被 sh 执行)
+# 不再 source 配置文件:引擎自己读 .env(其中的 \$(...) 因此不会被 sh 执行)
 export DIGEST_OUTPUT_DIR=\${DIGEST_OUTPUT_DIR:-"$APP_DIR"}
 # 定时任务也要写入本次安装的版本号,否则 CLI 生成的日报无法追溯引擎版本。
 export DIGEST_RELEASE_VERSION=\${DIGEST_RELEASE_VERSION:-"$release_tag"}
