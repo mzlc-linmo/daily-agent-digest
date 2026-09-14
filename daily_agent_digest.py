@@ -592,7 +592,15 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); ap.add_argument('--app-command'); args=ap.parse_args()
     if args.app_command:
         try: print(json.dumps(app_command(args.app_command, json.load(__import__('sys').stdin)), ensure_ascii=False)); return
-        except Exception as exc: print(json.dumps({'error':str(exc)},ensure_ascii=False)); raise SystemExit(1)
+        except Exception as exc:
+            # 失败也要落盘:否则 state 停在 generating、last_error 为空,
+            # 界面只能弹一次错误框,托盘却永远显示"生成中"。
+            try:
+                st = app_state(); st['last_error'] = str(exc)
+                if st.get('report_status') == 'generating': st['report_status'] = 'failed'
+                write_state(st)
+            except Exception: pass
+            print(json.dumps({'error':str(exc)},ensure_ascii=False)); raise SystemExit(1)
     load_env()  # 直接 CLI 路径也要读 .env:此前靠 run.sh source 配置文件,那会让配置里的 $(...) 被执行
     start,end=day_window(args.date); root=Path(args.root); events,collect_stats=collect(root,start,end); payload=summarize(events,args.date); payload['coverage']['collect']=collect_stats; payload['coverage']['raw_events']=len(events); payload['coverage']['filtered_events']='llm'
     out=Path(args.out) if args.out else Path(os.getenv('DIGEST_OUTPUT_DIR',str(Path.home()/'.local/share/daily-agent-digest')))/f'{args.date}.json'; out.parent.mkdir(parents=True,exist_ok=True)
