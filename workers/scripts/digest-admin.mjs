@@ -44,7 +44,13 @@ const c = {
   red: (s) => `\x1b[31m${s}\x1b[0m`,
   yellow: (s) => `\x1b[33m${s}\x1b[0m`,
 };
-const say = (...a) => console.log(...a);
+// 有动画在跑时:先清掉动画那一行,打印内容,再把动画画回来,避免输出和动画互相覆盖
+const say = (...a) => {
+  const active = spinnerCtl && process.stdout.isTTY;
+  if (active) process.stdout.write('\r\x1b[0J');
+  console.log(...a);
+  if (active) spinnerCtl.draw();
+};
 const ok = (s) => say(`${c.green('✓')} ${s}`);
 const warn = (s) => say(`${c.yellow('!')} ${s}`);
 /// 管理台里单个操作失败不应终止会话,所以内部一律抛 CliError;只有顶层入口才真正退出。
@@ -227,36 +233,57 @@ function padEndWidth(text, width) {
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-let spinnerActive = false;
+/// 当前动画状态;null 表示没有动画在跑。
+let spinnerCtl = null;
 
-/// 执行耗时操作时显示旋转动画(仅真终端)。非终端只打印一行,避免污染输出。
+/// 暂停动画:提问/画菜单期间必须暂停,否则动画会把提示行覆盖掉。
+function pauseSpinner() {
+  const ctl = spinnerCtl;
+  if (!ctl) return;
+  ctl.paused = true;
+  if (ctl.interval) { clearInterval(ctl.interval); ctl.interval = null; }
+  if (process.stdout.isTTY) process.stdout.write('\r\x1b[0J');
+}
+
+/// 恢复动画(提问结束后)。
+function resumeSpinner() {
+  const ctl = spinnerCtl;
+  if (!ctl || !ctl.paused) return;
+  ctl.paused = false;
+  if (process.stdout.isTTY) { ctl.draw(); ctl.interval = setInterval(ctl.draw, 80); }
+}
+
+/// 执行操作时显示旋转动画(仅真终端)。
 ///   · **立即开始**转动,不延迟;
-///   · 动画由 setInterval 驱动,所以被等待的调用**必须异步** ——
-///     同步 spawn 会阻塞事件循环,动画会"画一帧就冻住"。
-///   · 嵌套调用不再起第二个动画 —— 两个定时器抢同一行会互相覆盖成花屏。
+///   · 动画由 setInterval 驱动,所以被等待的调用**必须异步**(同步 spawn 会让它冻住);
+///   · 嵌套调用不重启动画,只把文案换成更具体的那条(避免闪烁与两个定时器抢同一行)。
 async function withSpinner(label, fn) {
-  if (spinnerActive) return fn();
-  spinnerActive = true;
-  const tty = Boolean(process.stdout.isTTY);
-  const interval = tty ? setInterval(() => draw(), 80) : null;
-  let index = 0;
-  function draw() {
-    process.stdout.write(`\r\x1b[2m${SPINNER_FRAMES[index++ % SPINNER_FRAMES.length]} ${label}\x1b[0m`);
+  if (spinnerCtl) {
+    const previous = spinnerCtl.label;
+    spinnerCtl.label = label;
+    if (!spinnerCtl.paused) spinnerCtl.draw();
+    try {
+      return await fn();
+    } finally {
+      spinnerCtl.label = previous;
+      if (!spinnerCtl.paused) spinnerCtl.draw();
+    }
   }
-  if (tty) draw(); else say(c.dim(`  ${label}…`));
-  const stop = () => {
-    if (interval) clearInterval(interval);
-    if (tty) process.stdout.write('\r\x1b[0J');
+
+  const tty = Boolean(process.stdout.isTTY);
+  const ctl = { label, frame: 0, interval: null, paused: false };
+  ctl.draw = () => {
+    const frame = SPINNER_FRAMES[ctl.frame++ % SPINNER_FRAMES.length];
+    process.stdout.write(`\r\x1b[2m${frame} ${ctl.label}\x1b[0m`);
   };
+  spinnerCtl = ctl;
+  if (tty) { ctl.draw(); ctl.interval = setInterval(ctl.draw, 80); } else { say(c.dim(`  ${label}…`)); }
   try {
-    const result = await fn();
-    stop();
-    return result;
-  } catch (err) {
-    stop();
-    throw err;
+    return await fn();
   } finally {
-    spinnerActive = false;
+    if (ctl.interval) clearInterval(ctl.interval);
+    if (tty) process.stdout.write('\r\x1b[0J');
+    spinnerCtl = null;
   }
 }
 
@@ -277,11 +304,16 @@ async function ask(question, { defaultValue = '' } = {}) {
   const r = reader();
   if (stdinEnded) return '';
   const suffix = defaultValue ? c.dim(` [${defaultValue}]`) : '';
-  const answer = (await Promise.race([
-    r.question(`${c.bold('?')} ${question}${suffix}: `),
-    new Promise((resolve) => r.once('close', () => resolve(null))),
-  ]) ?? '').trim();
-  return answer || defaultValue;
+  pauseSpinner(); // 提示行不能被动画覆盖
+  try {
+    const answer = (await Promise.race([
+      r.question(`${c.bold('?')} ${question}${suffix}: `),
+      new Promise((resolve) => r.once('close', () => resolve(null))),
+    ]) ?? '').trim();
+    return answer || defaultValue;
+  } finally {
+    resumeSpinner();
+  }
 }
 
 async function confirm(question, { yes = false } = {}) {
@@ -297,6 +329,7 @@ async function askSecret(question) {
   const stdin = process.stdin;
   if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') return (await ask(question)).trim();
   closeReader();
+  pauseSpinner();
   if (stdin.isPaused()) stdin.resume();
   process.stdout.write(`${c.bold('?')} ${question}: `);
   return new Promise((resolve) => {
@@ -306,6 +339,7 @@ async function askSecret(question) {
       stdin.pause();
       stdin.off('data', onData);
       process.stdout.write('\n');
+      resumeSpinner();
       resolve(value);
     };
     const onData = (chunk) => {
@@ -696,6 +730,7 @@ function selectMenu(entries, { footer = '↑/↓ 移动 · Enter 确认 · q 退
 
   // readline 与 raw mode 不能同时读 stdin,先把 readline 收起来
   closeReader();
+  pauseSpinner(); // 菜单绘制期间不能让动画抢同一行
   if (stdin.isPaused()) stdin.resume();
 
   let cursor = entries.findIndex((e) => !e.header);
@@ -727,6 +762,7 @@ function selectMenu(entries, { footer = '↑/↓ 移动 · Enter 确认 · q 退
       stdin.pause();
       stdin.off('data', onData);
       stdout.write('\n');
+      resumeSpinner();
       resolve(value);
     };
     const move = (delta) => {
@@ -835,11 +871,11 @@ async function cmdMembers(flags) {
     return ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
   }
 
-  const issued = await issueLocally(env, {
+  const issued = await withSpinner(`轮换「${person.name}」的 Key`, () => issueLocally(env, {
     member_id: key.member_id || person.open_id.slice(-6),
     member: person.name,
     open_id: person.open_id,
-  });
+  }));
   reportIssue(person.name, issued);
 }
 
@@ -879,7 +915,8 @@ async function cmdMenu(flags) {
     if (!picked) { say('已退出。'); return; }
     say('');
     try {
-      await picked.run(flags);
+      // 整个动作都包在动画里:点击后立刻有反馈;内部更具体的文案会替换掉这条
+      await withSpinner(picked.label, () => picked.run(flags));
     } catch (err) {
       // 单个操作失败(含未登录、缺配置)只提示,不退出管理台
       warn(err instanceof CliError ? err.message : `执行出错:${err.message ?? err}`);
