@@ -18,10 +18,43 @@ App ──POST /api/v1/digests──▶ Worker ──tenant_access_token──�
 https://xxx.feishu.cn/base/<BITABLE_APP_TOKEN>?table=<BITABLE_TABLE_ID>
 ```
 
-## 部署:一个 CLI 搞定
+## 管理台(推荐入口)
+
+在终端里直接运行,**不带参数就进管理台**:
 
 ```bash
 cd workers
+node scripts/digest-admin.mjs
+```
+
+它列出全部管理项目,按编号选择,执行完自动回到菜单(单个操作失败只提示,不退出):
+
+```
+日报上报后端 · 管理台
+
+  ── 初次安装 ──
+    1) 一键全流程(校验凭据 → 部署 → 建表 → 读取员工)
+  ── 配置与部署 ──
+    2) 查看状态(配置 / Cloudflare 登录 / 后端健康)
+    3) 配置飞书应用凭据(App ID / Secret)
+    4) 创建 KV / D1 并部署 Worker
+    5) 建飞书表并回填 table id(含配置申请表单)
+  ── 成员与 Key ──
+    6) 列出员工(含 open_id)
+    7) 为员工签发 Key
+    8) 列出已签发的 Key
+    9) 撤销某把 Key
+  ── 审计日志 ──
+   10) 查看最近日志
+   11) 按条件查日志(成员 / 日期 / 成功失败)
+    0) 退出
+```
+
+在 CI / 脚本里(非交互)也可以直接用子命令,见下表。
+
+## 子命令(等价能力)
+
+```bash
 node scripts/digest-admin.mjs install        # 全流程引导
 ```
 

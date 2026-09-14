@@ -47,7 +47,10 @@ const c = {
 const say = (...a) => console.log(...a);
 const ok = (s) => say(`${c.green('✓')} ${s}`);
 const warn = (s) => say(`${c.yellow('!')} ${s}`);
-const die = (s) => { console.error(`${c.red('✗')} ${s}`); process.exit(1); };
+/// 管理台里单个操作失败不应终止会话,所以内部一律抛 CliError;只有顶层入口才真正退出。
+class CliError extends Error {}
+const fail = (msg) => { throw new CliError(msg); };
+const die = (msg) => { console.error(`${c.red('✗')} ${msg}`); process.exit(1); };
 
 /* ------------------------------------------------------------ 进程与配置 */
 
@@ -72,7 +75,7 @@ function requireLogin() {
   const r = wrangler(['whoami']);
   const out = r.out ?? '';
   if (r.code !== 0 || /not logged in|expired|CLOUDFLARE_API_TOKEN/i.test(out)) {
-    die(`未登录 Cloudflare。请先执行:\n    ${WRANGLER} login\n  (或在环境变量里设置 CLOUDFLARE_API_TOKEN)`);
+    fail(`未登录 Cloudflare。请先执行:\n    ${WRANGLER} login\n  (或在环境变量里设置 CLOUDFLARE_API_TOKEN)`);
   }
   const email = /associated with the email (\S+?)[.\s]/.exec(out)?.[1];
   return { email, raw: out };
@@ -135,17 +138,30 @@ function keychainSet(account, value, service = KEYCHAIN_SERVICE) {
 /* ------------------------------------------------------------------ 交互 */
 
 let rl = null;
-const reader = () => (rl ??= createInterface({ input: process.stdin, output: process.stdout }));
+let stdinEnded = false;
+const reader = () => {
+  if (!rl) {
+    rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('close', () => { stdinEnded = true; });
+  }
+  return rl;
+};
 
+/// 读取一行。**输入结束(EOF)时返回空串而不是挂住** —— 管道/重定向场景下不会留下未决 await。
 async function ask(question, { defaultValue = '' } = {}) {
+  const r = reader();
+  if (stdinEnded) return '';
   const suffix = defaultValue ? c.dim(` [${defaultValue}]`) : '';
-  const answer = (await reader().question(`${c.bold('?')} ${question}${suffix}: `)).trim();
+  const answer = (await Promise.race([
+    r.question(`${c.bold('?')} ${question}${suffix}: `),
+    new Promise((resolve) => r.once('close', () => resolve(null))),
+  ]) ?? '').trim();
   return answer || defaultValue;
 }
 
 async function confirm(question, { yes = false } = {}) {
   if (yes) return true;
-  const answer = (await reader().question(`${c.bold('?')} ${question} [y/N]: `)).trim().toLowerCase();
+  const answer = (await ask(`${question} [y/N]`)).trim().toLowerCase();
   return answer === 'y' || answer === 'yes';
 }
 
@@ -192,12 +208,12 @@ function buildEnv(flags = {}, { withKv = true, withDb = true } = {}) {
   };
   if (withKv) {
     const ns = kvNamespaceId();
-    if (!ns) die('wrangler.toml 里没有 KV 绑定,先跑 `deploy`');
+    if (!ns) fail('wrangler.toml 里没有 KV 绑定,先跑 `deploy`');
     env.KEYS = kvAdapter(ns, wrangler);
   }
   if (withDb) {
     const name = d1DatabaseName();
-    if (!name) die('wrangler.toml 里没有 D1 绑定,先跑 `deploy`');
+    if (!name) fail('wrangler.toml 里没有 D1 绑定,先跑 `deploy`');
     env.DB = d1Adapter(name, wrangler);
   }
   return env;
@@ -232,7 +248,7 @@ async function listEmployees(token, extraBases = []) {
 
 async function fetchEmployees(flags) {
   const { appId, appSecret } = resolvedFeishu(flags);
-  if (!appId || !appSecret) die('缺飞书凭据:先跑 `feishu`');
+  if (!appId || !appSecret) fail('缺飞书凭据:先跑 `feishu`');
   const token = await feishuToken(appId, appSecret);
   const extra = (flags['scan-bases'] || process.env.DIGEST_SCAN_BASES || tomlVar('SCAN_BASES') || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
@@ -275,9 +291,9 @@ async function cmdFeishu(flags) {
   let appSecret = flags['app-secret'] || keychainGet('feishu-app-secret')?.value || '';
 
   if (!appId) appId = await ask('飞书 App ID (cli_…)');
-  if (!appId.startsWith('cli_')) die(`App ID 看起来不对:${appId}(应以 cli_ 开头)`);
+  if (!appId.startsWith('cli_')) fail(`App ID 看起来不对:${appId}(应以 cli_ 开头)`);
   if (!appSecret) appSecret = await ask('飞书 App Secret(也可先存进钥匙串)');
-  if (!appSecret) die('缺少 App Secret');
+  if (!appSecret) fail('缺少 App Secret');
 
   process.stdout.write(c.dim('  正在校验凭据…\n'));
   await feishuToken(appId, appSecret);
@@ -291,7 +307,7 @@ async function cmdFeishu(flags) {
   }
   process.stdout.write(c.dim('  正在写入 Worker secret FEISHU_APP_SECRET…\n'));
   const r = wrangler(['secret', 'put', 'FEISHU_APP_SECRET'], { input: appSecret });
-  if (r.code !== 0) die(`写入 secret 失败:${r.out.trim()}`);
+  if (r.code !== 0) fail(`写入 secret 失败:${r.out.trim()}`);
   ok('FEISHU_APP_SECRET 已写入 Cloudflare');
 }
 
@@ -301,7 +317,7 @@ async function cmdDeploy(flags) {
     process.stdout.write(c.dim('  创建 KV 命名空间 KEYS…\n'));
     const r = wrangler(['kv', 'namespace', 'create', 'KEYS']);
     const id = /id\s*=\s*"([0-9a-f]{32})"/.exec(r.out ?? '')?.[1];
-    if (!id) die(`创建 KV 失败:${(r.out ?? '').trim()}`);
+    if (!id) fail(`创建 KV 失败:${(r.out ?? '').trim()}`);
     appendBinding(`# API Key 存放在 KV:签发时绑定人员,撤销即时生效。\n[[kv_namespaces]]\nbinding = "KEYS"\nid = "${id}"`);
     ok(`KV 已创建并写入 wrangler.toml(${id})`);
   } else ok('KV 已绑定,跳过');
@@ -310,19 +326,19 @@ async function cmdDeploy(flags) {
     process.stdout.write(c.dim('  创建 D1 数据库…\n'));
     const r = wrangler(['d1', 'create', D1_NAME]);
     const id = /database_id\s*=\s*"([0-9a-f-]{36})"/.exec(r.out ?? '')?.[1];
-    if (!id) die(`创建 D1 失败:${(r.out ?? '').trim()}`);
+    if (!id) fail(`创建 D1 失败:${(r.out ?? '').trim()}`);
     appendBinding(`# 审计日志(提交/签发/撤销)持久化在 D1。\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${id}"`);
     ok(`D1 已创建并写入 wrangler.toml(${id})`);
   } else ok('D1 已绑定,跳过');
 
   process.stdout.write(c.dim('  应用 schema.sql…\n'));
   const schema = wrangler(['d1', 'execute', D1_NAME, '--remote', '--file=schema.sql']);
-  if (schema.code !== 0) die(`建表失败:${(schema.out ?? '').trim()}`);
+  if (schema.code !== 0) fail(`建表失败:${(schema.out ?? '').trim()}`);
   ok('audit_log 表已就绪');
 
   process.stdout.write(c.dim('  部署 Worker…\n'));
   const deploy = wrangler(['deploy']);
-  if (deploy.code !== 0) die(`部署失败:${(deploy.out ?? '').trim()}`);
+  if (deploy.code !== 0) fail(`部署失败:${(deploy.out ?? '').trim()}`);
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deploy.out ?? '')?.[0];
   if (url) { setTomlVar('SUBMIT_URL', url); ok(`后端已部署:${url}`); }
   else warn('部署成功但没解析到地址,请手动把 SUBMIT_URL 写进 wrangler.toml');
@@ -343,7 +359,7 @@ async function cmdTables(flags) {
 
   process.stdout.write(c.dim('  重新部署以让 Worker 读到这些 id…\n'));
   const deploy = wrangler(['deploy']);
-  if (deploy.code !== 0) die(`部署失败:${(deploy.out ?? '').trim()}`);
+  if (deploy.code !== 0) fail(`部署失败:${(deploy.out ?? '').trim()}`);
   ok('已重新部署');
 
   if (flags['skip-form']) { warn('按要求跳过表单配置'); return; }
@@ -409,7 +425,7 @@ async function setupForm(flags) {
 
 async function cmdEmployees(flags) {
   const people = await fetchEmployees(flags);
-  if (!people.length) die('没找到任何员工(人员字段为空?)');
+  if (!people.length) fail('没找到任何员工(人员字段为空?)');
   say(c.bold(`\n共 ${people.length} 人`));
   for (const p of people) say(`  ${p.name.padEnd(14)} ${p.open_id}   ${c.dim(p.source)}`);
   say('');
@@ -431,11 +447,11 @@ async function cmdIssue(flags) {
   }
 
   const people = await fetchEmployees(flags);
-  if (!people.length) die('没找到员工');
+  if (!people.length) fail('没找到员工');
   say(c.bold('\n选择员工(可多选,如 1,3,5)'));
   people.forEach((p, i) => say(`  ${String(i + 1).padStart(2)}. ${p.name.padEnd(14)} ${c.dim(p.source)}`));
   const picks = (await ask('序号')).split(/[,，\s]+/).map((s) => Number(s) - 1).filter((i) => people[i]);
-  if (!picks.length) die('没有选中任何人');
+  if (!picks.length) fail('没有选中任何人');
   for (const i of picks) {
     const person = people[i];
     const mid = await ask(`「${person.name}」的成员ID(工号/账号)`, { defaultValue: person.open_id.slice(-6) });
@@ -463,7 +479,7 @@ async function cmdKeys(flags) {
 async function cmdRevoke(flags) {
   requireLogin();
   const keyId = flags._[0];
-  if (!keyId) die('用法:revoke <key_id>');
+  if (!keyId) fail('用法:revoke <key_id>');
   const revoked = await revokeLocally(buildEnv(flags, { withDb: false }), keyId);
   ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
 }
@@ -514,6 +530,92 @@ async function cmdInstall(flags) {
   say('完成。下一步:把后端地址 + Key 填进 App 的「设置」面板。\n');
 }
 
+/* ---------------------------------------------------------------- 管理台 */
+
+/// 管理台里撤销 Key:先列出启用中的 Key 让管理员挑,不用手输 key_id。
+async function cmdRevokeMenu(flags) {
+  requireLogin();
+  const env = buildEnv(flags, { withDb: false });
+  const keys = (await listKeysLocally(env)).filter((k) => k.enabled);
+  if (!keys.length) { warn('当前没有启用中的 Key'); return; }
+  say(c.bold('\n启用中的 Key:'));
+  keys.forEach((k, i) => say(`  ${String(i + 1).padStart(2)}. ${k.key_id}  ${String(k.member).padEnd(14)} ${c.dim(k.member_id)}`));
+  const answer = (await ask('要撤销的编号(或直接输入 key_id,留空取消)')).trim();
+  if (!answer) { warn('已取消'); return; }
+  const keyId = keys[Number(answer) - 1]?.key_id ?? answer;
+  const revoked = await revokeLocally(buildEnv(flags, { withDb: false }), keyId);
+  ok(`已撤销 ${revoked.key_id}(${revoked.member ?? ''}),下一次请求立即失效`);
+}
+
+/// 管理台里按条件查日志:逐项询问,留空即不限制。
+async function cmdLogsMenu(flags) {
+  const member = (await ask('成员ID(留空=全部)')).trim();
+  const date = (await ask('日期 YYYY-MM-DD(留空=全部)')).trim();
+  const outcome = (await ask('结果 ok/error(留空=全部)')).trim();
+  await cmdLogs({
+    ...flags,
+    member: member || undefined,
+    date: date || undefined,
+    outcome: outcome || undefined,
+    limit: flags.limit ?? 50,
+  });
+}
+
+/// 管理项目录:管理员按编号选择,执行完回到菜单。
+const MENU_SECTIONS = [
+  ['初次安装', [
+    ['一键全流程(校验凭据 → 部署 → 建表 → 读取员工)', (f) => cmdInstall(f)],
+  ]],
+  ['配置与部署', [
+    ['查看状态(配置 / Cloudflare 登录 / 后端健康)', (f) => cmdStatus(f)],
+    ['配置飞书应用凭据(App ID / Secret)', (f) => cmdFeishu(f)],
+    ['创建 KV / D1 并部署 Worker', (f) => cmdDeploy(f)],
+    ['建飞书表并回填 table id(含配置申请表单)', (f) => cmdTables(f)],
+  ]],
+  ['成员与 Key', [
+    ['列出员工(含 open_id)', (f) => cmdEmployees(f)],
+    ['为员工签发 Key', (f) => cmdIssue(f)],
+    ['列出已签发的 Key', (f) => cmdKeys(f)],
+    ['撤销某把 Key', (f) => cmdRevokeMenu(f)],
+  ]],
+  ['审计日志', [
+    ['查看最近日志', (f) => cmdLogs({ ...f, limit: 20 })],
+    ['按条件查日志(成员 / 日期 / 成功失败)', (f) => cmdLogsMenu(f)],
+  ]],
+];
+
+async function cmdMenu(flags) {
+  // 扁平化成"编号 → 动作",同时保留分组标题
+  const items = [];
+  for (const [section, entries] of MENU_SECTIONS) {
+    items.push({ section });
+    for (const [label, run] of entries) items.push({ number: items.filter((i) => i.number).length + 1, label, run });
+  }
+
+  say(c.bold('\n日报上报后端 · 管理台'));
+  say(c.dim('  管理动作在本机执行(直连 KV / D1 / 飞书),需要已登录 Cloudflare;Worker 上没有任何管理接口。'));
+  for (;;) {
+    say('');
+    for (const item of items) {
+      if (item.section) say(c.dim(`  ── ${item.section} ──`));
+      else say(`  ${String(item.number).padStart(3)}) ${item.label}`);
+    }
+    say(`  ${String(0).padStart(3)}) 退出`);
+    const answer = (await ask('请选择编号')).trim().toLowerCase();
+    if (!answer || ['0', 'q', 'quit', 'exit'].includes(answer)) { say('已退出。'); return; }
+    const target = items.find((i) => String(i.number) === answer);
+    if (!target) { warn(`没有编号 ${answer},请重新选择`); continue; }
+    say('');
+    try {
+      await target.run(flags);
+    } catch (err) {
+      // 单个操作失败(含未登录、缺配置)只提示,不退出管理台
+      if (err instanceof CliError) warn(err.message);
+      else { warn(`执行出错:${err.message ?? err}`); }
+    }
+  }
+}
+
 /* -------------------------------------------------------------------- 入口 */
 
 function parseArgs(argv) {
@@ -531,6 +633,7 @@ function parseArgs(argv) {
 }
 
 const COMMANDS = {
+  menu: cmdMenu,
   install: cmdInstall,
   status: cmdStatus,
   feishu: cmdFeishu,
@@ -544,8 +647,10 @@ const COMMANDS = {
 };
 
 const argv = process.argv.slice(2);
-const command = argv[0] && !argv[0].startsWith('--') ? argv[0] : 'status';
-const flags = parseArgs(command === argv[0] ? argv.slice(1) : argv);
+const explicit = argv[0] && !argv[0].startsWith('--') ? argv[0] : null;
+// 交互式终端下直接进管理台;管道/脚本场景退回 status,避免挂住
+const command = explicit ?? (process.stdin.isTTY ? 'menu' : 'status');
+const flags = parseArgs(explicit ? argv.slice(1) : argv);
 
 if (!COMMANDS[command] || flags.help) {
   say(`日报上报后端管理 CLI
@@ -553,8 +658,9 @@ if (!COMMANDS[command] || flags.help) {
 用法:node workers/scripts/digest-admin.mjs <命令> [选项]
 
 命令:
-  install          全流程引导(首次使用推荐)
-  status           显示配置与 Cloudflare 登录状态(默认命令)
+  menu             管理台:列出全部管理项目,按编号选择(交互终端下的默认命令)
+  install          全流程引导(非交互等价于 menu 的一次性版本)
+  status           显示配置与 Cloudflare 登录状态
   feishu           配置并校验飞书应用凭据(App ID/Secret)
   deploy           创建 KV + D1、应用日志表结构、部署 Worker
   tables           建飞书表 → 回填 table id → 重新部署 → 配置表单
@@ -583,7 +689,8 @@ if (!COMMANDS[command] || flags.help) {
 try {
   await COMMANDS[command](flags);
 } catch (err) {
-  die(err.message ?? String(err));
+  // 只有走到这里才真正退出;管理台内部用 CliError 承接,不会中断会话
+  die(err instanceof CliError ? err.message : (err.stack ?? String(err)));
 } finally {
   closeReader();
 }

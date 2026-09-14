@@ -287,7 +287,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | 飞书应用 | `cli_aa13a11707b89bdb`(凭据存于本机钥匙串 `zentao.mzlc.me`) |
 | secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
 | D1 | `daily-agent-digest-logs`(`audit_log` 表):提交(含失败)、签发、撤销、bootstrap 全部留痕,默认保留 180 天 |
-| 管理 CLI | `workers/scripts/digest-admin.mjs`:install / status / feishu / admin-token / deploy / tables / employees / issue / keys / revoke / logs |
+| 管理 CLI | `workers/scripts/digest-admin.mjs`:不带参数进入**管理台**(列出全部管理项按编号选择);子命令 menu / install / status / feishu / deploy / tables / employees / issue / keys / revoke / logs |
 | KV | `KEYS` 命名空间 `6f1b2801ee524cd7a3dab047e5c7e1a8`,存放成员 Key |
 | Key 生命周期 | **线上已验证**:签发 → 用 Key 调 `/api/v1/me` 成功 → 列表不含哈希 → 撤销后立即 `403 key_revoked` |
 | 自动签发 | Worker `scheduled()` 每分钟轮询申请表:未签发的行自动生成 Key 并把明文写回该行;状态改为「已撤销」即停用。**成员填表 ≈1 分钟后就拿到 Key,无需管理员介入** |
