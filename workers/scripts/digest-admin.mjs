@@ -369,6 +369,19 @@ async function confirm(question, { yes = false } = {}) {
 
 const closeReader = () => { if (rl) { rl.close(); rl = null; } };
 
+/// 逐个询问只有人能提供的配置值:先把"在哪找"讲清楚,再问。
+///
+/// 当前值还是模板占位符时**不拿它当默认值** —— 否则用户直接回车,提示里显示"保持原值",
+/// 实际却把占位符原样留着,后面照样跑不通。
+async function askConfigValue(label, varName, hints) {
+  say(`  ── ${label} ──`);
+  for (const line of hints) say(c.dim(`     ${line}`));
+  const current = tomlVar(varName);
+  const real = current && !isPlaceholder(current) ? current : '';
+  if (current && !real) say(c.yellow('     当前仍是模板占位符,需要填真实值(直接回车=不改动)'));
+  return ask(label, real ? { defaultValue: real } : {});
+}
+
 /// 读取密钥类输入:终端下不回显(打 * 号),管道下按普通行读。
 async function askSecret(question) {
   const stdin = process.stdin;
@@ -432,7 +445,7 @@ async function feishuApi(pathname, token, init = {}) {
 }
 
 async function resolvedFeishu(flags) {
-  const appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || (await keychainGet('feishu-app-id'))?.value || '';
+  const appId = flags['app-id'] || realVar('FEISHU_APP_ID') || (await keychainGet('feishu-app-id'))?.value || '';
   const appSecret = flags['app-secret'] || (await keychainGet('feishu-app-secret'))?.value || process.env.FEISHU_APP_SECRET || '';
   return { appId, appSecret };
 }
@@ -573,14 +586,21 @@ async function cmdStatus() {
 
 async function cmdFeishu(flags) {
   await requireLogin();
-  let appId = flags['app-id'] || tomlVar('FEISHU_APP_ID') || (await keychainGet('feishu-app-id'))?.value || '';
+  // 占位符不算已配置:否则会拿 cli_REPLACE_WITH_YOUR_APP_ID 去飞书换 token,报错莫名其妙。
+  let appId = flags['app-id'] || realVar('FEISHU_APP_ID') || (await keychainGet('feishu-app-id'))?.value || '';
   let appSecret = flags['app-secret'] || (await keychainGet('feishu-app-secret'))?.value || '';
 
   // 已配置的值作为默认值直接显示,回车即沿用
-  if (!appId) appId = (await ask('飞书 App ID (cli_…)')).trim();
+  if (!appId) {
+    say(c.dim('    在哪找:飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID(形如 cli_…)'));
+    say(c.dim('    也可以从 Cloudflare 控制台该 Worker 的 Variables(FEISHU_APP_ID)里抄回旧值。'));
+    appId = (await ask('飞书 App ID (cli_…)')).trim();
+  }
   if (!appId.startsWith('cli_')) fail(`App ID 看起来不对:${appId}(应以 cli_ 开头)`);
   const hadSecret = Boolean(appSecret);
   if (!appSecret) {
+    say(c.dim('    在哪找:同一页「凭证与基础信息」里的 App Secret(点「查看」复制)。'));
+    say(c.dim('    线上那份存在 Cloudflare secret 里,读不回明文;这里填的是本机 CLI 直连飞书用的。'));
     appSecret = await askSecret('飞书 App Secret(输入不回显)');
     if (!appSecret) fail('缺少 App Secret');
   }
@@ -673,12 +693,28 @@ async function cmdAdopt(flags) {
   if (!d1Id) warn(`没在账号里找到名为 ${D1_NAME} 的 D1 数据库:或显式给 --d1-id`);
 
   // 飞书侧与地址:只能人工确认(Cloudflare 控制台里该 Worker 的变量就是部署时的旧值)
-  say(c.dim('\n  下面几项在 Cloudflare 控制台 → Workers → 该 Worker → Settings → Variables 里能看到旧值;'));
-  say(c.dim('  表 token / 表 ID 也可以直接从飞书多维表格的 URL 里取。回车表示保持不变。\n'));
-  const baseToken = flags['base-token'] ?? await ask('飞书主表 token(bitable app token)', { defaultValue: tomlVar('BITABLE_APP_TOKEN') });
-  const tableId = flags['table-id'] ?? await ask('飞书主表 ID', { defaultValue: tomlVar('BITABLE_TABLE_ID') });
-  const appId = flags['app-id'] ?? await ask('飞书 App ID', { defaultValue: tomlVar('FEISHU_APP_ID') });
-  const submitUrlInput = flags['submit-url'] ?? await ask('后端提交地址(Worker 地址)', { defaultValue: knownSubmitUrl(tomlVar('SUBMIT_URL')) });
+  // 每个值都把"在哪找"讲清楚再问:这几项只有人能提供,光给字段名等于没说。
+  const workerName = tomlVar('name') || 'daily-agent-digest-submit';
+  const varsPath = `Cloudflare 控制台 → Workers → ${workerName} → Settings → Variables`;
+  const baseToken = flags['base-token'] ?? await askConfigValue('飞书主表 token(bitable app token)', 'BITABLE_APP_TOKEN', [
+    `${varsPath} → BITABLE_APP_TOKEN(部署时写进去的旧值,最可靠)`,
+    '或:飞书里打开那张多维表格,地址栏 /base/ 后面那一段(形如 bascnAbCd…)',
+    '注意:从「知识库/Wiki」里打开的地址栏是 /wiki/…,那种取不到,请用上面两种方式',
+  ]);
+  const tableId = flags['table-id'] ?? await askConfigValue('飞书主表 ID', 'BITABLE_TABLE_ID', [
+    `${varsPath} → BITABLE_TABLE_ID`,
+    '或:同一段地址栏 URL 里 ?table=tblXXXX 那一段',
+  ]);
+  const appId = flags['app-id'] ?? await askConfigValue('飞书 App ID', 'FEISHU_APP_ID', [
+    `${varsPath} → FEISHU_APP_ID`,
+    '或:飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID',
+    'App ID 不敏感;对应的 App Secret 存在 Cloudflare secret 里,这里不需要填',
+  ]);
+  const submitUrlInput = flags['submit-url'] ?? await askConfigValue('后端提交地址(Worker 地址)', 'SUBMIT_URL', [
+    `${varsPath} → SUBMIT_URL`,
+    '或:成员端托盘菜单「设置 → 提交地址」里已经填着的那个地址',
+    '形如 https://<worker>.<子域>.workers.dev,填到域名即可(不要带 /api/v1/digests)',
+  ]);
 
   for (const [name, value] of [['BITABLE_APP_TOKEN', baseToken], ['BITABLE_TABLE_ID', tableId], ['FEISHU_APP_ID', appId], ['SUBMIT_URL', submitUrlInput]]) {
     const trimmed = String(value ?? '').trim();

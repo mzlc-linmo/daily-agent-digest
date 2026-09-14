@@ -129,9 +129,15 @@ node workers/scripts/digest-admin.mjs adopt
 | --- | --- |
 | KV 命名空间 id | **`adopt` 自动**(`npx wrangler kv namespace list` 里 `KEYS` 那条) |
 | D1 `database_id` | **`adopt` 自动**(`npx wrangler d1 list`) |
-| 主表 token / 主表 ID / 飞书 App ID | Cloudflare 控制台 → Workers → 该 Worker → Settings → Variables(部署时写入的旧值);表 token/id 也能从飞书多维表格的 URL 里取,`adopt` 会逐个问 |
-| 后端地址 `SUBMIT_URL` | 就是 Worker 地址;成员端托盘菜单「设置」里的提交地址通常已经填着它 |
-| 本地飞书 App Secret | 只用于 CLI 直连飞书;`security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。线上那一份是 Cloudflare secret,不受影响 |
+| 后端地址 `SUBMIT_URL` | **`adopt` 会问**,默认值就是它的当前值;也可以看成员端托盘菜单「设置 → 提交地址」里填着的那个地址 |
+| 飞书主表 token(`BITABLE_APP_TOKEN`) | Cloudflare 控制台 → Workers → `daily-agent-digest-submit` → Settings → Variables → `BITABLE_APP_TOKEN`(**部署时写进去的旧值,最可靠**);或飞书打开那张多维表格,地址栏 `/base/` 后面那一段(形如 `bascnAbCd…`) |
+| 飞书主表 ID(`BITABLE_TABLE_ID`) | 同上那一段 URL 里 `?table=tblXXXX` 的部分,或 Variables 里的 `BITABLE_TABLE_ID` |
+| 飞书 App ID(`FEISHU_APP_ID`) | Variables 里的 `FEISHU_APP_ID`,或飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 |
+| 本地飞书 App Secret | 只用于 CLI 直连飞书:飞书开放平台同一页的 App Secret;写入本机钥匙串 `security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。线上那一份是 Cloudflare secret,读不回明文,也**不需要**重建 |
+
+> 从「知识库 / Wiki」里打开多维表格时,地址栏是 `/wiki/…`,取不到 `bascn…` / `tbl…`。
+> 这种情况请用 Cloudflare 里那个 Worker 的 Variables,或在飞书里把该表从知识库中单独打开一次。
+> `adopt` 在提问前会把上面这些取法逐条打印出来,不用回来翻文档。
 
 ## 子命令(等价能力)
 
