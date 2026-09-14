@@ -32,7 +32,8 @@ work, and upload the rest.
 - An OpenAI-compatible LLM endpoint (defaults to DeepSeek).
 - `zstd` (`brew install zstd`) only if you want DeepSeek Harness sessions collected; macOS
   does not ship it. Without it the other two sources still work and the report says so.
-- No system Python is required: the released engine is a self-contained PyInstaller binary.
+- No system Python is required: the engine ships inside the app (and the standalone release
+  asset is a self-contained PyInstaller binary).
 
 ## Install
 
@@ -45,6 +46,10 @@ it works straight from the disk image.
 
 The release is Developer ID signed, notarized by Apple and stapled, so Gatekeeper accepts it
 offline. On first launch, open the menu-bar icon → **设置** and fill in the LLM API key.
+
+The app ships its engine as a directory build, so each menu action does not pay an unpack
+cost. The only slow moment is the very first engine start after installing, while macOS
+validates the bundled binaries for the first time; afterwards the app answers immediately.
 
 ### Option 2: install script
 

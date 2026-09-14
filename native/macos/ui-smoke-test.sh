@@ -29,4 +29,18 @@ echo "== headless outcome mapping self-test =="
 "$BIN" --self-test
 
 echo
+echo "== bundled engine resolution =="
+# 发布版的引擎装在 Contents/Resources/engine(onedir)。放一个占位可执行文件,
+# 断言 App 优先选它 —— 选错就会退回旧的 onefile 布局,启动又要几秒。
+ENGINE="$OUT/Contents/Resources/engine/daily-agent-digest"
+mkdir -p "$(dirname "$ENGINE")"
+printf '#!/bin/sh\nexit 0\n' > "$ENGINE"
+chmod +x "$ENGINE"
+RESOLVED=$("$BIN" --engine-path)
+case "$RESOLVED" in
+  */Contents/Resources/engine/daily-agent-digest) echo "engine=$RESOLVED" ;;
+  *) echo "smoke: App 没有优先使用包内 onedir 引擎 -> $RESOLVED" >&2; exit 1 ;;
+esac
+
+echo
 echo "ui smoke test passed"

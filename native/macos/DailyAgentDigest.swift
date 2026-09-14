@@ -61,12 +61,14 @@ final class Backend {
     static let defaultTimeout: TimeInterval = 60
     static let generateTimeout: TimeInterval = 600
     init() {
-        // 优先用 App 包内的引擎(DMG 安装后开箱即用);其次环境变量(开发版);
+        // 优先用 App 包内的 onedir 引擎:它随包分发、启动无需解包,是发布版的默认布局。
+        // 发布版此前装的是 PyInstaller onefile,每次调用都要把 20MB 解开再重新 exec 自己,
+        // 单次启动实测 3-6 秒,而窗口/菜单动作每次都要新起一个进程。
+        // 其后是历史布局(onefile 放在 Resources 或 MacOS)、开发版环境变量,
         // 最后是 install.sh 的布局:引擎装在数据目录里。
-        // 两处都认:CI 把引擎放在 Contents/MacOS(与主程序同级,签名顺序更简单),
-        // 本地/未来布局可能放 Contents/Resources。
         let bundleRoot = Bundle.main.bundleURL
         let bundledCandidates = [
+            bundleRoot.appendingPathComponent("Contents/Resources/engine/daily-agent-digest").path,
             bundleRoot.appendingPathComponent("Contents/Resources/daily-agent-digest").path,
             bundleRoot.appendingPathComponent("Contents/MacOS/daily-agent-digest").path,
         ]
@@ -507,13 +509,63 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
                 self.status.stringValue = wasExcluded
                     ? "已恢复该主题，其内容已回到工作总结。"
                     : "已排除该主题，其标题与内容已从工作总结中移除。"
+                // 排除了内容 = 报告变了:让自动 tick 重新生效,当天 18:00 后会自动重新提交
+                NotificationCenter.default.post(name: .digestReportChanged, object: nil)
             }
         }
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+extension Notification.Name {
+    /// 报告内容发生变化(排除/恢复/重新生成),用于重新放开自动 tick。
+    static let digestReportChanged = Notification.Name("digestReportChanged")
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let backend=Backend(); var statusItem:NSStatusItem!; var report:ReportController!; var timer:Timer!; var progressPanel:NSPanel?; var generationBackgrounded=false
+    /// 自动 tick 的节流状态:上一次真正调用引擎的时间,以及已确认提交成功的日期。
+    var lastTickAt:Date?; var submittedTickDay:String?
+
+    /// 自动窗口:17:30 之前什么都不用做(引擎自己也是这个门限)。
+    static let tickWindowStartMinute = 17 * 60 + 30
+    /// 未提交成功时最短重试间隔:失败/未配置都可以再试,但不再每分钟一次。
+    static let tickRetryInterval: TimeInterval = 15 * 60
+
+    /// 报告时区固定 UTC+8(与引擎的 TZ 一致),否则"今天"会在两边错开。
+    static let reportTimeZone = TimeZone(identifier: "Asia/Shanghai") ?? TimeZone(secondsFromGMT: 8 * 3600)!
+    static func calendar() -> Calendar {
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = reportTimeZone; return cal
+    }
+    static func dayKey(_ date: Date) -> String {
+        let c = calendar().dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// 纯函数:这一分钟到底该不该调用引擎。抽出来是为了能在 --self-test 里断言,
+    /// 因为它决定了"自动出报/自动提交"是否还会发生。
+    static func tickDue(now: Date, lastTickAt: Date?, submittedDay: String?) -> Bool {
+        let cal = calendar()
+        let minute = cal.component(.hour, from: now) * 60 + cal.component(.minute, from: now)
+        guard minute >= tickWindowStartMinute else { return false }
+        if submittedDay == dayKey(now) { return false }
+        if let last = lastTickAt, now.timeIntervalSince(last) < tickRetryInterval { return false }
+        return true
+    }
+
+    /// 到点就记账并返回 true(真正的引擎调用由调用方发起)。
+    func tickIfDue(now: Date = Date()) -> Bool {
+        guard AppDelegate.tickDue(now: now, lastTickAt: lastTickAt, submittedDay: submittedTickDay) else { return false }
+        lastTickAt = now
+        return true
+    }
+
+    /// 报告内容变了(排除/恢复/重新生成)就重新放开自动 tick:
+    /// 引擎会把状态置回 ready/stale,18:00 之后应当自动重新提交,否则"当天改完不算数"。
+    func rearmAutoTick() {
+        submittedTickDay = nil
+        lastTickAt = nil
+        DebugLog.write("auto tick re-armed")
+    }
     func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image = {
             // 菜单栏用从 App 图标派生的单色 Template 图标;取不到再回退系统符号
             if let url = Bundle.main.url(forResource: "MenuBarIconTemplate", withExtension: "png"),
@@ -522,11 +574,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return image
             }
             return NSImage(systemSymbolName: "checklist", accessibilityDescription: "Daily Agent Digest")
-        }(); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"开机自启", action:#selector(toggleLoginItem), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); ensureLoginItem(); let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
+        }(); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"开机自启", action:#selector(toggleLoginItem), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); ensureLoginItem(); NotificationCenter.default.addObserver(forName: .digestReportChanged, object: nil, queue: .main) { [weak self] _ in self?.rearmAutoTick() }; let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
+              // 每分钟都起一个引擎进程是纯粹的浪费(实测每次启动秒级):只有进入当天
+              // 自动窗口后才调用,且提交成功后当天不再调用。是否该调用由纯函数决定,
+              // 便于 --self-test 断言。
+              guard let self = self, self.tickIfDue() else { return }
               // tick 可能触发完整的 LLM 生成(实测 40s+,超时更久):默认 60s 会被 watchdog
               // 杀掉,state 不落盘、下一分钟重试再被杀,自动出报可能永远失败。
-              self?.backend.call("tick", [:], timeout: Backend.generateTimeout) { obj in
+              self.backend.call("tick", [:], timeout: Backend.generateTimeout) { [weak self] obj in
                   if let error = obj["error"] as? String { DebugLog.write("tick failed: \(error)") }
+                  else if obj["submit_status"] as? String == "submitted" {
+                      self?.submittedTickDay = AppDelegate.dayKey(Date())
+                      DebugLog.write("tick submitted, no further tick today")
+                  }
               }
           }; RunLoop.main.add(tickTimer,forMode:.common); timer=tickTimer; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_AUTOGENERATE"] == "1" { DebugLog.write("auto generate requested by DIGEST_DEBUG_AUTOGENERATE"); self.perform(#selector(self.generate), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWREPORT"] == "1" { DebugLog.write("report window requested by DIGEST_DEBUG_SHOWREPORT"); self.perform(#selector(self.show), with: nil, afterDelay: 1.0) }; if ProcessInfo.processInfo.environment["DIGEST_DEBUG_SHOWABOUT"] == "1" { DebugLog.write("about requested by DIGEST_DEBUG_SHOWABOUT"); self.perform(#selector(self.about), with: nil, afterDelay: 1.0) } }
     @objc func show(){
@@ -581,6 +641,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.report.refresh()
                 } else {
                     self.report.refresh()
+                    // 新生成的报告应当能自动提交,所以重新放开 tick 门控。
+                    self.rearmAutoTick()
                     // Hop so the finishing block returns before the alert takes
                     // over the main queue.
                     DispatchQueue.main.async { self.presentGenerationResult(state) }
@@ -703,18 +765,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func about(){
-        // 弹窗只给一个版本号;其余(引擎/报告版本、路径)仅写调试日志。
-        backend.call("settings") { [weak self] info in
-            guard let self = self else { return }
-            let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-            DebugLog.write("about shown app=\(appVersion) engine=\(info["release_version"] ?? "unknown") report=\(self.report.stateRelease) enginePath=\(self.backend.executable)")
-            let alert = NSAlert()
-            alert.messageText = "当前版本:\(appVersion)"
-            alert.addButton(withTitle: "检查最新版本")
-            alert.addButton(withTitle: "关闭")
-            if self.presentAlert(alert) == .alertFirstButtonReturn {
-                self.checkLatestVersion(current: appVersion)
-            }
+        // 只弹一个版本号。此前这里还起了一个引擎进程,只为往调试日志里写一行引擎版本 ——
+        // 引擎启动是秒级开销,而版本号在 state 里已经有缓存。
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        DebugLog.write("about shown app=\(appVersion) report=\(report.stateRelease) enginePath=\(backend.executable)")
+        let alert = NSAlert()
+        alert.messageText = "当前版本:\(appVersion)"
+        alert.addButton(withTitle: "检查最新版本")
+        alert.addButton(withTitle: "关闭")
+        if self.presentAlert(alert) == .alertFirstButtonReturn {
+            self.checkLatestVersion(current: appVersion)
         }
     }
 
@@ -743,60 +803,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsPanel: NSPanel?
     private var settingsFields: [String: NSTextField] = [:]
     private var settingsStatus: NSTextField?
+    /// 上一次从引擎读到的配置。设置窗口用它**立即**出现:以前窗口是在引擎返回之后
+    /// 才创建的,引擎启动要几秒,用户点完「设置」会先看到几秒毫无反应。
+    private var settingsCache: [String: Any]?
+    /// 建框时各输入框的初值:读取结果回来时只覆盖"用户没动过"的字段。
+    private var settingsBaseline: [String: String] = [:]
+    private var settingsLoading = false
 
     @objc func settings(){
         if let existing = settingsPanel { existing.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        presentSettingsPanel(settingsCache)
+        refreshSettingsFromEngine()
+    }
+
+    /// 立刻把窗口画出来:有缓存就用缓存值,没有就先留空并提示正在读取。
+    private func presentSettingsPanel(_ values: [String: Any]?) {
+        let width: CGFloat = 560, height: CGFloat = 320
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = "日报设置"
+        panel.isReleasedWhenClosed = false
+        // 红叉关闭也要走同一套清理:此前只有「关闭」按钮会清空引用,
+        // 红叉关掉后引用还在,下次点「设置」走的是另一条分支,快慢不一致。
+        panel.delegate = self
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        var fields: [String: NSTextField] = [:]
+        var baseline: [String: String] = [:]
+        func addField(_ label: String, _ key: String, _ y: CGFloat) {
+            let caption = NSTextField(labelWithString: label)
+            caption.frame = NSRect(x: 20, y: y + 4, width: 110, height: 22)
+            caption.alignment = .right
+            content.addSubview(caption)
+            let value = values?[key] as? String ?? ""
+            let input = NSTextField(string: value)   // 明文:便于核对是否粘贴成功
+            input.frame = NSRect(x: 140, y: y, width: width - 170, height: 26)
+            content.addSubview(input)
+            fields[key] = input
+            baseline[key] = value
+        }
+        addField("LLM Base URL", "base_url", 274)
+        addField("Model", "model", 238)
+        addField("LLM API Key", "api_key", 202)
+        addField("提交地址", "submit_url", 166)
+        addField("提交 API Key", "submit_api_key", 130)
+
+        let status = NSTextField(labelWithString: "")
+        status.frame = NSRect(x: 20, y: 88, width: width - 40, height: 36)
+        status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byWordWrapping
+        status.maximumNumberOfLines = 2
+        content.addSubview(status)
+
+        func addButton(_ title: String, _ action: Selector, _ x: CGFloat, _ w: CGFloat) {
+            let b = NSButton(title: title, target: self, action: action)
+            b.frame = NSRect(x: x, y: 22, width: w, height: 32)
+            b.bezelStyle = .rounded
+            content.addSubview(b)
+        }
+        addButton("保存", #selector(saveSettingsFromPanel), 20, 100)
+        addButton("测试连接", #selector(testConnectionFromPanel), 130, 110)
+        addButton("关闭", #selector(closeSettingsPanel), width - 120, 100)
+
+        panel.contentView = content
+        settingsPanel = panel
+        settingsFields = fields
+        settingsBaseline = baseline
+        settingsStatus = status
+        if settingsCache == nil {
+            status.stringValue = "正在读取当前配置…"
+        } else {
+            setSettingsStatus("改完点「保存」；「测试连接」只测试当前输入,不会自动保存。", .secondaryLabelColor)
+        }
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        DebugLog.write("settings panel shown cached=\(settingsCache != nil)")
+    }
+
+    private func setSettingsStatus(_ text: String, _ color: NSColor) {
+        settingsStatus?.stringValue = text
+        settingsStatus?.textColor = color
+    }
+
+    /// 后台读一次真实配置。在途保护:面板未出现时连点「设置」不再并发拉起多个引擎进程。
+    private func refreshSettingsFromEngine() {
+        guard !settingsLoading else {
+            setSettingsStatus("正在读取当前配置…", .secondaryLabelColor)
+            return
+        }
+        settingsLoading = true
         backend.call("settings") { [weak self] current in
             guard let self = self else { return }
-            let width: CGFloat = 560, height: CGFloat = 320
-            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
-                                styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            panel.title = "日报设置"
-            panel.isReleasedWhenClosed = false
-            let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-
-            var fields: [String: NSTextField] = [:]
-            func addField(_ label: String, _ key: String, _ value: String, _ y: CGFloat) {
-                let caption = NSTextField(labelWithString: label)
-                caption.frame = NSRect(x: 20, y: y + 4, width: 110, height: 22)
-                caption.alignment = .right
-                content.addSubview(caption)
-                let input = NSTextField(string: value)   // 明文:便于核对是否粘贴成功
-                input.frame = NSRect(x: 140, y: y, width: width - 170, height: 26)
-                content.addSubview(input)
-                fields[key] = input
+            self.settingsLoading = false
+            if let error = current["error"] as? String {
+                self.setSettingsStatus("读取配置失败：\(error)", .systemRed)
+                return
             }
-            addField("LLM Base URL", "base_url", current["base_url"] as? String ?? "", 274)
-            addField("Model", "model", current["model"] as? String ?? "", 238)
-            addField("LLM API Key", "api_key", current["api_key"] as? String ?? "", 202)
-            addField("提交地址", "submit_url", current["submit_url"] as? String ?? "", 166)
-            addField("提交 API Key", "submit_api_key", current["submit_api_key"] as? String ?? "", 130)
+            self.settingsCache = current
+            self.applySettingsToFields(current)
+            self.setSettingsStatus("改完点「保存」；「测试连接」只测试当前输入,不会自动保存。", .secondaryLabelColor)
+        }
+    }
 
-            let status = NSTextField(labelWithString: "改完点「保存」；「测试连接」只测试当前输入,不会自动保存。")
-            status.frame = NSRect(x: 20, y: 88, width: width - 40, height: 36)
-            status.textColor = .secondaryLabelColor
-            status.lineBreakMode = .byWordWrapping
-            status.maximumNumberOfLines = 2
-            content.addSubview(status)
-
-            func addButton(_ title: String, _ action: Selector, _ x: CGFloat, _ w: CGFloat) {
-                let b = NSButton(title: title, target: self, action: action)
-                b.frame = NSRect(x: x, y: 22, width: w, height: 32)
-                b.bezelStyle = .rounded
-                content.addSubview(b)
-            }
-            addButton("保存", #selector(saveSettingsFromPanel), 20, 100)
-            addButton("测试连接", #selector(testConnectionFromPanel), 130, 110)
-            addButton("关闭", #selector(closeSettingsPanel), width - 120, 100)
-
-            panel.contentView = content
-            self.settingsPanel = panel
-            self.settingsFields = fields
-            self.settingsStatus = status
-            panel.center()
-            panel.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            DebugLog.write("settings panel shown")
+    /// 只覆盖用户没改过的字段:读取期间敲进去的内容不能被回来结果冲掉。
+    private func applySettingsToFields(_ current: [String: Any]) {
+        for (key, field) in settingsFields {
+            guard field.stringValue == (settingsBaseline[key] ?? "") else { continue }
+            guard let value = current[key] as? String else { continue }
+            field.stringValue = value
+            settingsBaseline[key] = value
         }
     }
 
@@ -810,36 +926,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         backend.call("save-settings", settingsPayload()) { [weak self] result in
             guard let self = self else { return }
             if let error = result["error"] as? String {
-                self.settingsStatus?.stringValue = "保存失败：\(error)"
-                self.settingsStatus?.textColor = .systemRed
+                self.setSettingsStatus("保存失败：\(error)", .systemRed)
             } else {
-                self.settingsStatus?.stringValue = "已保存。之后提交会自动复用这份配置。"
-                self.settingsStatus?.textColor = .systemGreen
+                // save-settings 返回落盘后的完整配置,顺手刷新缓存与基线。
+                self.settingsCache = result
+                self.settingsBaseline = self.settingsFields.mapValues { $0.stringValue }
+                self.setSettingsStatus("已保存。之后提交会自动复用这份配置。", .systemGreen)
             }
         }
     }
 
     @objc func testConnectionFromPanel() {
-        settingsStatus?.stringValue = "正在测试…"
-        settingsStatus?.textColor = .secondaryLabelColor
+        setSettingsStatus("正在测试…", .secondaryLabelColor)
         // 只测当前输入(不落盘):测试失败也不会污染已保存的配置
         backend.call("check-submit", settingsPayload()) { [weak self] result in
             guard let self = self else { return }
             if let error = result["error"] as? String {
-                self.settingsStatus?.stringValue = "连接失败：\(error)"
-                self.settingsStatus?.textColor = .systemRed
+                self.setSettingsStatus("连接失败：\(error)", .systemRed)
             } else {
                 let member = result["member"] as? String ?? "未知"
-                self.settingsStatus?.stringValue = "连接成功：服务端识别为「\(member)」。确认无误后点「保存」。"
-                self.settingsStatus?.textColor = .systemGreen
+                self.setSettingsStatus("连接成功：服务端识别为「\(member)」。确认无误后点「保存」。", .systemGreen)
             }
         }
     }
 
     @objc func closeSettingsPanel() {
-        settingsPanel?.close()
+        settingsPanel?.close()   // 清理统一交给 windowWillClose
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === settingsPanel else { return }
         settingsPanel = nil
         settingsFields = [:]
+        settingsBaseline = [:]
         settingsStatus = nil
     }
 
@@ -983,6 +1102,32 @@ enum SelfTest {
         } else {
             print("PASS short text measures one line -> \(shortHeight)pt")
         }
+
+        // 自动 tick 门控:改坏了就等于"自动出报/自动提交"静默失效,或者又变回每分钟空转。
+        let cal = AppDelegate.calendar()
+        func at(_ day: String, _ hour: Int, _ minute: Int) -> Date {
+            let parts = day.split(separator: "-").compactMap { Int($0) }
+            var c = DateComponents()
+            c.year = parts[0]; c.month = parts[1]; c.day = parts[2]; c.hour = hour; c.minute = minute
+            return cal.date(from: c) ?? Date()
+        }
+        let today = "2026-09-14"
+        let tickCases: [(String, Date, Date?, String?, Bool)] = [
+            ("before the window nothing happens", at(today, 9, 0), nil, nil, false),
+            ("17:29 still nothing", at(today, 17, 29), nil, nil, false),
+            ("17:30 opens the window", at(today, 17, 30), nil, nil, true),
+            ("a second call one minute later is throttled", at(today, 17, 31), at(today, 17, 30), nil, false),
+            ("retry allowed after the interval", at(today, 17, 46), at(today, 17, 30), nil, true),
+            ("already submitted today stops ticking", at(today, 19, 0), nil, today, false),
+            ("a new day ticks again", at("2026-09-15", 17, 30), at(today, 17, 30), today, true),
+        ]
+        let wrongTicks = tickCases.filter { AppDelegate.tickDue(now: $0.1, lastTickAt: $0.2, submittedDay: $0.3) != $0.4 }
+        if wrongTicks.isEmpty {
+            print("PASS auto tick gate opens only in the daily window and throttles retries")
+        } else {
+            passed = false
+            print("FAIL auto tick gate wrong for \(wrongTicks.map { $0.0 })")
+        }
         return passed
     }
 }
@@ -1004,6 +1149,13 @@ if CommandLine.arguments.contains("--check-version") {
     _ = semaphore.wait(timeout: .now() + 20)
     print(output)
     exit(output.hasPrefix("检查失败") ? 1 : 0)
+}
+
+if CommandLine.arguments.contains("--engine-path") {
+    // 无头输出实际会使用的引擎路径:打包方式换过几次(onedir / onefile / 数据目录),
+    // 这条命令让 CI 与冒烟测试能直接断言 App 选中的到底是哪一个。
+    print(Backend().executable)
+    exit(FileManager.default.isExecutableFile(atPath: Backend().executable) ? 0 : 1)
 }
 
 if CommandLine.arguments.contains("--self-test") {

@@ -64,6 +64,11 @@ if [ "$(uname -s)" = Darwin ]; then
     }
     xcrun stapler validate "$app" >/dev/null 2>&1 || { echo "DMG 内 App 的装订票据校验失败: $name" >&2; exit 1; }
     [ -L "$mount/Applications" ] || { echo "DMG 缺少拖拽用的 Applications 快捷方式: $name" >&2; exit 1; }
+    # 包内引擎必须是 onedir 目录版:单文件版每次调用都要解包再重新 exec,
+    # App 的每个菜单动作都会因此慢上几秒(这正是用户报告的"设置窗口很慢")。
+    engine="$app/Contents/Resources/engine/daily-agent-digest"
+    [ -x "$engine" ] || { echo "DMG 内的 App 没有包内引擎: $name" >&2; exit 1; }
+    [ -d "$(dirname "$engine")/_internal" ] || { echo "包内引擎不是 onedir 布局(会退回每次解包的慢启动): $name" >&2; exit 1; }
     hdiutil detach "$mount" -quiet
     mount=''
   done
