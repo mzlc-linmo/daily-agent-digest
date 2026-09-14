@@ -180,8 +180,6 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         status.textColor = .secondaryLabelColor
         status.frame = NSRect(x: 28, y: 24, width: 804, height: 24)
         view.addSubview(status)
-        upload.target = self; upload.action = #selector(submitNow)
-        upload.bezelStyle = .rounded
         view.addSubview(upload)
 
         let w = NSWindow(contentRect: view.bounds, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -189,6 +187,8 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         w.minSize = NSSize(width: 760, height: 620)
         w.title = "今日工作日报"
         super.init(window: w)
+        upload.target = self; upload.action = #selector(submitNow)
+        upload.bezelStyle = .rounded
         table.dataSource = self
         table.delegate = self
         w.delegate = self
