@@ -33,7 +33,10 @@ work, and export the rest.
 - macOS 15 or newer (Apple Silicon or Intel).
 - An OpenAI-compatible LLM endpoint (defaults to DeepSeek).
 - `zstd` (`brew install zstd`) only if you want DeepSeek Harness sessions collected; macOS
-  does not ship it. Without it the other two sources still work and the report says so.
+  does not ship it. The engine looks for it in `PATH` **and** in the usual install locations
+  (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/anaconda3/bin`, `~/.local/bin`), because an app
+  launched from Finder or a login item does not inherit your shell's `PATH` — set `DIGEST_ZSTD`
+  to override. Without it the other sources still work and the report says so in its warnings.
 - No system Python is required: the engine ships inside the app (and the standalone release
   asset is a self-contained PyInstaller binary).
 

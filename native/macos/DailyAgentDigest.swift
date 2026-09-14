@@ -77,10 +77,30 @@ final class Backend {
             ?? DigestPaths.dataDirectory + "/daily-agent-digest"
         DebugLog.write("backend executable=\(executable)")
     }
+    /// 引擎需要的工具目录。从 Finder / 登录项启动的 App,PATH 只有系统默认值
+    /// (`launchctl getenv PATH` 为空),brew 与 anaconda 里的 zstd 等命令都找不到 ——
+    /// 表现就是"当天没干活"。这里与 install.sh 写给 launchd 的 PATH 保持一致。
+    static let extraToolPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/anaconda3/bin", "/opt/conda/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+    /// 纯函数便于自测:把已有 PATH 与常见工具目录合并(去重、保序)。
+    static func mergePath(_ current: String) -> String {
+        var seen = Set<String>()
+        return (current.split(separator: ":").map(String.init) + extraToolPaths)
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+            .joined(separator: ":")
+    }
+
+    static func childEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = mergePath(env["PATH"] ?? "")
+        return env
+    }
+
     func call(_ command: String, _ input: [String: Any] = [:], timeout: TimeInterval = Backend.defaultTimeout, completion: @escaping ([String: Any]) -> Void) {
         DebugLog.write("backend call command=\(command) input_keys=\(input.keys.sorted()) timeout=\(Int(timeout))s")
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process(); p.executableURL = URL(fileURLWithPath: self.executable); p.arguments = ["--app-command", command]
+            p.environment = Backend.childEnvironment()
             let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
             p.standardInput = stdin; p.standardOutput = stdout; p.standardError = stderr
             let timedOut = Flag()
@@ -1359,6 +1379,22 @@ enum SelfTest {
             print("FAIL short text should measure about one line -> \(shortHeight)")
         } else {
             print("PASS short text measures one line -> \(shortHeight)pt")
+        }
+
+        // 引擎子进程的 PATH:从 Finder 启动时只有 /usr/bin:/bin,必须补上 brew/anaconda,
+        // 否则 zstd 找不到、DSH 会话静默丢失。
+        let minimal = Backend.mergePath("/usr/bin:/bin")
+        let pathChecks = [
+            minimal.contains("/opt/homebrew/bin"),
+            minimal.contains("/opt/anaconda3/bin"),
+            minimal.hasPrefix("/usr/bin:/bin"),
+            Backend.mergePath(minimal) == minimal,      // 幂等
+        ]
+        if pathChecks.allSatisfy({ $0 }) {
+            print("PASS engine child PATH keeps the caller's entries and adds tool locations")
+        } else {
+            passed = false
+            print("FAIL engine child PATH wrong: \(minimal)")
         }
 
         // Markdown 导出:只含计入的条目、编号连续、页脚统计与条目一致。

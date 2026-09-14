@@ -387,11 +387,12 @@ def read_jsonl(path, provider, start, end, stats, out, include_process):
 
 def dsh(root, start, end):
     stats = new_stats(); out = []; include = keep_process()
-    if not zstd_available():
-        stats['zstd_missing'] = 'zstd 未安装,无法解压 .dsh 会话(brew install zstd)'
+    zstd = zstd_binary()
+    if not zstd:
+        stats['zstd_missing'] = '未找到 zstd,无法解压 .dsh 会话(brew install zstd,或用 DIGEST_ZSTD 指定路径)'
         return dedupe(out), stats
     for f in (root/'.dsh/sessions').glob('**/*.zstd'):
-        try: raw = subprocess.check_output(['zstd','-dc',str(f)], stderr=subprocess.DEVNULL, text=True)
+        try: raw = subprocess.check_output([zstd,'-dc',str(f)], stderr=subprocess.DEVNULL, text=True)
         except (OSError, subprocess.CalledProcessError): continue
         for i, line in enumerate(raw.splitlines()):
             try: obj = json.loads(line)
@@ -409,11 +410,34 @@ def pi(root, start, end):
         read_jsonl(f, 'pi', start, end, stats, out, include)
     return dedupe(out), stats
 
-def zstd_available():
-    """zstd 不是 macOS 自带命令(通常来自 brew/anaconda)。
-    缺失时 dsh 会话无法解压 —— 必须让这件事**可见**,否则用户只会看到"今天没干活"。"""
+# zstd 不是 macOS 自带命令。**只查 PATH 是不够的**:从 Finder / 登录项启动的 App
+# 拿不到 shell 的 PATH(launchctl getenv PATH 为空),于是 brew(/opt/homebrew/bin)与
+# anaconda(/opt/anaconda3/bin)里的 zstd 全都看不见 —— 表现为"今天没干活"。
+# 所以除 PATH 外,再按常见绝对路径找一遍。
+ZSTD_CANDIDATES = (
+    '/opt/homebrew/bin/zstd',
+    '/usr/local/bin/zstd',
+    '/opt/anaconda3/bin/zstd',
+    '/opt/local/bin/zstd',
+    '/usr/bin/zstd',
+    str(Path.home()/'.local/bin/zstd'),
+)
+
+def zstd_binary():
+    """返回可用的 zstd 路径,找不到返回 None。顺序:显式配置 → PATH → 常见绝对路径。"""
+    override=(os.getenv('DIGEST_ZSTD') or '').strip()
+    if override:
+        return override if Path(override).exists() else None
     from shutil import which
-    return which('zstd') is not None
+    found=which('zstd')
+    if found: return found
+    for candidate in ZSTD_CANDIDATES:
+        if Path(candidate).exists(): return candidate
+    return None
+
+def zstd_available():
+    """zstd 缺失时 dsh 会话无法解压 —— 必须让这件事**可见**,否则用户只会看到"今天没干活"。"""
+    return zstd_binary() is not None
 
 
 def open_sqlite_readonly(path):

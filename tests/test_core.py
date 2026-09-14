@@ -240,6 +240,51 @@ class GenerateTests(unittest.TestCase):
         self.assertTrue(state['warnings'], '必须把原因暴露给界面')
         self.assertTrue(any('未做主题归并' in w for w in state['warnings']), state['warnings'])
 
+    def test_zstd_is_found_without_relying_on_path(self):
+        """从 Finder 启动的 App 只有系统默认 PATH,但 brew/anaconda 里的 zstd 必须能用。"""
+        import shutil
+        real_which = shutil.which
+        real_candidates = engine.ZSTD_CANDIDATES
+        saved = os.environ.pop("DIGEST_ZSTD", None)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                fake = Path(d) / "zstd"
+                fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                fake.chmod(0o755)
+                engine.ZSTD_CANDIDATES = (str(fake),)
+                shutil.which = lambda name, *a, **k: None          # PATH 里没有
+                self.assertEqual(engine.zstd_binary(), str(fake), "PATH 找不到时必须退到绝对路径")
+                # 显式指定优先
+                os.environ["DIGEST_ZSTD"] = str(fake)
+                self.assertEqual(engine.zstd_binary(), str(fake))
+                os.environ["DIGEST_ZSTD"] = str(Path(d) / "nope")
+                self.assertIsNone(engine.zstd_binary(), "指向不存在的路径时应视为不可用")
+        finally:
+            shutil.which = real_which
+            engine.ZSTD_CANDIDATES = real_candidates
+            os.environ.pop("DIGEST_ZSTD", None)
+            if saved is not None: os.environ["DIGEST_ZSTD"] = saved
+
+    def test_dsh_sessions_are_collected_when_zstd_is_off_path(self):
+        """整条链路:PATH 里没有 zstd,但 DIGEST_ZSTD 指到了,DSH 会话就该进报告。"""
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            sessions = source / ".dsh/sessions/proj-a"; sessions.mkdir(parents=True)
+            line = json.dumps({"type": "user/message", "time": "2026-09-12T10:00:00+08:00",
+                               "seq": 1, "data": {"content": [{"type": "text", "text": "把提交改成按天覆盖。"}]}},
+                              ensure_ascii=False)
+            (sessions / "s.zstd").write_text(line + "\n", encoding="utf-8")
+            # 假的 zstd:-dc <file> 原样输出(真实 zstd 的用法就是 zstd -dc file)
+            fake = Path(d) / "zstd"
+            fake.write_text('#!/bin/sh\ncat "$2"\n', encoding="utf-8")
+            fake.chmod(0o755)
+            state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)},
+                            extra_env={"PATH": "/usr/bin:/bin", "DIGEST_ZSTD": str(fake)})
+        self.assertFalse([w for w in state['warnings'] if 'zstd' in w], state['warnings'])
+        self.assertTrue(state['work_items'], 'DSH 会话应当被采集到')
+        dsh_stats = state['collect_stats']['dsh']
+        self.assertEqual(dsh_stats.get('prompt', 0), 1, dsh_stats)
+
     def test_unused_agent_is_not_reported_as_a_problem(self):
         """没用过 codex 的机器不该天天收到"未找到 codex 数据库"的告警。"""
         with tempfile.TemporaryDirectory() as d:
@@ -263,8 +308,10 @@ class GenerateTests(unittest.TestCase):
             home = Path(d) / "home"; source = Path(d) / "source"
             dsh = source / ".dsh/sessions"; dsh.mkdir(parents=True)
             (dsh / "x.zstd").write_bytes(b"not really zstd")
+            # zstd 现在还会按绝对路径找(brew/anaconda),所以"机器上没有"要用
+            # DIGEST_ZSTD 指向一个不存在的路径来模拟。
             state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)},
-                            extra_env={"PATH": "/usr/bin:/bin"})
+                            extra_env={"PATH": "/usr/bin:/bin", "DIGEST_ZSTD": str(Path(d) / "missing-zstd")})
         self.assertTrue(any('zstd' in w for w in state['warnings']), state['warnings'])
 
     def test_unclassified_report_is_refused_by_submit(self):
