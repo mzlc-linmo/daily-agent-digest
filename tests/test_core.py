@@ -222,6 +222,72 @@ class ExclusionIsArrayFilterTests(unittest.TestCase):
 
 
 class GenerateTests(unittest.TestCase):
+    def test_unclassified_report_is_an_error_and_says_why(self):
+        """没配置 LLM 时报告只有"按来源分组"的占位内容。
+
+        以前这种情况 report_status 仍是 ready、last_error 为空 —— 界面与 Markdown 都会
+        把它当成一份正常的日报(用户实际遇到的正是这个)。现在必须显式失败并给出原因,
+        同时保留占位条目,至少还能看出当天有哪些来源有会话。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            sessions = source / ".pi/agent/sessions"; sessions.mkdir(parents=True)
+            (sessions / "s.jsonl").write_text(pi_line("user", "重构采集器并补测试。", 0, "2026-09-12T10:00:00+08:00") + "\n", encoding="utf-8")
+            state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
+        self.assertEqual(state['report_status'], 'error', '未归并的报告不得显示为成功')
+        self.assertIn('未配置 LLM', state['last_error'])
+        self.assertTrue(state['work_items'], '占位条目仍要保留,便于看出哪些来源有会话')
+        self.assertTrue(state['warnings'], '必须把原因暴露给界面')
+        self.assertTrue(any('未做主题归并' in w for w in state['warnings']), state['warnings'])
+
+    def test_unused_agent_is_not_reported_as_a_problem(self):
+        """没用过 codex 的机器不该天天收到"未找到 codex 数据库"的告警。"""
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            sessions = source / ".pi/agent/sessions"; sessions.mkdir(parents=True)
+            (sessions / "s.jsonl").write_text(pi_line("user", "随便做点事。", 0, "2026-09-12T10:00:00+08:00") + "\n", encoding="utf-8")
+            state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
+        self.assertFalse([w for w in state['warnings'] if 'codex' in w], state['warnings'])
+        # 但目录在、库不在时要提醒
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            (source / ".codex").mkdir(parents=True)
+            sessions = source / ".pi/agent/sessions"; sessions.mkdir(parents=True)
+            (sessions / "s.jsonl").write_text(pi_line("user", "随便做点事。", 0, "2026-09-12T10:00:00+08:00") + "\n", encoding="utf-8")
+            state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
+        self.assertTrue([w for w in state['warnings'] if 'codex' in w], state['warnings'])
+
+    def test_missing_zstd_is_reported_as_a_warning(self):
+        """zstd 不在 PATH 上时 DSH 会话收不到 —— 必须在 warnings 里说出来,不能静默少一个来源。"""
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"; source = Path(d) / "source"
+            dsh = source / ".dsh/sessions"; dsh.mkdir(parents=True)
+            (dsh / "x.zstd").write_bytes(b"not really zstd")
+            state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)},
+                            extra_env={"PATH": "/usr/bin:/bin"})
+        self.assertTrue(any('zstd' in w for w in state['warnings']), state['warnings'])
+
+    def test_unclassified_report_is_refused_by_submit(self):
+        """未完成主题归并的日报不得被上传:那等于把占位内容当成日报发出去。"""
+        server = StubSubmitService({"mode": "created"})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                state = {"schema_version": "1.2", "date": today(), "report_status": "error",
+                         "last_error": "未配置 LLM(LLM_BASE_URL / LLM_API_KEY / LLM_MODEL)",
+                         "work_items": [item("待归并记录")],
+                         "report_chars": 0, "included_count": 0, "excluded_count": 0,
+                         "submit_status": None, "submit_error": None}
+                engine.recount_report(state)
+                (home / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                result = command(home, "submit", {"date": today()},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+        finally:
+            server.stop()
+        self.assertEqual(result["submit_status"], "failed")
+        self.assertIn("拒绝上报", result["submit_error"])
+        self.assertNotEqual(result["report_status"], "submitted")
+
     def test_generate_returns_items_with_titles_and_bodies_within_the_limit(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d) / "home"; source = Path(d) / "source"
@@ -233,7 +299,8 @@ class GenerateTests(unittest.TestCase):
                                      "2026-09-12T10:%02d:00+08:00" % (i % 60)))
             (sessions / "session-a.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
             state = command(home, 'generate', {'date': '2026-09-12', 'source_root': str(source)})
-            self.assertEqual(state['report_status'], 'ready', state.get('last_error'))
+            # 这个测试不给 LLM 配置,所以状态是"未归并"(见上面那条测试);这里只关心
+            # 条目的形状与字数预算,与归并是否成功无关。
             self.assertTrue(state['work_items'])
             self.assertNotIn('summary', state, "报告就是工作项列表,没有单独的叙述字段")
             for entry in state['work_items']:

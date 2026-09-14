@@ -149,6 +149,11 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     var stateRelease = "unknown"
     var stateUIBuild = "unknown"
     var stateChars = 0
+    /// 引擎给出的"这份日报为什么可能不完整"(未归并、缺 zstd、采集器报错…)。
+    /// 以前这些只躺在 state 里,界面不显示,于是缺来源/没归并的报告看起来完全正常。
+    var stateWarnings: [String] = []
+    let warning = NSTextField(labelWithString: "")
+    static let warningFont = NSFont.systemFont(ofSize: 12)
     /// Markdown 文档面板(非模态:可以一边看文档一边在报告窗口里排除条目后重新导出)
     var markdownPanel: NSPanel?
     var markdownView: NSTextView?
@@ -205,6 +210,12 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         tableScroll.documentView = table
         view.addSubview(tableScroll)
 
+        warning.font = ReportController.warningFont
+        warning.textColor = .systemOrange
+        warning.lineBreakMode = .byWordWrapping
+        warning.maximumNumberOfLines = 4
+        view.addSubview(warning)
+
         status.font = NSFont.systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
         status.frame = NSRect(x: 28, y: 24, width: 804, height: 24)
@@ -249,6 +260,8 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
             self.stateRelease = obj["release_version"] as? String ?? "unknown"
             self.stateUIBuild = Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") as? String ?? "unknown"
             self.stateChars = obj["report_chars"] as? Int ?? ReportController.includedChars(items: self.items)
+            self.stateWarnings = (obj["warnings"] as? [String]) ?? []
+            self.updateWarning()
             self.renderSummary()
             self.updateMetadata()
             // 选材说明必须可见:否则"今天的日报怎么这么少"无从判断。
@@ -346,12 +359,19 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
 
         heading.frame = NSRect(x: pad, y: top - 50, width: width, height: 34)
         metadata.frame = NSRect(x: pad + 2, y: top - 78, width: width, height: 20)
-        summaryLabel.frame = NSRect(x: pad, y: top - 112, width: 200, height: 22)
+
+        // 有告警时:告警块接在元信息下面,其余内容整体下移同样的高度,
+        // 这样不会与工作总结区重叠(布局是绝对定位)。
+        let warnHeight = warningHeight(boxWidth: boxWidth)
+        let shift = warnHeight > 0 ? warnHeight + 8 : 0
+        warning.frame = NSRect(x: pad + 2, y: top - 84 - warnHeight, width: width, height: warnHeight)
+
+        summaryLabel.frame = NSRect(x: pad, y: top - 112 - shift, width: 200, height: 22)
 
         let needed = summaryTextHeight(boxWidth: boxWidth)
-        let available = max(120, top - 112 - 22 - 40 - 72 - 60)
+        let available = max(120, top - 112 - shift - 22 - 40 - 72 - 60)
         let boxHeight = min(max(needed, 120), available)
-        let boxTop = top - 118
+        let boxTop = top - 118 - shift
         summaryScroll.frame = NSRect(x: pad, y: boxTop - boxHeight, width: boxWidth, height: boxHeight)
         summary.frame = NSRect(x: 0, y: 0, width: boxWidth - 2, height: max(needed, boxHeight))
 
@@ -482,9 +502,15 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     ///
     /// 只包含**未排除**的条目,所以文档与报告窗口里看到的始终一致;
     /// 排除是纯数组过滤,这里不需要(也不应该)再问一次 LLM。
-    static func markdownDocument(items: [[String: Any]], day: String) -> String {
+    static func markdownDocument(items: [[String: Any]], day: String, warnings: [String] = []) -> String {
         let included = items.filter { ($0["excluded"] as? Bool) != true }
         var lines: [String] = ["# 今日工作日报 · \(day.isEmpty ? "未知日期" : day)", ""]
+        // 告警必须写进文档本身:导出的 Markdown 常常被直接转发出去,
+        // 不能让"未归并/缺来源"的报告看起来像一份完成的总结。
+        for text in warnings {
+            lines.append("> ⚠️ \(text)")
+        }
+        if !warnings.isEmpty { lines.append("") }
         if included.isEmpty {
             lines.append("_今天没有计入的条目。_")
             lines.append("")
@@ -510,7 +536,7 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
 
     /// 打开(或刷新)Markdown 文档面板。
     @objc func showMarkdown() {
-        let document = ReportController.markdownDocument(items: items, day: stateDay)
+        let document = ReportController.markdownDocument(items: items, day: stateDay, warnings: stateWarnings)
         if let panel = markdownPanel, let text = markdownView {
             text.string = document
             markdownStatus?.stringValue = "已按当前条目重新生成(\(document.count) 字)"
@@ -567,7 +593,7 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     }
 
     @objc func copyMarkdown() {
-        let document = markdownView?.string ?? ReportController.markdownDocument(items: items, day: stateDay)
+        let document = markdownView?.string ?? ReportController.markdownDocument(items: items, day: stateDay, warnings: stateWarnings)
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(document, forType: .string)
@@ -576,7 +602,7 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     }
 
     @objc func saveMarkdown() {
-        let document = markdownView?.string ?? ReportController.markdownDocument(items: items, day: stateDay)
+        let document = markdownView?.string ?? ReportController.markdownDocument(items: items, day: stateDay, warnings: stateWarnings)
         let save = NSSavePanel()
         save.nameFieldStringValue = "日报-\(stateDay.isEmpty ? "未生成" : stateDay).md"
         save.canCreateDirectories = true
@@ -599,6 +625,26 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         markdownPanel = nil
         markdownView = nil
         markdownStatus = nil
+    }
+
+    /// 告警文本:最多显示 3 条,避免把报告挤出窗口;完整的仍会写进 Markdown。
+    func warningText() -> String {
+        guard !stateWarnings.isEmpty else { return "" }
+        let shown = stateWarnings.prefix(3).map { "⚠️ " + $0 }
+        var lines = Array(shown)
+        if stateWarnings.count > 3 { lines.append("⚠️ 另有 \(stateWarnings.count - 3) 条提示,详见 Markdown 文档") }
+        return lines.joined(separator: "\n")
+    }
+
+    func warningHeight(boxWidth: CGFloat) -> CGFloat {
+        let text = warningText()
+        guard !text.isEmpty else { return 0 }
+        return ReportController.textHeight(text, font: ReportController.warningFont, width: boxWidth - 4)
+    }
+
+    func updateWarning() {
+        warning.stringValue = warningText()
+        DebugLog.write("report warnings=\(stateWarnings.count)")
     }
 
     /// 手动上传:把当前日报提交到服务端(定时任务之外的手动入口)。
@@ -1338,6 +1384,14 @@ enum SelfTest {
             passed = false
             print("FAIL markdown export wrong: \(mdWrong)")
         }
+        let warnedDoc = ReportController.markdownDocument(
+            items: mdItems, day: "2026-09-14", warnings: ["未做主题归并:未配置 LLM(LLM_BASE_URL / LLM_API_KEY / LLM_MODEL);以下为按来源分组的原始记录"])
+        if warnedDoc.contains("> ⚠️ 未做主题归并"), warnedDoc.contains("未配置 LLM") {
+            print("PASS markdown export carries the engine warnings")
+        } else {
+            passed = false
+            print("FAIL markdown export dropped the warnings")
+        }
         let emptyDoc = ReportController.markdownDocument(items: [], day: "")
         if emptyDoc.contains("没有计入的条目"), emptyDoc.contains("- 工作项:0 项"), emptyDoc.contains("未知日期") {
             print("PASS markdown export handles an empty report")
@@ -1452,7 +1506,10 @@ if CommandLine.arguments.contains("--markdown-demo") {
         ["title": "排查设置窗口卡顿", "desc": "定位到每次调用都要重新解包引擎,改为 onedir 后单次启动从 5 秒降到 0.07 秒。", "chars": 74, "excluded": false],
         ["title": "内部调试记录(已排除)", "desc": "这一项被排除了,不该出现在文档里。", "chars": 40, "excluded": true],
     ]
-    print(ReportController.markdownDocument(items: sample, day: "2026-09-14"), terminator: "")
+    print(ReportController.markdownDocument(
+        items: sample, day: "2026-09-14",
+        warnings: ["未做主题归并:未配置 LLM(LLM_BASE_URL / LLM_API_KEY / LLM_MODEL);以下为按来源分组的原始记录",
+                   "zstd 未安装,无法解压 .dsh 会话(brew install zstd)"]), terminator: "")
     exit(0)
 }
 

@@ -483,13 +483,49 @@ def summarize(events, day):
                     if not title: continue
                     items.append({'id':hashlib.sha256(f'{day}|{len(items)}|{title}'.encode()).hexdigest()[:16],'title':title,'desc':str(item.get('desc','') or '').strip(),'status':item.get('status','observed'),'source_task_ids':item.get('source_task_ids',[]),'excluded':False})
                 if items: payload['work_items']=items
+                else:
+                    # 模型回了但一个可用标题都没有:占位项会留在报告里,必须记下原因,
+                    # 否则这份"没归并"的报告会被当成正常日报。
+                    payload['llm_error']='LLM 没有返回可用的工作项'
+                    payload['coverage']['limitations'].append('LLM returned no usable items')
+                    debug('LLM returned no usable items')
                 payload['decisions']=parsed.get('decisions',[]); payload['blockers']=parsed.get('blockers',[]); payload['next_steps']=parsed.get('next_steps',[])
         except Exception as exc: debug(f'LLM error: {type(exc).__name__}: {exc}'); payload['llm_error']=f'{type(exc).__name__}: {exc}'; payload['coverage']['limitations'].append('LLM unavailable: '+type(exc).__name__)
+    else:
+        # 没配置 LLM 也一样:报告里只有"按来源分组的占位内容",必须说明。
+        payload['llm_error']='未配置 LLM(LLM_BASE_URL / LLM_API_KEY / LLM_MODEL)'
+        payload['coverage']['limitations'].append('LLM not configured')
+        debug('LLM not configured: report stays unclassified')
     # Enforce the budget locally too: model output is guidance, not a guarantee.
     payload['work_items'], payload['report_chars'] = fit_report(payload.get('work_items',[]))
     payload['coverage']['report_chars'] = payload['report_chars']
     payload['coverage']['report_char_limit'] = REPORT_CHAR_LIMIT
     return payload
+
+def collect_warnings(payload, collect_stats):
+    """把"这份日报为什么可能不完整"整理成给人看的一行行提示。
+
+    以前这些原因只躺在 collect_stats / coverage 里,界面完全不显示:
+    LLM 没配置、模型没返回工作项、zstd 缺失导致 DSH 会话没被采集、某个采集器报错,
+    全都会表现为一份"看起来正常"的日报(用户实际遇到的就是这种)。
+    """
+    out=[]
+    if payload.get('llm_error'):
+        out.append(f"未做主题归并:{payload['llm_error']};以下为按来源分组的原始记录")
+    for name, st in (collect_stats or {}).items():
+        if not isinstance(st, dict): continue
+        if st.get('zstd_missing'): out.append(st['zstd_missing'])
+        if st.get('db_missing'):
+            # 目录都不存在 = 这台机器根本没用过这个 agent,不是问题;
+            # 目录在、库却不在,才值得提醒(否则每台机器都会天天看到误报)。
+            db=Path(str(st['db_missing']))
+            if db.parent.is_dir(): out.append(f"未找到 {name} 的数据库:{db}")
+        if st.get('error'): out.append(f"采集 {name} 失败:{st['error']}")
+    # 去重但保序(同一个 zstd 提示可能来自多个采集器)
+    seen=set(); uniq=[]
+    for w in out:
+        if w not in seen: seen.add(w); uniq.append(w)
+    return uniq
 
 def generate(day=None, source_root=None):
     day=day or dt.datetime.now(TZ).date().isoformat(); root=Path(source_root or os.getenv('DIGEST_SOURCE_ROOT', str(Path.home()))); start,end=day_window(day); events,collect_stats=collect(root,start,end)
@@ -499,6 +535,7 @@ def generate(day=None, source_root=None):
     # 排除项不会进入上报内容,因此字数按未排除项统计。
     state['coverage_note']=context_note(payload.get('coverage',{}).get('context') or {}) if payload.get('coverage',{}).get('context') else None
     state['collect_stats']=collect_stats
+    state['warnings']=collect_warnings(payload, collect_stats)
     state=recount_report(state); write_state(state)
     return state
 
@@ -545,6 +582,14 @@ def submit(day):
     """
     state=app_state(day)
     if state.get('report_status')=='submitted': return state
+    # 只有成功归并过的日报才允许上报。否则手动点「上传」会把"按来源分组的占位内容"
+    # 当成日报送出去 —— 那比不报更糟。
+    if state.get('report_status')!='ready':
+        reason=state.get('last_error') or '日报未成功生成(可能未配置 LLM)'
+        state['submit_status']='failed'
+        state['submit_error']=f'日报未完成主题归并,拒绝上报:{reason}'
+        state['last_error']=state['submit_error']
+        write_state(state); return state
     included=[x for x in state.get('work_items',[]) if not x.get('excluded')]
     target=(os.getenv('DIGEST_SUBMIT_URL') or '').strip(); key=(os.getenv('DIGEST_API_KEY') or '').strip()
     if not target or not key:

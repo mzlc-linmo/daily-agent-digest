@@ -136,8 +136,28 @@ rather than in a shell rc file.
    model cannot exceed them.
 6. **Review and submit** — exclude what is not work, then upload.
 
-If the LLM is unavailable, generation fails with the provider error in the window instead of
-silently reporting an empty day.
+### When the report is incomplete, it says so
+
+A report can be incomplete for reasons that have nothing to do with the window: the LLM may be
+unconfigured or may return nothing usable, `zstd` may be missing so DeepSeek Harness sessions
+cannot be read, a session database may be unreadable. None of that is allowed to look like a
+finished digest:
+
+- the engine records `report_status=error` with the reason in `last_error`, and puts every
+  reason into a `warnings` list (unclassified report, missing `zstd`, unreadable database,
+  collector failure);
+- the report window shows those warnings in orange under the title, so a report missing half
+  its sources is never mistaken for a quiet day;
+- the Markdown export carries them as `> ⚠️` lines at the top, because that document gets
+  forwarded;
+- 上传 refuses a report that was never classified (`submit_status=failed`, 「日报未完成主题
+  归并,拒绝上报」) rather than sending provider-grouped placeholders to the server.
+
+An agent you simply do not use does not raise a warning — a missing `~/.codex` is only reported
+when the directory exists but its database is gone.
+
+If the LLM is unavailable, the report still lists what was collected, grouped by provider, so
+you can see which sources had sessions at all.
 
 ## Submission (server side pending)
 
@@ -185,6 +205,8 @@ footer (date, item count, character count):
 ```
 
 Excluded items are not in the document, so the Markdown always matches what the window shows.
+If the report is incomplete (see below), the document opens with `> ⚠️` lines naming the reason —
+an unclassified or half-collected report must not read like a finished summary.
 The panel offers 复制 (to the clipboard) and 保存为 .md…, and the text can be selected
 directly.
 
