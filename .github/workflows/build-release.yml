@@ -141,7 +141,19 @@ jobs:
           for f in daily-agent-digest-macos-* *.zip *.dmg install.sh SHA256SUMS; do [ -e "$f" ] && assets+=("$f"); done
           [ "${#assets[@]}" -gt 0 ] || { echo '没有可发布的产物' >&2; exit 1; }
           if [ "$RELEASE_SIGNED" = true ]; then
-            gh release create "$RELEASE_REF" "${assets[@]}" --target main --title "$RELEASE_REF" --notes 'Developer ID signed and notarized macOS binaries, drag-to-Applications DMG and menu-bar app. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
+            tag="$RELEASE_REF"
+            create_args=(--target main --title "$RELEASE_REF")
+            notes='Developer ID signed and notarized macOS binaries, drag-to-Applications DMG and menu-bar app. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
           else
-            gh release create "ci-$BUILD_NUMBER" "${assets[@]}" --draft --prerelease --title "CI verification $BUILD_NUMBER" --notes 'Unsigned build for private verification only. Not a public installable release. Run a version tag after configuring Apple signing secrets to publish.'
+            tag="ci-$BUILD_NUMBER"
+            create_args=(--draft --prerelease --title "CI verification $BUILD_NUMBER")
+            notes='Unsigned build for private verification only. Not a public installable release. Run a version tag after configuring Apple signing secrets to publish.'
+          fi
+          # 重跑同一个 tag 必须可行:release 已存在时改为覆盖同名产物,而不是直接失败。
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag 已存在:覆盖产物并更新说明"
+            gh release upload "$tag" "${assets[@]}" --clobber
+            gh release edit "$tag" --notes "$notes"
+          else
+            gh release create "$tag" "${assets[@]}" "${create_args[@]}" --notes "$notes"
           fi
