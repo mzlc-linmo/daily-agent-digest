@@ -227,8 +227,11 @@ def app_state(day=None):
     return state
 
 def settings():
-    load_env(); return {'base_url':os.getenv('LLM_BASE_URL','https://api.deepseek.com/v1'),'model':os.getenv('LLM_MODEL','deepseek-flash'),'api_key_set':bool(os.getenv('LLM_API_KEY')),'release_version':RELEASE_VERSION,
-                        'submit_url':os.getenv('DIGEST_SUBMIT_URL',''),'submit_api_key_set':bool(os.getenv('DIGEST_API_KEY'))}
+    # 同时回传**值**而不只是"是否已配置":设置窗口要把已保存的 Key 明文显示出来,
+    # 否则用户无法确认自己粘贴是否成功(掩码输入框已经被明确否掉)。
+    # 这些值只经本机管道传给 App,不出网;.env 本身也只有 0600。
+    load_env(); return {'base_url':os.getenv('LLM_BASE_URL','https://api.deepseek.com/v1'),'model':os.getenv('LLM_MODEL','deepseek-flash'),'api_key':os.getenv('LLM_API_KEY',''),'api_key_set':bool(os.getenv('LLM_API_KEY')),'release_version':RELEASE_VERSION,
+                        'submit_url':os.getenv('DIGEST_SUBMIT_URL',''),'submit_api_key':os.getenv('DIGEST_API_KEY',''),'submit_api_key_set':bool(os.getenv('DIGEST_API_KEY'))}
 
 def save_settings(data):
     APP_DIR.mkdir(parents=True, exist_ok=True); path=APP_DIR/'.env'; old={}
@@ -583,7 +586,16 @@ def check_submit(data=None):
         with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
             body=json.loads(r.read() or b'{}')
     except urllib.error.HTTPError as exc:
-        raise ValueError(f'HTTP {exc.code}: {exc.read().decode("utf-8","replace")[:200]}')
+        raw = exc.read().decode('utf-8', 'replace')
+        code = ''
+        try: code = (json.loads(raw).get('error') or {}).get('code', '')
+        except (ValueError, AttributeError): pass
+        # 把服务端的错误码翻成"下一步该做什么":只说"403"用户无法自救。
+        hint = {
+            'key_revoked': '该 Key 已被撤销(重新签发或轮换后旧 Key 会立即失效)。请在管理台「员工与 Key」里重新签发,并把新 Key 填到上面的输入框。',
+            'invalid_key': '该 Key 不存在或格式不对。请检查是否复制完整,或到管理台重新签发。',
+        }.get(code, '')
+        raise ValueError(f'HTTP {exc.code}: {raw[:200]}' + (f'\n\n{hint}' if hint else ''))
     except Exception as exc:
         raise ValueError(f'{type(exc).__name__}: {exc}')
     return {'member':body.get('member',''),'member_id':body.get('member_id','')}

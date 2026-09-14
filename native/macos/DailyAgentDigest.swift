@@ -109,6 +109,7 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     var items = [[String: Any]]()
     let table = NSTableView()
     let status = NSTextField(labelWithString: "")
+    let upload = NSButton(title: "上传", target: nil, action: nil)
     let summary = NSTextView()
     let heading = NSTextField(labelWithString: "今日工作日报")
     let metadata = NSTextField(labelWithString: "")
@@ -179,6 +180,9 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         status.textColor = .secondaryLabelColor
         status.frame = NSRect(x: 28, y: 24, width: 804, height: 24)
         view.addSubview(status)
+        upload.target = self; upload.action = #selector(submitNow)
+        upload.bezelStyle = .rounded
+        view.addSubview(upload)
 
         let w = NSWindow(contentRect: view.bounds, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.contentView = view
@@ -320,7 +324,8 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
 
         itemsLabel.frame = NSRect(x: pad, y: summaryScroll.frame.minY - 30, width: 200, height: 22)
         tableScroll.frame = NSRect(x: pad, y: 72, width: boxWidth, height: max(60, itemsLabel.frame.minY - 12 - 72))
-        status.frame = NSRect(x: pad, y: 24, width: boxWidth, height: 24)
+        status.frame = NSRect(x: pad, y: 24, width: boxWidth - 96, height: 24)
+        upload.frame = NSRect(x: pad + boxWidth - 80, y: 22, width: 80, height: 26)
         DebugLog.write("report relayout summaryNeeded=\(Int(needed)) summaryBox=\(Int(boxHeight)) table=\(Int(tableScroll.frame.width))x\(Int(tableScroll.frame.height)) items=\(items.count)")
     }
     func numberOfRows(in tableView: NSTableView) -> Int { items.count }
@@ -431,6 +436,31 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
                          width: ReportController.buttonWidth, height: 26)
         cell.addSubview(b)
         return cell
+    }
+
+    /// 手动上传:把当前日报提交到服务端(定时任务之外的手动入口)。
+    @objc func submitNow() {
+        upload.isEnabled = false
+        status.stringValue = "正在上传…"
+        status.textColor = .secondaryLabelColor
+        backend.call("submit", [:], timeout: 120) { [weak self] state in
+            guard let self = self else { return }
+            self.upload.isEnabled = true
+            if let error = state["error"] as? String {
+                self.status.stringValue = "上传失败：\(error)"
+                self.status.textColor = .systemRed
+            } else if state["submit_status"] as? String == "submitted" {
+                let mode = state["submit_mode"] as? String ?? "ok"
+                let count = state["submitted_count"] as? Int ?? 0
+                self.status.stringValue = "已上传（\(mode)）：\(count) 项。再次上传会覆盖当天内容。"
+                self.status.textColor = .systemGreen
+            } else {
+                let reason = state["submit_error"] as? String ?? "未配置提交地址或 API Key"
+                self.status.stringValue = "未上传：\(reason)"
+                self.status.textColor = .systemRed
+            }
+            self.refresh()
+        }
     }
 
     @objc func toggle(_ sender: NSButton) {
@@ -680,70 +710,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // 设置窗口做成**非模态面板**:测试连接在窗口内显示结果、窗口不关闭,
+    // 密钥字段明文可见(掩码让用户无法确认粘贴是否成功)。
+    private var settingsPanel: NSPanel?
+    private var settingsFields: [String: NSTextField] = [:]
+    private var settingsStatus: NSTextField?
+
     @objc func settings(){
+        if let existing = settingsPanel { existing.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         backend.call("settings") { [weak self] current in
             guard let self = self else { return }
-            let alert = NSAlert()
-            alert.messageText = "日报设置"
-            alert.informativeText = "提交地址与 API Key 保存一次即可，之后每次提交自动复用。"
-            let form = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 196))
-            func field(_ label: String, _ value: String, _ y: Int, secure: Bool = false) -> NSTextField {
-                let caption = NSTextField(labelWithString: label)
-                caption.frame = NSRect(x: 0, y: y + 4, width: 104, height: 22)
-                form.addSubview(caption)
-                let input = secure ? NSSecureTextField(string: value) : NSTextField(string: value)
-                input.frame = NSRect(x: 112, y: y, width: 340, height: 26)
-                form.addSubview(input)
-                return input
-            }
-            let url = field("LLM Base URL", current["base_url"] as? String ?? "https://api.deepseek.com/v1", 158)
-            let model = field("Model", current["model"] as? String ?? "deepseek-flash", 124)
-            let submitURL = field("提交地址", current["submit_url"] as? String ?? "", 90)
-            let submitKey = field("提交 API Key", "", 56, secure: true)
-            submitKey.placeholderString = (current["submit_api_key_set"] as? Bool == true) ? "已配置，留空表示不修改" : "dag_…"
-            let llmKey = NSTextField(labelWithString: (current["api_key_set"] as? Bool == true) ? "LLM API Key：已配置" : "LLM API Key：未配置")
-            llmKey.textColor = .secondaryLabelColor
-            llmKey.frame = NSRect(x: 112, y: 24, width: 340, height: 20)
-            form.addSubview(llmKey)
-            alert.accessoryView = form
-            alert.addButton(withTitle: "保存")
-            alert.addButton(withTitle: "取消")
-            alert.addButton(withTitle: "测试连接")
+            let width: CGFloat = 560, height: CGFloat = 320
+            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            panel.title = "日报设置"
+            panel.isReleasedWhenClosed = false
+            let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
 
-            switch self.presentAlert(alert) {
-            case .alertFirstButtonReturn:
-                var payload: [String: Any] = ["base_url": url.stringValue, "model": model.stringValue,
-                                              "submit_url": submitURL.stringValue]
-                if !submitKey.stringValue.isEmpty { payload["submit_api_key"] = submitKey.stringValue }
-                self.backend.call("save-settings", payload) { result in
-                    if let error = result["error"] as? String { self.showInfo("保存失败", error) }
-                    else { self.showInfo("已保存", "提交地址与 API Key 已写入本地配置，之后无需再次输入。") }
-                }
-            case .alertThirdButtonReturn:
-                // 测试"当前输入"的值,不必先保存。
-                var payload: [String: Any] = ["submit_url": submitURL.stringValue]
-                if !submitKey.stringValue.isEmpty { payload["submit_api_key"] = submitKey.stringValue }
-                self.backend.call("check-submit", payload) { result in
-                    if let error = result["error"] as? String {
-                        self.showInfo("连接失败", error)
-                    } else {
-                        let member = result["member"] as? String ?? "未知"
-                        self.showInfo("连接成功", "服务端识别为该成员：\(member)\n确认无误后点“保存”。")
-                    }
-                }
-            default:
-                break
+            var fields: [String: NSTextField] = [:]
+            func addField(_ label: String, _ key: String, _ value: String, _ y: CGFloat) {
+                let caption = NSTextField(labelWithString: label)
+                caption.frame = NSRect(x: 20, y: y + 4, width: 110, height: 22)
+                caption.alignment = .right
+                content.addSubview(caption)
+                let input = NSTextField(string: value)   // 明文:便于核对是否粘贴成功
+                input.frame = NSRect(x: 140, y: y, width: width - 170, height: 26)
+                content.addSubview(input)
+                fields[key] = input
+            }
+            addField("LLM Base URL", "base_url", current["base_url"] as? String ?? "", 274)
+            addField("Model", "model", current["model"] as? String ?? "", 238)
+            addField("LLM API Key", "api_key", current["api_key"] as? String ?? "", 202)
+            addField("提交地址", "submit_url", current["submit_url"] as? String ?? "", 166)
+            addField("提交 API Key", "submit_api_key", current["submit_api_key"] as? String ?? "", 130)
+
+            let status = NSTextField(labelWithString: "改完点「保存」；「测试连接」只测试当前输入,不会自动保存。")
+            status.frame = NSRect(x: 20, y: 88, width: width - 40, height: 36)
+            status.textColor = .secondaryLabelColor
+            status.lineBreakMode = .byWordWrapping
+            status.maximumNumberOfLines = 2
+            content.addSubview(status)
+
+            func addButton(_ title: String, _ action: Selector, _ x: CGFloat, _ w: CGFloat) {
+                let b = NSButton(title: title, target: self, action: action)
+                b.frame = NSRect(x: x, y: 22, width: w, height: 32)
+                b.bezelStyle = .rounded
+                content.addSubview(b)
+            }
+            addButton("保存", #selector(saveSettingsFromPanel), 20, 100)
+            addButton("测试连接", #selector(testConnectionFromPanel), 130, 110)
+            addButton("关闭", #selector(closeSettingsPanel), width - 120, 100)
+
+            panel.contentView = content
+            self.settingsPanel = panel
+            self.settingsFields = fields
+            self.settingsStatus = status
+            panel.center()
+            panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            DebugLog.write("settings panel shown")
+        }
+    }
+
+    private func settingsPayload() -> [String: Any] {
+        var payload: [String: Any] = [:]
+        for (key, field) in settingsFields { payload[key] = field.stringValue }
+        return payload
+    }
+
+    @objc func saveSettingsFromPanel() {
+        backend.call("save-settings", settingsPayload()) { [weak self] result in
+            guard let self = self else { return }
+            if let error = result["error"] as? String {
+                self.settingsStatus?.stringValue = "保存失败：\(error)"
+                self.settingsStatus?.textColor = .systemRed
+            } else {
+                self.settingsStatus?.stringValue = "已保存。之后提交会自动复用这份配置。"
+                self.settingsStatus?.textColor = .systemGreen
             }
         }
     }
 
-    /// 统一的小提示弹窗(始终置顶)。
-    func showInfo(_ title: String, _ message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "好")
-        presentAlert(alert)
+    @objc func testConnectionFromPanel() {
+        settingsStatus?.stringValue = "正在测试…"
+        settingsStatus?.textColor = .secondaryLabelColor
+        // 只测当前输入(不落盘):测试失败也不会污染已保存的配置
+        backend.call("check-submit", settingsPayload()) { [weak self] result in
+            guard let self = self else { return }
+            if let error = result["error"] as? String {
+                self.settingsStatus?.stringValue = "连接失败：\(error)"
+                self.settingsStatus?.textColor = .systemRed
+            } else {
+                let member = result["member"] as? String ?? "未知"
+                self.settingsStatus?.stringValue = "连接成功：服务端识别为「\(member)」。确认无误后点「保存」。"
+                self.settingsStatus?.textColor = .systemGreen
+            }
+        }
+    }
+
+    @objc func closeSettingsPanel() {
+        settingsPanel?.close()
+        settingsPanel = nil
+        settingsFields = [:]
+        settingsStatus = nil
     }
 
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }
