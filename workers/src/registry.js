@@ -24,17 +24,22 @@ export const REQUESTS = {
   fields: {
     title: '申请标题',      // 主字段:飞书的主字段不能用人员类型
     applicant: '申请人',    // 人员(通讯录)
+    account: '账号',        // 工号/账号,用作 member_id
     remark: '申请说明',
-    status: '状态',        // 单选:待处理 / 已签发 / 已拒绝
+    status: '状态',        // 单选:待处理 / 已签发 / 已撤销
+    key: 'Key',            // 生成的明文 Key,写回该行,成员自己复制
     keyId: 'KeyID',
     handledAt: '处理时间',
   },
 };
 
+import { issueKey } from './keys.js';
+
 export const STATUS_ISSUED = '已启用';
 export const STATUS_REVOKED = '已撤销';
 export const REQUEST_PENDING = '待处理';
 export const REQUEST_ISSUED = '已签发';
+export const REQUEST_REVOKED = '已撤销';
 
 export function registryFieldDefs() {
   const f = REGISTRY.fields;
@@ -88,33 +93,95 @@ function ms(iso) {
   return Date.parse(iso || new Date().toISOString());
 }
 
-/// 签发后登记一行(并在申请表里把对应申请标为已签发)。
-export async function recordIssued(env, feishu, { member, member_id, key_id, open_id, created_at }) {
-  const notes = [];
-  if (env.REGISTRY_TABLE_ID) {
-    const f = REGISTRY.fields;
-    await feishu.batchCreate(env, env.REGISTRY_TABLE_ID, [{
+/// 定时任务:处理「密钥申请」表里待处理的行。
+///
+/// 成员填完表单,记录落到申请表;这里给它生成一把随机 Key、写回该行(成员自己复制),
+/// 同时在登记表建一行。无需管理员介入 —— 表就是控制面:
+///   · 状态=待处理 → 自动签发
+///   · 状态=已撤销 → 撤销对应 Key
+export async function processRequests(env, feishu) {
+  if (!env.REQUEST_TABLE_ID) return { issued: 0, revoked: 0, skipped: 0 };
+  const f = REQUESTS.fields;
+  const rows = await feishu.findRecords(env, env.REQUEST_TABLE_ID, undefined);
+  let issued = 0; let revoked = 0; let skipped = 0;
+
+  for (const row of rows) {
+    const fields = row.fields ?? {};
+    const status = String(fields[f.status] ?? '');
+    const keyId = String(fields[f.keyId] ?? '');
+    const person = (fields[f.applicant] ?? [])[0];
+
+    // 撤销:表里把状态改成「已撤销」即可
+    if (status === REQUEST_REVOKED && keyId) {
+      if (env.KEYS) {
+        const record = await env.KEYS.get(`key:${keyId}`, 'json');
+        if (record && record.enabled !== false) {
+          record.enabled = false;
+          record.revoked_at = new Date().toISOString();
+          await env.KEYS.put(`key:${keyId}`, JSON.stringify(record));
+        }
+      }
+      await recordRevoked(env, feishu, { key_id: keyId, revoked_at: new Date().toISOString() });
+      revoked += 1;
+      continue;
+    }
+
+    // 签发:还没拿到 Key 的申请。
+    // 注意:表单里「状态」是隐藏字段,成员提交后这一列是空的 —— 空状态同样视为待处理,
+    // 否则真实提交永远拿不到 Key。
+    const alreadyIssued = Boolean(fields[f.key]) || Boolean(keyId) || status === REQUEST_ISSUED;
+    if (alreadyIssued || status === REQUEST_REVOKED || !person?.id) { skipped += 1; continue; }
+    const memberId = String(fields[f.account] ?? '').trim() || `u${String(person.id).slice(-6)}`;
+    const issuedKey = await issueKey(env, feishu, {
+      member_id: memberId,
+      member: person.name || memberId,
+      open_id: person.id,
+    });
+    await feishu.batchUpdate(env, env.REQUEST_TABLE_ID, [{
+      record_id: row.record_id,
       fields: {
-        [f.keyId]: key_id,
-        ...(open_id ? { [f.member]: [{ id: open_id }] } : {}),
-        [f.memberId]: member_id,
-        [f.status]: STATUS_ISSUED,
-        [f.issuedAt]: ms(created_at),
+        [f.status]: REQUEST_ISSUED,
+        [f.key]: issuedKey.key,
+        [f.keyId]: issuedKey.key_id,
+        [f.handledAt]: ms(new Date().toISOString()),
       },
     }]);
-    notes.push('registry:created');
+    await recordIssued(env, feishu, {
+      member: issuedKey.member, member_id: issuedKey.member_id, key_id: issuedKey.key_id,
+      open_id: issuedKey.open_id, created_at: new Date().toISOString(),
+    });
+    issued += 1;
   }
-  // 把该成员最近的「待处理」申请标为已签发。
-  // 注意:人员字段不能用 filter 匹配(实测 contains / 等值都命中 0),所以按状态取回后在本地比对。
+  return { issued, revoked, skipped };
+}
+
+/// 签发后登记一行(台账)。注意:申请表的"关单"由 processRequests 负责。
+export async function recordIssued(env, feishu, { member, member_id, key_id, open_id, created_at }) {
+  const notes = [];
+  if (!env.REGISTRY_TABLE_ID) return notes;
+  const f = REGISTRY.fields;
+  await feishu.batchCreate(env, env.REGISTRY_TABLE_ID, [{
+    fields: {
+      [f.keyId]: key_id,
+      ...(open_id ? { [f.member]: [{ id: open_id }] } : {}),
+      [f.memberId]: member_id,
+      [f.status]: STATUS_ISSUED,
+      [f.issuedAt]: ms(created_at),
+    },
+  }]);
+  notes.push('registry:created');
+  // 管理员手动签发时,顺手关掉该成员待处理的申请;
+  // 否则定时任务会给同一条申请再发一把 Key。
+  // 注意:人员字段不能用 filter 匹配,按状态取回后在本地比对。
   if (env.REQUEST_TABLE_ID && open_id) {
-    const f = REQUESTS.fields;
+    const rf = REQUESTS.fields;
     const pending = (await feishu.findRecords(env, env.REQUEST_TABLE_ID,
-      `CurrentValue.[${f.status}]="${REQUEST_PENDING}"`))
-      .filter((r) => (r.fields?.[f.applicant] ?? []).some((p) => p && p.id === open_id));
+      `CurrentValue.[${rf.status}]="${REQUEST_PENDING}"`))
+      .filter((r) => (r.fields?.[rf.applicant] ?? []).some((p) => p && p.id === open_id));
     if (pending.length) {
       await feishu.batchUpdate(env, env.REQUEST_TABLE_ID, pending.map((r) => ({
         record_id: r.record_id,
-        fields: { [f.status]: REQUEST_ISSUED, [f.keyId]: key_id, [f.handledAt]: ms(new Date().toISOString()) },
+        fields: { [rf.status]: REQUEST_ISSUED, [rf.keyId]: key_id, [rf.handledAt]: ms(new Date().toISOString()) },
       })));
       notes.push(`requests:closed=${pending.length}`);
     }

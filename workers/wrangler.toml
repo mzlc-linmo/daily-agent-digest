@@ -24,3 +24,7 @@ enabled = true
 [[kv_namespaces]]
 binding = "KEYS"
 id = "6f1b2801ee524cd7a3dab047e5c7e1a8"
+
+# 每分钟轮询「密钥申请」表:待处理 → 自动签发并写回 Key;已撤销 → 撤销 Key。
+[triggers]
+crons = ["* * * * *"]
