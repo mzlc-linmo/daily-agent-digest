@@ -10,6 +10,7 @@ import {
 } from './report.js';
 import * as realFeishu from './feishu.js';
 import { issueKey, listKeys, revokeKey, revokeExistingFor } from './keys.js';
+import { logEvent, queryLogs, requestContext } from './logs.js';
 import { ensureTable, recordIssued, recordRevoked, recordSubmission, REGISTRY, REQUESTS, registryFieldDefs, requestFieldDefs } from './registry.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
@@ -28,7 +29,7 @@ function errorResponse(err) {
 
 /// 提交日报:按「成员+日期」覆盖已存在的行,内容完全相同时幂等返回。
 /// 任何写表失败都会抛出,绝不在表格未写入时返回 2xx(需求 FR-7.2/7.7)。
-export async function submitDigest(request, env, feishu, now) {
+export async function submitDigest(request, env, feishu, now, audit = {}) {
   const member = await authenticate(request, env);
 
   const raw = await request.text();
@@ -96,7 +97,22 @@ export async function submitDigest(request, env, feishu, now) {
   } catch (err) {
     console.warn(`台账回写最近提交失败:${err.message}`);
   }
-  return json({ ...meta, mode: existing.length ? 'updated' : 'created', records }, existing.length ? 200 : 201);
+  const mode = existing.length ? 'updated' : 'created';
+  await logEvent(env, {
+    ...audit,
+    event: 'submit',
+    outcome: 'ok',
+    duration_ms: (audit.started ? now() - audit.started : null),
+    key_id: member.key_id,
+    member: member.member,
+    member_id: member.member_id,
+    date: report.date,
+    mode,
+    items: report.items.length,
+    report_chars: report.report_chars ?? null,
+    release_version: report.release_version ?? null,
+  });
+  return json({ ...meta, mode, records }, existing.length ? 200 : 201);
 }
 
 export async function whoami(request, env) {
@@ -121,7 +137,7 @@ export async function queryDigest(request, env, feishu, url) {
 }
 
 /// 管理员一次性建表 + 建字段,返回 table_id 供写入 Cloudflare vars。
-export async function bootstrap(request, env, feishu) {
+export async function bootstrap(request, env, feishu, audit = {}) {
   authenticateAdmin(request, env);
   if (!env.BITABLE_APP_TOKEN) throw new ValidationError('缺少 BITABLE_APP_TOKEN');
   const tableName = env.BITABLE_TABLE_NAME || '日报明细';
@@ -175,6 +191,11 @@ export async function bootstrap(request, env, feishu) {
     created.push(`field:${definition.field_name}`);
   }
 
+  await logEvent(env, {
+    ...audit, event: 'bootstrap', outcome: 'ok',
+    duration_ms: audit.started ? Date.now() - audit.started : null,
+    detail: JSON.stringify({ table_id: tableId, registry: adminTables.registry, requests: adminTables.requests }),
+  });
   return json({
     app_token: env.BITABLE_APP_TOKEN,
     table_id: tableId,
@@ -188,7 +209,7 @@ export async function bootstrap(request, env, feishu) {
 }
 
 /// 管理员签发 Key:此时就把人员身份(含 open_id)绑死。
-export async function adminIssueKey(request, env, feishu) {
+export async function adminIssueKey(request, env, feishu, audit = {}) {
   authenticateAdmin(request, env);
   const body = await request.json().catch(() => ({}));
   const issued = await issueKey(env, feishu, {
@@ -212,6 +233,12 @@ export async function adminIssueKey(request, env, feishu) {
     console.warn(`登记表写入失败(Key 已签发):${err.message}`);
     registry = [`registry:failed:${err.message}`];
   }
+  await logEvent(env, {
+    ...audit, event: 'issue_key', outcome: 'ok',
+    duration_ms: audit.started ? Date.now() - audit.started : null,
+    key_id: issued.key_id, member: issued.member, member_id: issued.member_id,
+    detail: JSON.stringify({ registry }),
+  });
   return json({
     ...issued,
     registry,
@@ -224,7 +251,7 @@ export async function adminListKeys(request, env) {
   return json({ keys: await listKeys(env) });
 }
 
-export async function adminRevokeKey(request, env, feishu) {
+export async function adminRevokeKey(request, env, feishu, audit = {}) {
   authenticateAdmin(request, env);
   const body = await request.json().catch(() => ({}));
   const revoked = await revokeKey(env, String(body.key_id ?? ''));
@@ -234,6 +261,12 @@ export async function adminRevokeKey(request, env, feishu) {
   } catch (err) {
     console.warn(`登记表撤销回写失败:${err.message}`);
   }
+  await logEvent(env, {
+    ...audit, event: 'revoke_key', outcome: 'ok',
+    duration_ms: audit.started ? Date.now() - audit.started : null,
+    key_id: revoked.key_id, member: revoked.member, member_id: revoked.member_id,
+    detail: JSON.stringify({ registry }),
+  });
   return json({ ...revoked, registry });
 }
 
@@ -252,6 +285,14 @@ export async function handleRequest(request, env, deps = {}) {
   const now = deps.now ?? (() => Date.now());
   const url = new URL(request.url);
   const route = `${request.method} ${url.pathname}`;
+  // 审计上下文:所有分支共用;失败也要留痕,所以放在 try 外面
+  const audit = { ...requestContext(request), started: now() };
+  const auditEvent = {
+    'POST /api/v1/digests': 'submit',
+    'POST /admin/keys': 'issue_key',
+    'POST /admin/keys/revoke': 'revoke_key',
+    'POST /admin/bootstrap': 'bootstrap',
+  }[route] ?? null;
 
   try {
     switch (route) {
@@ -262,21 +303,46 @@ export async function handleRequest(request, env, deps = {}) {
       case 'GET /api/v1/digests':
         return await queryDigest(request, env, feishu, url);
       case 'POST /api/v1/digests':
-        return await submitDigest(request, env, feishu, now);
+        return await submitDigest(request, env, feishu, now, audit);
       case 'POST /admin/bootstrap':
-        return await bootstrap(request, env, feishu);
+        return await bootstrap(request, env, feishu, audit);
       case 'POST /admin/keys':
-        return await adminIssueKey(request, env, feishu);
+        return await adminIssueKey(request, env, feishu, audit);
       case 'GET /admin/keys':
         return await adminListKeys(request, env);
       case 'POST /admin/keys/revoke':
-        return await adminRevokeKey(request, env, feishu);
+        return await adminRevokeKey(request, env, feishu, audit);
+      case 'GET /admin/logs':
+        return await adminLogs(request, env, url);
       default:
         return json({ error: { code: 'not_found', message: `未知接口:${route}` } }, 404);
     }
   } catch (err) {
-    if (err instanceof AuthError || err instanceof ValidationError || err.status) return errorResponse(err);
-    // 未预期的异常也不能泄露堆栈
-    return errorResponse(err);
+    const response = errorResponse(err);
+    // 失败的请求同样入审计日志 —— 否则"谁在什么时候提交失败了"永远查不到
+    if (auditEvent) {
+      await logEvent(env, {
+        ...audit,
+        event: auditEvent,
+        outcome: 'error',
+        duration_ms: now() - audit.started,
+        error_code: err.code ?? (err instanceof ValidationError ? 'validation_failed' : 'internal_error'),
+        error_message: String(err.message ?? err).slice(0, 500),
+      });
+    }
+    return response;
   }
+}
+
+/// 查询审计日志(管理员)。支持 ?limit=&member_id=&date=&event=&outcome=
+export async function adminLogs(request, env, url) {
+  authenticateAdmin(request, env);
+  const rows = await queryLogs(env, {
+    limit: url.searchParams.get('limit') ?? 100,
+    memberId: url.searchParams.get('member_id') ?? undefined,
+    date: url.searchParams.get('date') ?? undefined,
+    event: url.searchParams.get('event') ?? undefined,
+    outcome: url.searchParams.get('outcome') ?? undefined,
+  });
+  return json({ count: rows.length, logs: rows });
 }

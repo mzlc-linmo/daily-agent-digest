@@ -5,6 +5,9 @@ compatibility_date = "2024-11-01"
 # 非敏感配置放这里;密钥用 `wrangler secret put`(见 README)。
 [vars]
 # 独立 base「团队日报」(app_token);App Secret 用 wrangler secret 存
+SUBMIT_URL = "https://daily-agent-digest-submit.mzlc.workers.dev"
+# 员工出现在别人共享的表里时,填 base_token:名称,逗号分隔(digest-admin employees 会一并扫描)
+SCAN_BASES = "C30jbYH9laGWK0swpDhcNuz4n4g:需求排期,TF8ubqrfvasV8Psxsl5cqRWDnjg:问题跟踪"
 BITABLE_APP_TOKEN = "JHoFbrmTBaTN8nsmoYScZyTpnEb"
 # 目标表名;留空 BITABLE_TABLE_ID 时,bootstrap 会按这个名字找表或建表
 BITABLE_TABLE_NAME = "日报明细"
@@ -28,3 +31,9 @@ id = "6f1b2801ee524cd7a3dab047e5c7e1a8"
 # 每分钟轮询「密钥申请」表:待处理 → 自动签发并写回 Key;已撤销 → 撤销 Key。
 [triggers]
 crons = ["* * * * *"]
+
+# 审计日志(提交/签发/撤销)持久化在 D1;应用 schema.sql 建表。
+[[d1_databases]]
+binding = "DB"
+database_name = "daily-agent-digest-logs"
+database_id = "c45efa6f-6d08-4333-a87c-0d5ed612b31b"

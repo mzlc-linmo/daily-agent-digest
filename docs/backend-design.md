@@ -286,6 +286,8 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | 多维表格 | base「团队日报」`JHoFbrmTBaTN8nsmoYScZyTpnEb`,表「日报明细」`tbl77oxPmPcVVyVz` |
 | 飞书应用 | `cli_aa13a11707b89bdb`(凭据存于本机钥匙串 `zentao.mzlc.me`) |
 | secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
+| D1 | `daily-agent-digest-logs`(`audit_log` 表):提交(含失败)、签发、撤销、bootstrap 全部留痕,默认保留 180 天 |
+| 管理 CLI | `workers/scripts/digest-admin.mjs`:install / status / feishu / admin-token / deploy / tables / employees / issue / keys / revoke / logs |
 | KV | `KEYS` 命名空间 `6f1b2801ee524cd7a3dab047e5c7e1a8`,存放成员 Key |
 | Key 生命周期 | **线上已验证**:签发 → 用 Key 调 `/api/v1/me` 成功 → 列表不含哈希 → 撤销后立即 `403 key_revoked` |
 | 自动签发 | Worker `scheduled()` 每分钟轮询申请表:未签发的行自动生成 Key 并把明文写回该行;状态改为「已撤销」即停用。**成员填表 ≈1 分钟后就拿到 Key,无需管理员介入** |
@@ -330,7 +332,20 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 **踩到的第三个飞书坑**:表单字段"先设必填、再隐藏"会留下**隐藏但必填**的状态,提交必被拦住;
 已隐藏的字段又无法直接改 `required`(报 `1254001`)。正确顺序是**先取消必填、再隐藏**。
 
-## 19. 已确认决策
+## 19. 审计日志与运维入口(2026-09-14)
+
+**日志入 D1**:此前"提交失败"只留在 Workers Logs(保留数天,不可查询)。现在每次提交都往 D1 的
+`audit_log` 写一行,成功与失败都写,并带上 `mode`/`items`/`duration_ms`/`error_code`/`user_agent`/`country`;
+签发、撤销、bootstrap 也写。写入是 best-effort —— 日志服务故障绝不能影响成员提交日报。
+
+**管理 CLI**:`workers/scripts/digest-admin.mjs` 把"装后端 → 配飞书 key → 配管理员口令 → 建表回填 table id →
+读员工 → 选人生成 Key"串成一条流程,每步也可单独重跑。安全细节:
+
+- App Secret 与管理员口令只经 stdin 交给 `wrangler secret put`,不落盘、不打印;可从本机钥匙串复用;
+- `admin-token --local-only` 只把口令存本机(**不覆盖** Cloudflare 上的口令);
+- `--yes` 非交互模式下,若本机已有口令则**拒绝改动** Cloudflare 的 secret —— 避免自动化把线上口令冲掉。
+
+## 20. 已确认决策
 
 | 编号 | 问题 | 决策 |
 | --- | --- | --- |

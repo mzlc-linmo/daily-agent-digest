@@ -18,36 +18,50 @@ App ──POST /api/v1/digests──▶ Worker ──tenant_access_token──�
 https://xxx.feishu.cn/base/<BITABLE_APP_TOKEN>?table=<BITABLE_TABLE_ID>
 ```
 
-## 部署
+## 一键部署:管理 CLI
+
+所有运维动作都在一个 CLI 里,每一步都可以单独重跑(幂等);首次使用直接跑向导:
 
 ```bash
 cd workers
-npm install                     # 只装 wrangler(devDependency,运行时不依赖)
+node scripts/digest-admin.mjs install
+```
 
-# 密钥(不会进代码仓库)
-npx wrangler secret put FEISHU_APP_SECRET     # 飞书应用的 App Secret
-npx wrangler secret put ADMIN_TOKEN           # 自己定的管理口令,仅用于 bootstrap
+向导依次完成:**配置飞书凭据 → 配置管理员口令 → 创建 KV/D1 并部署 → 建飞书表并回填 table id → 读取员工 → 选员工签发 Key**。
 
-# 非敏感配置写进 wrangler.toml 的 [vars]
-#   BITABLE_APP_TOKEN / FEISHU_APP_ID
+也可以逐步执行:
 
+| 命令 | 作用 |
+| --- | --- |
+| `digest-admin.mjs status` | 显示当前配置缺什么、后端是否健康 |
+| `digest-admin.mjs feishu` | 配置并**校验**飞书 App ID / Secret(Secret 只经 stdin 交给 wrangler,不落盘) |
+| `digest-admin.mjs admin-token` | 配置管理员口令;`--local-only` 只存本机钥匙串、不覆盖 Cloudflare |
+| `digest-admin.mjs deploy` | 创建 **KV**(存 Key)+ **D1**(存审计日志)、应用 `schema.sql`、部署 Worker |
+| `digest-admin.mjs tables` | 调 `/admin/bootstrap` 建表建字段 → **回填 table id** → 重新部署 → 配置申请表单 |
+| `digest-admin.mjs employees` | 读取员工(含 open_id) |
+| `digest-admin.mjs issue` | 交互式选员工签发 Key(或 `--open-id --name --member-id`) |
+| `digest-admin.mjs keys` / `revoke <key_id>` | 列出 / 撤销 |
+| `digest-admin.mjs logs` | 查询审计日志(`--member --date --event --outcome --limit`) |
+
+密钥来源:飞书 App Secret 与管理员口令优先从**本机钥匙串**读(`service=daily-agent-digest`),
+其次读环境变量;因此配好一次之后,后续命令都不用再输入。
+
+手动等价命令(不想用 CLI 时):
+
+```bash
+npx wrangler secret put FEISHU_APP_SECRET   # 提示时粘贴 App Secret
+npx wrangler secret put ADMIN_TOKEN
 npx wrangler deploy
 ```
 
-部署后会得到 `https://daily-agent-digest-submit.<account>.workers.dev`。
+### 环境变量(可选)
 
-### 建表与建字段(bootstrap)
-
-不用手工建字段 —— 调一次 bootstrap 即可,它会按 `docs/backend-design.md` 第 6.1 节的字段定义建表并补全字段:
-
-```bash
-curl -sS -X POST https://<你的>.workers.dev/admin/bootstrap \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | tee /tmp/bootstrap.json
-
-# 返回里的 table_id 填进 wrangler.toml 的 BITABLE_TABLE_ID,然后重新 deploy
-```
-
-bootstrap 是幂等的:表已存在就复用,字段已存在就跳过,只补齐缺失的。
+| 变量 | 说明 |
+| --- | --- |
+| `WRANGLER_CMD` | 默认 `npx --yes wrangler` |
+| `DIGEST_SUBMIT_URL` | 后端地址;默认读 `wrangler.toml` 的 `SUBMIT_URL` |
+| `ADMIN_TOKEN` | 管理员口令;默认读钥匙串 |
+| `DIGEST_SCAN_BASES` | 额外扫描的 base(`token:名称`,逗号分隔);默认读 `wrangler.toml` 的 `SCAN_BASES` |
 
 ## 成员与 Key 的映射:两张飞书表
 
@@ -81,35 +95,20 @@ bootstrap 是幂等的:表已存在就复用,字段已存在就跳过,只补齐�
 > ⚠️ 如果将来要把这个 base 分享给团队看日报,请**先把这两张表拆到另一个 base**,
 > 或开启 Bitable 高级权限限制可见范围,否则 Key 会随 base 一起暴露。
 
-## 管理员签发 Key(签发即绑定人员)
-
-先准备一次:
+## 管理员签发 Key
 
 ```bash
-npx wrangler kv namespace create KEYS        # 首次部署前:把输出的 id 填进 wrangler.toml
-npx wrangler secret put ADMIN_TOKEN          # 自己定一个管理口令
-security add-generic-password -s daily-agent-digest -a admin-token -w   # 存进钥匙串,脚本以后免输入
+# 1) 找不到人时先查 open_id(从企业已有表格的人员字段读)
+node scripts/digest-admin.mjs employees
+
+# 2) 交互式:列出员工 → 选序号(可多选,如 1,3)→ 逐个签发
+node scripts/digest-admin.mjs issue
+
+# 或直接指定
+node scripts/digest-admin.mjs issue --open-id ou_xxxx --name 张三 --member-id zhangsan
 ```
 
-两个脚本(不用手搓 curl):
-
-```bash
-# 1) 找人:从企业已有表格的人员字段里取 open_id
-node workers/scripts/find-openid.mjs 张三
-node workers/scripts/find-openid.mjs                     # 列出全部能找到的人
-#    若某人在共享表里而不在应用自有空间,补上 base_token:
-DIGEST_SCAN_BASES="<base_token>:名称,<base_token2>:名称" node workers/scripts/find-openid.mjs
-
-# 2) 签发 / 列出 / 撤销
-workers/scripts/admin.sh issue mastercui "Master Cui" ou_68585f59c3f462432b11334d41671ef3
-workers/scripts/admin.sh list
-workers/scripts/admin.sh revoke 8a4e4742
-```
-
-`issue` 的第三个参数给 `ou_…` 直接用 open_id,给邮箱则让服务端解析(需要
-`contact:user.id:readonly`);两者都没有会被**拒绝签发**,不会生成一把无法关联通讯录的 Key。
-
-返回里的 `key`(`dag_<key_id>_<secret>`)只出现这一次,交给该成员;服务端只保存哈希,台账里也只有公开的 key_id。
+明文 Key 只在签发响应里出现一次;服务端只存 sha256,台账里也只有公开的 key_id。
 
 ## 成员侧配置
 
@@ -164,6 +163,31 @@ ADMIN_TOKEN="dev-admin"
 | 客户端报 `HTTP 403 error code: 1010` | Cloudflare 拦截了默认的 `Python-urllib` User-Agent;引擎已固定带 `DailyAgentDigest/<版本>` 标识,自研客户端也必须带 UA |
 | 大陆网络访问超时 | `*.workers.dev` 不可达,见设计文档 12.1;可迁到国内云函数,客户端无需改动 |
 
-## 日志
+## 审计日志(D1 持久化)
 
-`npx wrangler tail` 实时查看。只记录 `submission_id`、成员、日期、条数、耗时与飞书 `log_id`,**不记录日报正文**。
+**每次提交都会落一行**(成功与失败都写),签发/撤销/建表也记录在案,存在 **D1** 的 `audit_log` 表里:
+
+| 列 | 说明 |
+| --- | --- |
+| `ts` / `event` | 时间;`submit` / `issue_key` / `revoke_key` / `bootstrap` |
+| `key_id` / `member` / `member_id` | 由哪把 Key、哪位成员发起 |
+| `date` / `mode` / `items` / `report_chars` | 日报日期、`created`/`updated`/`unchanged`、条数、字数 |
+| `duration_ms` / `outcome` / `error_code` / `error_message` | 耗时与结果(失败原因) |
+| `release_version` / `user_agent` / `country` | 客户端版本、UA、来源国家 |
+
+```bash
+node scripts/digest-admin.mjs logs --limit 50            # 最近 50 条
+node scripts/digest-admin.mjs logs --member zhangsan --date 2026-09-13
+node scripts/digest-admin.mjs logs --outcome error       # 只看失败
+```
+
+直接查库(不经后端):
+
+```bash
+npx wrangler d1 execute daily-agent-digest-logs --remote \
+  --command "SELECT ts, event, outcome, member_id, error_code FROM audit_log ORDER BY id DESC LIMIT 20"
+```
+
+日志写入是 **best-effort**:D1 出问题不会影响日报提交(有测试覆盖)。定时任务每小时清理一次,
+默认保留 **180 天**(`logs.js` 的 `pruneLogs`)。
+

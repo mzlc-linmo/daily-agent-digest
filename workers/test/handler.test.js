@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/handler.js';
 import { processRequests, requestFieldDefs, registryFieldDefs, REQUESTS, REGISTRY } from '../src/registry.js';
+import { logEvent, queryLogs } from '../src/logs.js';
 import { sha256Hex } from '../src/report.js';
 import { FIELDS } from '../src/report.js';
 
@@ -116,10 +117,33 @@ function fakeFeishu() {
   };
 }
 
+/// 假 D1:记录 INSERT,可按需让 run() 抛错(验证"日志失败不影响业务")。
+function fakeDB({ failOnInsert = false } = {}) {
+  const inserted = [];
+  return {
+    inserted,
+    prepare(sql) {
+      const stmt = {
+        params: [],
+        bind(...params) { stmt.params = params; return stmt; },
+        async run() {
+          if (/INSERT/i.test(sql)) {
+            if (failOnInsert) throw new Error('D1 不可用');
+            inserted.push(Object.fromEntries(sql.match(/\((.*?)\)/s)[1].split(',').map((c) => c.trim()).map((c, i) => [c, stmt.params[i]])));
+          }
+          return { meta: { changes: 1 } };
+        },
+        async all() { return { results: inserted }; },
+      };
+      return stmt;
+    },
+  };
+}
+
 function post(path, body, { key = KEY, headers = {} } = {}) {
   return new Request(`https://digest.example.com${path}`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...headers },
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'test-agent', ...headers },
     body: typeof body === 'string' ? body : JSON.stringify(body),
   });
 }
@@ -555,6 +579,79 @@ test('建表字段定义必须覆盖运行时用到的每一个字段', async ()
   for (const needed of ['待处理', '已签发', '已撤销']) {
     assert.ok(options.includes(needed), `状态缺少选项「${needed}」`);
   }
+});
+
+test('成功提交写入审计日志', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB() };
+  const res = await handleRequest(post('/api/v1/digests', REPORT), env, { feishu });
+  assert.equal(res.status, 201);
+  const row = env.DB.inserted.find((r) => r.event === 'submit');
+  assert.ok(row, '应写入 submit 事件');
+  assert.equal(row.outcome, 'ok');
+  assert.equal(row.member_id, 'zhangsan');
+  assert.equal(row.date, REPORT.date);
+  assert.equal(row.items, REPORT.work_items.length);
+  assert.equal(row.mode, 'created');
+  assert.equal(row.user_agent, 'test-agent');
+});
+
+test('失败的提交同样入日志(鉴权失败/校验失败)', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB() };
+  await handleRequest(post('/api/v1/digests', REPORT, { key: 'dag_bad_wrong' }), env, { feishu });
+  await handleRequest(post('/api/v1/digests', { ...REPORT, work_items: [] }), env, { feishu });
+  const errors = env.DB.inserted.filter((r) => r.event === 'submit' && r.outcome === 'error');
+  assert.equal(errors.length, 2, '两次失败都要留痕');
+  assert.deepEqual(errors.map((r) => r.error_code).sort(), ['invalid_key', 'validation_failed']);
+});
+
+test('日志写失败不影响日报提交', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB({ failOnInsert: true }) };
+  const res = await handleRequest(post('/api/v1/digests', REPORT), env, { feishu });
+  assert.equal(res.status, 201, 'D1 出问题不能拖垮提交');
+});
+
+test('没绑定 D1 时日志静默跳过', async () => {
+  const env = { ...ENV };
+  delete env.DB;
+  assert.equal(await logEvent(env, { event: 'submit', outcome: 'ok' }), false);
+  const feishu = fakeFeishu();
+  const res = await handleRequest(post('/api/v1/digests', REPORT), env, { feishu });
+  assert.equal(res.status, 201);
+});
+
+test('签发与撤销也写入审计日志', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB(), KEYS: fakeKV() };
+  const auth = { Authorization: `Bearer ${ENV.ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
+  await handleRequest(new Request('https://digest.example.com/admin/keys', {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ member_id: 'zhaoliu', member: '赵六', open_id: 'ou_zhaoliu' }),
+  }), env, { feishu });
+  await handleRequest(new Request('https://digest.example.com/admin/keys/revoke', {
+    method: 'POST', headers: auth, body: JSON.stringify({ key_id: 'k1' }),
+  }), env, { feishu });
+  const events = env.DB.inserted.map((r) => r.event);
+  assert.ok(events.includes('issue_key'), JSON.stringify(events));
+  assert.ok(events.includes('revoke_key'), JSON.stringify(events));
+});
+
+test('日志查询接口需要管理口令,并能按条件过滤', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB() };
+  await logEvent(env, { event: 'submit', outcome: 'ok', member_id: 'zhangsan', date: '2026-09-13' });
+
+  const denied = await handleRequest(new Request('https://digest.example.com/admin/logs'), env, { feishu });
+  assert.equal(denied.status, 401, '没有管理口令不得读日志');
+
+  const ok = await handleRequest(new Request('https://digest.example.com/admin/logs?member_id=zhangsan', {
+    headers: { Authorization: `Bearer ${ENV.ADMIN_TOKEN}` },
+  }), env, { feishu });
+  assert.equal(ok.status, 200);
+  const body = await ok.json();
+  assert.ok(Array.isArray(body.logs));
 });
 
 test('未知路径返回 404', async () => {
