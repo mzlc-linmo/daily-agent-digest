@@ -230,10 +230,26 @@ python3 -m unittest discover -s tests     # engine tests
 
 Pushing a `v*` tag builds both architectures on macOS runners and publishes one release with:
 
-- `daily-agent-digest-macos-arm64` / `-x86_64` — standalone engine binaries;
-- `Daily-Agent-Digest-arm64.dmg` / `-x86_64.dmg` — drag-to-Applications installers;
-- `Daily-Agent-Digest-<arch>-app.zip` — the app bundle;
-- `install.sh` and `SHA256SUMS`.
+| Asset | What it is | How to use it |
+| --- | --- | --- |
+| `Daily-Agent-Digest-arm64.dmg` / `-x86_64.dmg` | Drag-to-Applications installer (**this is what you want**) | Open it, drag the app into Applications |
+| `Daily-Agent-Digest-<arch>-app.zip` | The app bundle, used by `install.sh` | Unzip, or let `install.sh` handle it |
+| `daily-agent-digest-macos-arm64` / `-x86_64` | The engine executable — a **Mach-O binary**, not a text file | Run it from a terminal; never double-click it |
+| `install.sh` + `SHA256SUMS` | Script installer and checksums | `curl … \| sh`, or `shasum -a 256 -c SHA256SUMS` |
+
+> **Don't double-click the bare `daily-agent-digest-macos-*` asset.** It has no file
+> extension and no app bundle, so macOS hands it to TextEdit, which fails with 「文本编码
+> Unicode (UTF-8) 不适用」. That dialog means the file is fine — it is a program, not
+> a document. To use it anyway:
+>
+> ```bash
+> chmod +x daily-agent-digest-macos-arm64       # browsers may drop the executable bit
+> ./daily-agent-digest-macos-arm64 --help
+> ```
+>
+> It is a command-line engine: it reads `~/Library/Application Support/Daily Agent Digest/.env`
+> and prints JSON. All day-to-day use goes through the menu-bar app, whose settings live behind
+> the tray menu → 设置 — there is no config file to open by hand.
 
 When the Apple signing secrets are configured (`APPLE_CERTIFICATE_BASE64`,
 `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_APP_PASSWORD`,
