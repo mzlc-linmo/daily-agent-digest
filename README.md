@@ -3,13 +3,13 @@
 [![Build release binaries](https://github.com/mzlc-linmo/daily-agent-digest/actions/workflows/build-release.yml/badge.svg)](https://github.com/mzlc-linmo/daily-agent-digest/actions/workflows/build-release.yml)
 
 A macOS menu-bar app that turns a day of local AI coding-agent sessions into a short,
-structured work digest, then submits it to a team Feishu (Lark) Bitable with one API
-address and one API key.
+structured work digest — one LLM pass, a list of work items you can edit — then exports it as
+Markdown or sends it to a server you point it at.
 
 It reads the session logs that AI coding agents already keep on disk — Codex, pi and
 DeepSeek Harness — keeps only what a work report needs, and asks a single LLM pass for a
 list of work items. You review that list in a menu-bar panel, exclude anything that is not
-work, and upload the rest.
+work, and export the rest.
 
 ## What it does
 
@@ -22,9 +22,11 @@ work, and upload the rest.
 - **Produces a structured report, not prose.** The LLM returns `{title, desc}` per work
   item; the app renders each included item as a heading plus its own body. Excluding an
   item is a plain array filter — instant, no extra LLM call, fully reversible.
-- **Uploads to your own backend.** Digests are submitted over HTTPS to a Cloudflare Worker
-  that writes them into a Feishu Bitable, so a regenerated report overwrites the previous
-  version of that day instead of duplicating it.
+- **Exports the report as Markdown.** One button in the report window opens the day's report
+  as a Markdown document you can copy or save, ready to paste into a wiki, a ticket or a chat.
+- **Can submit to a server (server side not built yet).** The client keeps a working submit
+  path — an address plus a key, `POST /api/v1/digests` — but this repository no longer ships
+  a backend. See [Submission](#submission-server-side-pending).
 
 ## Requirements
 
@@ -137,44 +139,59 @@ rather than in a shell rc file.
 If the LLM is unavailable, generation fails with the provider error in the window instead of
 silently reporting an empty day.
 
-## Submission service
+## Submission (server side pending)
 
-The backend is a zero-dependency Cloudflare Worker in `workers/`: Workers KV stores member
-keys, D1 stores an audit log (180-day retention) and the Feishu Bitable is the system of
-record. It exposes four member endpoints:
+The earlier plan — a Cloudflare Worker writing the digest into a Feishu Bitable — has been
+**dropped**, and its code has been removed from this repository. What remains is the client
+half of that contract, which still works against any server that implements it:
 
-| Endpoint | Purpose |
+| Client behaviour | Contract |
 | --- | --- |
-| `GET /healthz` | Liveness, including a Feishu reachability check |
-| `GET /api/v1/me` | Who the presented key belongs to (`member`, `member_id`, `key_id`) |
-| `GET /api/v1/digests?date=YYYY-MM-DD` | Whether that day was submitted, and its fingerprint |
-| `POST /api/v1/digests` | Submit or overwrite one day's digest |
+| 设置 → 提交地址 + 提交 API Key | Stored in `.env` as `DIGEST_SUBMIT_URL` / `DIGEST_API_KEY` (mode `600`) |
+| 测试连接 | `GET {DIGEST_SUBMIT_URL}/api/v1/me` with `Authorization: Bearer <key>` → `{member, member_id, key_id}` |
+| 上传 | `POST {DIGEST_SUBMIT_URL}/api/v1/digests` with the same header → `{mode: created\|updated\|unchanged, submitted_at}` |
+| 上传失败 | Recorded as `submit_status=failed` + `submit_error`; the report is **never** marked as sent unless the server answered with a recognised result |
 
-Reads are scoped to the caller's own key: the digest query looks up the record id derived
-from the authenticated member, so one member key cannot inspect another member's data.
+Until that server exists, use **Markdown** export (below) to hand the report over by hand,
+and leave 提交地址 empty — the app then reports `submit_status=not_configured` instead of
+pretending the digest was delivered.
 
-Keys are only issued by an operator, never self-service: a key is bound to a person at
-issuance, and each person has at most one active key. The plaintext key is displayed exactly
-once; afterwards only a masked form can be listed. Revoking or rotating a key takes effect
-immediately, and every issue, revoke, submit and bootstrap event is written to the audit log.
+> Removed along with the Worker: member keys and their issuance CLI, the D1 audit log, the
+> Feishu Bitable writer, and the deployment/recovery tooling. If a future server is built,
+> the four endpoints above are all it has to provide.
 
-Operators manage the deployment with a local interactive CLI (arrow-key menus, no
-hand-editing of config files):
+## 日报 Markdown
 
-```bash
-cd workers
-node scripts/digest-admin.mjs
+The report window has a **Markdown** button. It opens the current report as a Markdown
+document — one `##` heading per included item, its body underneath, and a small metadata
+footer (date, item count, character count):
+
+```markdown
+# 今日工作日报 · 2026-09-14
+
+## 1. 修复日报提交的重复写入
+
+把提交改为按天覆盖,重新生成不再产生重复行……
+
+## 2. 梳理托盘菜单
+
+……
+
+---
+
+- 日期:2026-09-14
+- 工作项:2 项
+- 正文合计:412 字
 ```
 
-It can run the whole setup in one pass — verify Feishu credentials → create KV/D1 and deploy
-the Worker → create the Bitable tables and write back their ids → manage members and keys —
-and it can also be driven by subcommands (`install`, `deploy`, `tables`, `members`, `logs`)
-for scripted use. See `workers/README.md` and `docs/backend-design.md`.
+Excluded items are not in the document, so the Markdown always matches what the window shows.
+The panel offers 复制 (to the clipboard) and 保存为 .md…, and the text can be selected
+directly.
 
 ## Repository layout
 
 ```
-daily_agent_digest.py        Engine: collection, extraction, summarization, submission
+daily_agent_digest.py        Engine: collection, extraction, summarization, Markdown/submit
 native/macos/                Menu-bar app (Swift/AppKit) and its build script
 native/windows/              Windows tray prototype (compiled in CI, not released)
 install.sh                   Script installer for macOS
@@ -183,8 +200,7 @@ scripts/ci-notarize.sh       Notarize + staple the engine, the app and the DMG
 scripts/dev.sh               Isolated local development harness
 scripts/release-audit.sh     Pre-release audit of release artifacts
 tests/test_core.py           Engine protocol tests
-workers/                     Cloudflare Worker, D1 schema, admin CLI, Worker tests
-docs/                        Requirements baseline, backend design, development notes
+docs/                        Requirements baseline and development notes
 ```
 
 ## Local development
@@ -206,8 +222,7 @@ See `docs/development.md` (Chinese) for the full command list and isolation guar
 Tests:
 
 ```bash
-python3 -m unittest discover -s tests     # 35 engine tests
-cd workers && npm test                    # 34 Worker tests
+python3 -m unittest discover -s tests     # engine tests
 ./native/macos/ui-smoke-test.sh           # compiles the app and runs its self-test
 ```
 

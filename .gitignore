@@ -1,6 +1,6 @@
 .env
 .env.*
-# 只忽略运行期产物,不要用 *.json —— 那会把 workers/package.json 这类源码配置一起忽略掉
+# 只忽略运行期产物,不要用 *.json —— 那会把 package.json 这类源码配置一起忽略掉
 state.json
 *.local.json
 *.jsonl
@@ -16,12 +16,3 @@ dist/
 # Local development harness runtime (scripts/dev.sh): isolated home, fixture
 # source tree, logs, dev app bundle and the seeded .env.
 .dev/
-
-# Cloudflare Worker(workers/)
-workers/node_modules/
-workers/.wrangler/
-workers/.dev.vars
-# 操作机上的真实配置(token / 表 id / KV / D1 / 子域)。仓库只跟踪模板
-# wrangler.toml.example;deploy / tables / adopt 都写入这份被忽略的文件,
-# 所以 `git status` 始终干净,也不会不小心把真实标识符提交进公开仓库。
-workers/wrangler.toml

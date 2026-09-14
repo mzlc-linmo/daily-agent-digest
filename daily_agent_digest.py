@@ -5,7 +5,7 @@ from pathlib import Path
 TZ = dt.timezone(dt.timedelta(hours=8))
 APP_DIR = Path(os.getenv('DIGEST_HOME', Path.home()/'Library/Application Support/Daily Agent Digest'))
 RELEASE_VERSION = os.getenv('DIGEST_RELEASE_VERSION', 'dev')
-# Cloudflare 会拦截 Python-urllib 的默认 UA(错误码 1010),必须带自己的标识。
+# 服务端/CDN 可能拦截 Python-urllib 的默认 UA(例如 Cloudflare 的 1010),所以带自己的标识。
 USER_AGENT = f'DailyAgentDigest/{RELEASE_VERSION}'
 
 # Report contract (docs/requirements.md FR-3.11). The whole report is
@@ -535,7 +535,10 @@ def app_command(command, data):
     raise ValueError('unknown app command')
 
 def submit(day):
-    """把当天的日报提交到提交服务,由服务端写入飞书多维表格。
+    """把当天的日报提交到提交服务(地址与 Key 由设置界面配置)。
+
+    服务端实现不在本仓库:只要它提供 POST /api/v1/digests 并能按「成员 + 日期」覆盖即可。
+    (此前的 Cloudflare Worker + 飞书方案已废弃并删除。)
 
     未配置提交地址/Key,或服务端返回非 2xx 时**绝不**把状态置为 submitted:
     那会让界面以为日报已经送达。改为持久化 submit_status / submit_error,便于重试与排查。
@@ -587,7 +590,7 @@ def fail_submit(state, day, message):
     write_state(state); return state
 
 def check_submit(data=None):
-    """调 GET /api/v1/me 校验地址与 Key,供设置界面"测试连接"并回填姓名。
+    """调 GET /api/v1/me 校验地址与 Key,供设置界面"测试连接"并回填成员名。
 
     传入 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
     """

@@ -133,6 +133,8 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     let table = NSTableView()
     let status = NSTextField(labelWithString: "")
     let upload = NSButton(title: "上传", target: nil, action: nil)
+    /// 把当日日报导出成 Markdown 文档(可复制 / 保存)。
+    let markdown = NSButton(title: "Markdown", target: nil, action: nil)
     let summary = NSTextView()
     let heading = NSTextField(labelWithString: "今日工作日报")
     let metadata = NSTextField(labelWithString: "")
@@ -147,6 +149,10 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
     var stateRelease = "unknown"
     var stateUIBuild = "unknown"
     var stateChars = 0
+    /// Markdown 文档面板(非模态:可以一边看文档一边在报告窗口里排除条目后重新导出)
+    var markdownPanel: NSPanel?
+    var markdownView: NSTextView?
+    var markdownStatus: NSTextField?
     /// Must match REPORT_CHAR_LIMIT in daily_agent_digest.py; shown so the
     /// documented report length is visible while reading.
     static let reportCharLimit = 1000
@@ -204,6 +210,7 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         status.frame = NSRect(x: 28, y: 24, width: 804, height: 24)
         view.addSubview(status)
         view.addSubview(upload)
+        view.addSubview(markdown)
 
         let w = NSWindow(contentRect: view.bounds, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.contentView = view
@@ -212,6 +219,9 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
         super.init(window: w)
         upload.target = self; upload.action = #selector(submitNow)
         upload.bezelStyle = .rounded
+        markdown.target = self; markdown.action = #selector(showMarkdown)
+        markdown.bezelStyle = .rounded
+        markdown.toolTip = "把当日日报显示为 Markdown 文档,可复制或保存为 .md"
         table.dataSource = self
         table.delegate = self
         w.delegate = self
@@ -347,8 +357,9 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
 
         itemsLabel.frame = NSRect(x: pad, y: summaryScroll.frame.minY - 30, width: 200, height: 22)
         tableScroll.frame = NSRect(x: pad, y: 72, width: boxWidth, height: max(60, itemsLabel.frame.minY - 12 - 72))
-        status.frame = NSRect(x: pad, y: 24, width: boxWidth - 96, height: 24)
+        status.frame = NSRect(x: pad, y: 24, width: boxWidth - 200, height: 24)
         upload.frame = NSRect(x: pad + boxWidth - 80, y: 22, width: 80, height: 26)
+        markdown.frame = NSRect(x: pad + boxWidth - 80 - 8 - 96, y: 22, width: 96, height: 26)
         DebugLog.write("report relayout summaryNeeded=\(Int(needed)) summaryBox=\(Int(boxHeight)) table=\(Int(tableScroll.frame.width))x\(Int(tableScroll.frame.height)) items=\(items.count)")
     }
     func numberOfRows(in tableView: NSTableView) -> Int { items.count }
@@ -459,6 +470,135 @@ final class ReportController: NSWindowController, NSTableViewDataSource, NSTable
                          width: ReportController.buttonWidth, height: 26)
         cell.addSubview(b)
         return cell
+    }
+
+    /// 单条正文的字数:优先用引擎算好的 `chars`,没有就按描述长度兜底。
+    static func itemChars(_ item: [String: Any]) -> Int {
+        if let chars = item["chars"] as? Int { return chars }
+        return (item["desc"] as? String ?? "").count
+    }
+
+    /// 把当日日报渲染成 Markdown 文档。
+    ///
+    /// 只包含**未排除**的条目,所以文档与报告窗口里看到的始终一致;
+    /// 排除是纯数组过滤,这里不需要(也不应该)再问一次 LLM。
+    static func markdownDocument(items: [[String: Any]], day: String) -> String {
+        let included = items.filter { ($0["excluded"] as? Bool) != true }
+        var lines: [String] = ["# 今日工作日报 · \(day.isEmpty ? "未知日期" : day)", ""]
+        if included.isEmpty {
+            lines.append("_今天没有计入的条目。_")
+            lines.append("")
+        } else {
+            for (index, item) in included.enumerated() {
+                let title = (item["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let desc = (item["desc"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                lines.append("## \(index + 1). \(title.isEmpty ? "(无标题)" : title)")
+                lines.append("")
+                if !desc.isEmpty {
+                    lines.append(desc)
+                    lines.append("")
+                }
+            }
+        }
+        lines.append("---")
+        lines.append("")
+        lines.append("- 日期:\(day.isEmpty ? "未知" : day)")
+        lines.append("- 工作项:\(included.count) 项")
+        lines.append("- 正文合计:\(included.reduce(0) { $0 + itemChars($1) }) 字")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// 打开(或刷新)Markdown 文档面板。
+    @objc func showMarkdown() {
+        let document = ReportController.markdownDocument(items: items, day: stateDay)
+        if let panel = markdownPanel, let text = markdownView {
+            text.string = document
+            markdownStatus?.stringValue = "已按当前条目重新生成(\(document.count) 字)"
+            markdownStatus?.textColor = .secondaryLabelColor
+            panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let width: CGFloat = 700, height: CGFloat = 560
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        panel.title = "日报 Markdown"
+        panel.isReleasedWhenClosed = false
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let scroll = NSScrollView(frame: NSRect(x: 16, y: 62, width: width - 32, height: height - 78))
+        scroll.hasVerticalScroller = true
+        scroll.autoresizingMask = [.width, .height]
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: width - 32, height: height - 78))
+        text.string = document
+        text.isEditable = false            // 只读:这是导出结果,不是编辑器
+        text.isSelectable = true
+        text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        text.autoresizingMask = [.width]
+        text.textContainerInset = NSSize(width: 8, height: 8)
+        scroll.documentView = text
+        content.addSubview(scroll)
+
+        let statusLabel = NSTextField(labelWithString: "Markdown 源码,可直接选中复制,或点「复制」「保存为 .md…」")
+        statusLabel.frame = NSRect(x: 16, y: 34, width: width - 300, height: 20)
+        statusLabel.font = NSFont.systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        content.addSubview(statusLabel)
+
+        func addButton(_ title: String, _ action: Selector, _ x: CGFloat, _ w: CGFloat) {
+            let b = NSButton(title: title, target: self, action: action)
+            b.frame = NSRect(x: x, y: 30, width: w, height: 28)
+            b.bezelStyle = .rounded
+            content.addSubview(b)
+        }
+        addButton("复制", #selector(copyMarkdown), width - 16 - 76 - 8 - 120 - 8 - 76, 76)
+        addButton("保存为 .md…", #selector(saveMarkdown), width - 16 - 76 - 8 - 120, 120)
+        addButton("关闭", #selector(closeMarkdownPanel), width - 16 - 76, 76)
+
+        panel.contentView = content
+        markdownPanel = panel
+        markdownView = text
+        markdownStatus = statusLabel
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        DebugLog.write("markdown panel shown chars=\(document.count) items=\(items.count)")
+    }
+
+    @objc func copyMarkdown() {
+        let document = markdownView?.string ?? ReportController.markdownDocument(items: items, day: stateDay)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(document, forType: .string)
+        markdownStatus?.stringValue = "已复制到剪贴板(\(document.count) 字)"
+        markdownStatus?.textColor = .systemGreen
+    }
+
+    @objc func saveMarkdown() {
+        let document = markdownView?.string ?? ReportController.markdownDocument(items: items, day: stateDay)
+        let save = NSSavePanel()
+        save.nameFieldStringValue = "日报-\(stateDay.isEmpty ? "未生成" : stateDay).md"
+        save.canCreateDirectories = true
+        save.begin { [weak self] response in
+            guard let self = self, response == .OK, let url = save.url else { return }
+            do {
+                try document.write(to: url, atomically: true, encoding: .utf8)
+                self.markdownStatus?.stringValue = "已保存:\(url.path)"
+                self.markdownStatus?.textColor = .systemGreen
+                DebugLog.write("markdown saved path=\(url.path) chars=\(document.count)")
+            } catch {
+                self.markdownStatus?.stringValue = "保存失败:\(error.localizedDescription)"
+                self.markdownStatus?.textColor = .systemRed
+            }
+        }
+    }
+
+    @objc func closeMarkdownPanel() {
+        markdownPanel?.close()
+        markdownPanel = nil
+        markdownView = nil
+        markdownStatus = nil
     }
 
     /// 手动上传:把当前日报提交到服务端(定时任务之外的手动入口)。
@@ -1175,6 +1315,37 @@ enum SelfTest {
             print("PASS short text measures one line -> \(shortHeight)pt")
         }
 
+        // Markdown 导出:只含计入的条目、编号连续、页脚统计与条目一致。
+        let mdItems: [[String: Any]] = [
+            ["title": "修复重复写入", "desc": "把提交改为按天覆盖。", "chars": 12, "excluded": false],
+            ["title": "被排除的主题", "desc": "不该出现在文档里。", "chars": 99, "excluded": true],
+            ["title": "梳理托盘菜单", "desc": "菜单项与快捷键。", "chars": 9, "excluded": false],
+        ]
+        let doc = ReportController.markdownDocument(items: mdItems, day: "2026-09-14")
+        let mdChecks: [(String, Bool)] = [
+            ("标题含日期", doc.contains("# 今日工作日报 · 2026-09-14")),
+            ("第一条编号为 1", doc.contains("## 1. 修复重复写入")),
+            ("排除中间项后编号仍连续", doc.contains("## 2. 梳理托盘菜单")),
+            ("正文跟在标题下", doc.contains("把提交改为按天覆盖。")),
+            ("排除项不出现", !doc.contains("被排除的主题")),
+            ("工作项计数正确", doc.contains("- 工作项:2 项")),
+            ("字数合计正确", doc.contains("- 正文合计:21 字")),
+        ]
+        let mdWrong = mdChecks.filter { !$0.1 }.map { $0.0 }
+        if mdWrong.isEmpty {
+            print("PASS markdown export contains only included items, numbered and counted")
+        } else {
+            passed = false
+            print("FAIL markdown export wrong: \(mdWrong)")
+        }
+        let emptyDoc = ReportController.markdownDocument(items: [], day: "")
+        if emptyDoc.contains("没有计入的条目"), emptyDoc.contains("- 工作项:0 项"), emptyDoc.contains("未知日期") {
+            print("PASS markdown export handles an empty report")
+        } else {
+            passed = false
+            print("FAIL markdown export empty case wrong")
+        }
+
         // 自动 tick 门控:改坏了就等于"自动出报/自动提交"静默失效,或者又变回每分钟空转。
         let cal = AppDelegate.calendar()
         func at(_ day: String, _ hour: Int, _ minute: Int) -> Date {
@@ -1271,6 +1442,17 @@ if CommandLine.arguments.contains("--paste-check") {
         exit(1)
     }
     print("SKIP 当前环境无法构造 field editor,只验证了菜单接线")
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--markdown-demo") {
+    // 无头打印一份样例文档:Markdown 导出的格式不需要开 GUI 就能核对。
+    let sample: [[String: Any]] = [
+        ["title": "修复日报提交的重复写入", "desc": "把提交改为按天覆盖,重新生成不再产生重复行,并在状态里记录 submit_mode 便于排查。", "chars": 82, "excluded": false],
+        ["title": "排查设置窗口卡顿", "desc": "定位到每次调用都要重新解包引擎,改为 onedir 后单次启动从 5 秒降到 0.07 秒。", "chars": 74, "excluded": false],
+        ["title": "内部调试记录(已排除)", "desc": "这一项被排除了,不该出现在文档里。", "chars": 40, "excluded": true],
+    ]
+    print(ReportController.markdownDocument(items: sample, day: "2026-09-14"), terminator: "")
     exit(0)
 }
 

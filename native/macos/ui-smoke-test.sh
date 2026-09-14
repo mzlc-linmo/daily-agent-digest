@@ -81,4 +81,16 @@ echo "== paste into a settings field =="
 "$BIN" --paste-check
 
 echo
+echo "== markdown export =="
+MD=$("$BIN" --markdown-demo)
+printf '%s\n' "$MD" | head -3 | sed 's/^/  /'
+printf '%s\n' "$MD" | grep -q '^# 今日工作日报 · 2026-09-14$' || {
+  echo "smoke: markdown 标题格式不对" >&2; exit 1; }
+printf '%s\n' "$MD" | grep -q '^## 2\. ' || {
+  echo "smoke: markdown 缺少第二条编号" >&2; exit 1; }
+printf '%s\n' "$MD" | grep -q '已排除' && {
+  echo "smoke: 被排除的条目不应出现在 markdown 里" >&2; exit 1; }
+echo "markdown export ok"
+
+echo
 echo "ui smoke test passed"
