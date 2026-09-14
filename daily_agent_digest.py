@@ -3,7 +3,7 @@ import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, ssl, ur
 from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
-APP_DIR = Path(os.getenv('DIGEST_HOME', Path.home()/'.local/share/daily-agent-digest'))
+APP_DIR = Path(os.getenv('DIGEST_HOME', Path.home()/'Library/Application Support/Daily Agent Digest'))
 RELEASE_VERSION = os.getenv('DIGEST_RELEASE_VERSION', 'dev')
 # Cloudflare 会拦截 Python-urllib 的默认 UA(错误码 1010),必须带自己的标识。
 USER_AGENT = f'DailyAgentDigest/{RELEASE_VERSION}'

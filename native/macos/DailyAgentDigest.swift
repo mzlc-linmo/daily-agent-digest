@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 enum DebugLog {
     static let enabled = ProcessInfo.processInfo.environment["DIGEST_DEBUG"] == "1"
@@ -51,7 +52,18 @@ final class Backend {
     static let defaultTimeout: TimeInterval = 60
     static let generateTimeout: TimeInterval = 600
     init() {
-        executable = ProcessInfo.processInfo.environment["DIGEST_ENGINE"] ?? (FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest/daily-agent-digest")
+        // 优先用 App 包内的引擎(DMG 安装后开箱即用);其次环境变量(开发版);
+        // 最后才是旧安装路径(兼容 install.sh 装出来的布局)。
+        // 两处都认:CI 把引擎放在 Contents/MacOS(与主程序同级,签名顺序更简单),
+        // 本地/未来布局可能放 Contents/Resources。
+        let bundleRoot = Bundle.main.bundleURL
+        let bundledCandidates = [
+            bundleRoot.appendingPathComponent("Contents/Resources/daily-agent-digest").path,
+            bundleRoot.appendingPathComponent("Contents/MacOS/daily-agent-digest").path,
+        ]
+        executable = ProcessInfo.processInfo.environment["DIGEST_ENGINE"]
+            ?? bundledCandidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/daily-agent-digest/daily-agent-digest"
         DebugLog.write("backend executable=\(executable)")
     }
     func call(_ command: String, _ input: [String: Any] = [:], timeout: TimeInterval = Backend.defaultTimeout, completion: @escaping ([String: Any]) -> Void) {
@@ -501,7 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return image
             }
             return NSImage(systemSymbolName: "checklist", accessibilityDescription: "Daily Agent Digest")
-        }(); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
+        }(); let m=NSMenu(); m.addItem(NSMenuItem(title:"查看今日总结", action:#selector(show), keyEquivalent:"")); m.addItem(NSMenuItem(title:"生成今日总结", action:#selector(generate), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"设置", action:#selector(settings), keyEquivalent:",")); m.addItem(NSMenuItem(title:"开机自启", action:#selector(toggleLoginItem), keyEquivalent:"")); m.addItem(NSMenuItem.separator()); m.addItem(NSMenuItem(title:"关于", action:#selector(about), keyEquivalent:"")); m.addItem(NSMenuItem(title:"退出", action:#selector(quit), keyEquivalent:"q")); statusItem.menu=m; report=ReportController(backend:backend); ensureLoginItem(); let tickTimer=Timer(timeInterval:60,repeats:true){ [weak self] _ in
               // tick 可能触发完整的 LLM 生成(实测 40s+,超时更久):默认 60s 会被 watchdog
               // 杀掉,state 不落盘、下一分钟重试再被杀,自动出报可能永远失败。
               self?.backend.call("tick", [:], timeout: Backend.generateTimeout) { obj in
@@ -821,6 +833,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsPanel = nil
         settingsFields = [:]
         settingsStatus = nil
+    }
+
+    /// 统一的小提示弹窗(始终置顶)
+    func showInfo(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        presentAlert(alert)
+    }
+
+    /// 开机自启:用 SMAppService 注册为登录项,不再依赖 launchd plist。
+    private func loginItemEnabled() -> Bool {
+        if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
+        return false
+    }
+
+    private func ensureLoginItem() {
+        guard #available(macOS 13.0, *) else { return }
+        if SMAppService.mainApp.status != .enabled {
+            do { try SMAppService.mainApp.register(); DebugLog.write("login item registered") }
+            catch { DebugLog.write("login item register failed: \(error.localizedDescription)") }
+        }
+    }
+
+    @objc func toggleLoginItem() {
+        guard #available(macOS 13.0, *) else { showInfo("不支持", "开机自启需要 macOS 13 或更新版本。"); return }
+        do {
+            if loginItemEnabled() { try SMAppService.mainApp.unregister(); showInfo("已关闭", "已取消开机自启。") }
+            else { try SMAppService.mainApp.register(); showInfo("已开启", "开机后会随登录自动启动。") }
+        } catch { showInfo("设置失败", error.localizedDescription) }
     }
 
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }

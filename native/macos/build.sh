@@ -29,6 +29,18 @@ cp "$ASSETS/AppIcon.icns" "$OUT/Contents/Resources/AppIcon.icns"
 swift "$(dirname "$0")/make-menubar-icon.swift" "$ASSETS/app-icon-1024.png" "$ASSETS" >/dev/null
 cp "$ASSETS"/MenuBarIconTemplate*.png "$OUT/Contents/Resources/"
 
+# 引擎进包:DMG 安装后不需要额外下载引擎。CI 通过 DIGEST_ENGINE_BIN 指定产物,
+  # 本地构建没有引擎时跳过(App 会回退到旧路径,不影响开发)。
+ENGINE_BIN=${DIGEST_ENGINE_BIN:-}
+if [ -n "$ENGINE_BIN" ] && [ -f "$ENGINE_BIN" ]; then
+  cp "$ENGINE_BIN" "$OUT/Contents/Resources/daily-agent-digest"
+  chmod 755 "$OUT/Contents/Resources/daily-agent-digest"
+  echo "  bundled engine: $ENGINE_BIN"
+fi
+
+# 模块缓存显式指向可写目录:受限环境(沙箱/CI)下 TMPDIR 里的缓存不可写,
+# 会报 "could not build Objective-C module ..."(Swift 与 Clang 是两套缓存)
+export CLANG_MODULE_CACHE_PATH=/tmp/dag-clang-modcache
 swiftc "$(dirname "$0")/DailyAgentDigest.swift" -o "$OUT/Contents/MacOS/DailyAgentDigest"
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>$APP_ID</string><key>CFBundleName</key><string>Daily Agent Digest</string><key>CFBundleDisplayName</key><string>Daily Agent Digest</string><key>CFBundleExecutable</key><string>DailyAgentDigest</string><key>CFBundleIconFile</key><string>AppIcon</string><key>LSUIElement</key><true/><key>CFBundleShortVersionString</key><string>$VERSION</string><key>CFBundleVersion</key><string>$VERSION</string><key>DigestUIBuildID</key><string>$UI_BUILD_ID</string></dict></plist>
