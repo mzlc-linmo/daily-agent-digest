@@ -521,6 +521,20 @@ test('同一成员重新申请时,旧 Key 立即失效(一人一把)', async () 
   assert.ok(firstId);
 });
 
+test('定时任务:申请人不是恰好一人时跳过(不猜身份)', async () => {
+  const feishu = fakeFeishu();
+  const env = await makeEnv();
+  env.KEYS = fakeKV();
+  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{
+    fields: { 申请人: [{ id: 'ou_a', name: 'A' }, { id: 'ou_b', name: 'B' }] },
+  }]);
+  const result = await processRequests(env, feishu);
+  assert.equal(result.issued, 0, '多选时不应签发');
+  assert.equal(env.KEYS.store.size, 0);
+  const row = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0];
+  assert.equal(row['Key'], undefined);
+});
+
 test('未知路径返回 404', async () => {
   const res = await handleRequest(new Request('https://digest.example.com/nope'), ENV, { feishu: fakeFeishu() });
   assert.equal(res.status, 404);

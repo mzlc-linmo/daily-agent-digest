@@ -109,7 +109,9 @@ export async function processRequests(env, feishu) {
     const fields = row.fields ?? {};
     const status = String(fields[f.status] ?? '');
     const keyId = String(fields[f.keyId] ?? '');
-    const person = (fields[f.applicant] ?? [])[0];
+    // 「申请人」是单选人员字段;这里再兜一层:不是恰好一人就不签发,绝不猜。
+    const applicants = fields[f.applicant] ?? [];
+    const person = applicants.length === 1 ? applicants[0] : null;
 
     // 撤销:表里把状态改成「已撤销」即可
     if (status === REQUEST_REVOKED && keyId) {
@@ -131,6 +133,7 @@ export async function processRequests(env, feishu) {
     // 否则真实提交永远拿不到 Key。
     const alreadyIssued = Boolean(fields[f.key]) || Boolean(keyId) || status === REQUEST_ISSUED;
     if (alreadyIssued || status === REQUEST_REVOKED || !person?.id) { skipped += 1; continue; }
+    if (applicants.length !== 1) console.warn(`申请 ${row.record_id} 的申请人数为 ${applicants.length},已跳过`);
     const memberId = String(fields[f.account] ?? '').trim() || `u${String(person.id).slice(-6)}`;
     // 一人一把:作废该成员已有的有效 Key(重复提交不会留下多把永久凭证)
     for (const oldKeyId of await revokeExistingFor(env, person.id)) {
