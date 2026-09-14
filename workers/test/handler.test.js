@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/handler.js';
-import { processRequests } from '../src/registry.js';
+import { processRequests, requestFieldDefs, registryFieldDefs, REQUESTS, REGISTRY } from '../src/registry.js';
 import { sha256Hex } from '../src/report.js';
 import { FIELDS } from '../src/report.js';
 
@@ -533,6 +533,28 @@ test('定时任务:申请人不是恰好一人时跳过(不猜身份)', async ()
   assert.equal(env.KEYS.store.size, 0);
   const row = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0];
   assert.equal(row['Key'], undefined);
+});
+
+test('建表字段定义必须覆盖运行时用到的每一个字段', async () => {
+  // 这组断言是为了防"补丁静默没生效":字段定义漏了,重新 bootstrap 出来的表就会缺列,
+  // 而运行时照旧往那一列写 —— 只有重建表时才会暴露,平时看不出来。
+  const requestNames = requestFieldDefs().map((d) => d.field_name);
+  for (const name of Object.values(REQUESTS.fields)) {
+    assert.ok(requestNames.includes(name), `申请表定义缺少字段「${name}」`);
+  }
+  const registryNames = registryFieldDefs().map((d) => d.field_name);
+  for (const name of Object.values(REGISTRY.fields)) {
+    assert.ok(registryNames.includes(name), `登记表定义缺少字段「${name}」`);
+  }
+  // 申请人是单选人员字段
+  const applicant = requestFieldDefs().find((d) => d.field_name === REQUESTS.fields.applicant);
+  assert.equal(applicant.type, 11);
+  assert.equal(applicant.property.multiple, false, '申请人必须是单选');
+  // 状态选项必须包含运行时实际写入的三个值
+  const options = requestFieldDefs().find((d) => d.field_name === REQUESTS.fields.status).property.options.map((o) => o.name);
+  for (const needed of ['待处理', '已签发', '已撤销']) {
+    assert.ok(options.includes(needed), `状态缺少选项「${needed}」`);
+  }
 });
 
 test('未知路径返回 404', async () => {

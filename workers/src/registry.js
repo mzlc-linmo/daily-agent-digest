@@ -1,8 +1,8 @@
 // 飞书侧的两张管理表:
-//   ① 「成员密钥」登记表 —— 签发/撤销/最近提交自动写入,团队可见、可审计
-//   ② 「密钥申请」表     —— 成员用表单申请,管理员签发后自动回写状态
+//   ① 「成员密钥」登记表 —— 签发/撤销/最近提交自动写入,可审计
+//   ② 「密钥申请」表     —— 成员用表单申请(只填「申请人」),定时任务自动签发并把 Key 写回该行
 //
-// 这两张表是给人和审计看的;鉴权仍然以 KV 为准(KV 是权威,表是台账)。
+// 这两张表只给管理员看(base 已关闭链接分享);鉴权仍然以 KV 为准(KV 是权威,表是台账)。
 // 写入一律 best-effort:台账写失败不能影响成员提交日报。
 
 export const REGISTRY = {
@@ -59,9 +59,12 @@ export function requestFieldDefs() {
   const f = REQUESTS.fields;
   return [
     { field_name: f.title, type: 1 },      // 必须是文本,才能作为主字段
-    { field_name: f.applicant, type: 11 },
+    // 人员(通讯录),只能选一人:一次申请对应一个人
+    { field_name: f.applicant, type: 11, property: { multiple: false } },
+    { field_name: f.account, type: 1 },
     { field_name: f.remark, type: 1 },
-    { field_name: f.status, type: 3, property: { options: [{ name: REQUEST_PENDING }, { name: REQUEST_ISSUED }, { name: '已拒绝' }] } },
+    { field_name: f.status, type: 3, property: { options: [{ name: REQUEST_PENDING }, { name: REQUEST_ISSUED }, { name: REQUEST_REVOKED }] } },
+    { field_name: f.key, type: 1 },
     { field_name: f.keyId, type: 1 },
     { field_name: f.handledAt, type: 5, property: { date_formatter: 'yyyy/MM/dd HH:mm', auto_fill: false } },
   ];
