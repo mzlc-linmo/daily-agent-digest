@@ -5,7 +5,9 @@
 //
 // 所有调用都必须检查响应体里的 `code`:飞书经常在 HTTP 200 下返回业务错误。
 
-const FEISHU_BASE = 'https://open.feishu.cn/open-apis';
+// 默认官方地址。本地联调/测试可用 FEISHU_BASE_URL 指到桩服务;
+// Cloudflare 运行时里没有 process,所以走 globalThis 兜底而不是直接引用。
+const FEISHU_BASE = globalThis.process?.env?.FEISHU_BASE_URL ?? 'https://open.feishu.cn/open-apis';
 const TOKEN_EARLY_REFRESH_MS = 5 * 60 * 1000;
 
 export class FeishuError extends Error {
@@ -194,6 +196,14 @@ export async function createTable(env, { name, fields }) {
 export async function listTables(env) {
   const data = await call(env, `/bitable/v1/apps/${env.BITABLE_APP_TOKEN}/tables`, { query: { page_size: 100 } });
   return data.items ?? [];
+}
+
+/// 知识库(Wiki)里的多维表格:链接给的是 node_token,不是 app_token。
+/// 本地 CLI 收到 /wiki/<node_token> 形式的地址时用它换算成真正的 app_token。
+export async function resolveWikiNode(env, nodeToken) {
+  const data = await call(env, '/wiki/v2/spaces/get_node', { query: { token: nodeToken, obj_type: 'wiki' } });
+  const node = data.node ?? {};
+  return { objToken: node.obj_token ?? '', objType: node.obj_type ?? '', title: node.title ?? '' };
 }
 
 /// 供 /healthz 使用:确认能拿到 token 且表可读。

@@ -116,28 +116,45 @@ node scripts/digest-admin.mjs
 - **占位符状态下不要跑 `deploy` / `tables`**:那会把占位符写进线上 Worker,直接打断所有人上报。命令本身也会拦住你
   (KV/D1 是占位符时明确失败,而不是新建命名空间 —— 新建会丢掉已签发的 Key)。
 
-换机器或配置丢失后,一条命令就能把 KV / D1 找回来:
+换机器或配置丢失后,一条命令就能恢复:
 
 ```bash
 node workers/scripts/digest-admin.mjs adopt
 ```
 
-它会在 Cloudflare 上按名字找到 KV `KEYS` 与 D1 `daily-agent-digest-logs` 并写回本地配置,再问剩下四项
-(回车即保持原值),最后拿 `/healthz` 验一次地址。
+它先从 Cloudflare 按名字找回 KV `KEYS` 与 D1 `daily-agent-digest-logs`,然后**只问一条飞书多维表格链接** ——
+`app_token` 和 `table_id` 本来就在同一条地址栏 URL 里,不该让人分两次回答:
+
+```
+  ── 飞书多维表格 ──
+     在飞书里打开那张日报表,把地址栏整条粘进来即可(两种写法都认):
+       https://<租户>.feishu.cn/base/<app_token>?table=<table_id>
+       https://<租户>.feishu.cn/wiki/<node_token>   (知识库里的表,会自动换算)
+✓ 解析到 app_token = JHoFbrmTBaTN8nsmoYScZyTpnEb
+✓ 飞书校验通过:该 base 下有 2 张表(日报明细、成员)
+✓ 按表名「日报明细」补上 table_id = tblAbCdEf123
+```
+
+细节:
+
+- 链接里带了 `?table=` 就直接用;**没带**就调飞书接口按 `BITABLE_TABLE_NAME`(默认「日报明细」)自动定位并回填;
+- 粘完之后会用飞书接口**校验**一次:token 粘错、表 id 不属于该 base、应用没有该表的权限,都会当场报出来,
+  而不是等到跑 `tables` / `employees` 时才失败;
+- 知识库(`/wiki/…`)链接给的是 `node_token`,会调用 `wiki/v2/spaces/get_node` 换算成真正的 `app_token`
+  (需要本机有飞书 App ID / Secret);
+- KV / D1 若按名字找不到,会**列出账号里现有的名字**,便于用 `--kv-id` / `--d1-id` 指定。
 
 | 缺失项 | 取回方式 |
 | --- | --- |
-| KV 命名空间 id | **`adopt` 自动**(`npx wrangler kv namespace list` 里 `KEYS` 那条) |
-| D1 `database_id` | **`adopt` 自动**(`npx wrangler d1 list`) |
-| 后端地址 `SUBMIT_URL` | **`adopt` 会问**,默认值就是它的当前值;也可以看成员端托盘菜单「设置 → 提交地址」里填着的那个地址 |
-| 飞书主表 token(`BITABLE_APP_TOKEN`) | Cloudflare 控制台 → Workers → `daily-agent-digest-submit` → Settings → Variables → `BITABLE_APP_TOKEN`(**部署时写进去的旧值,最可靠**);或飞书打开那张多维表格,地址栏 `/base/` 后面那一段(形如 `bascnAbCd…`) |
-| 飞书主表 ID(`BITABLE_TABLE_ID`) | 同上那一段 URL 里 `?table=tblXXXX` 的部分,或 Variables 里的 `BITABLE_TABLE_ID` |
-| 飞书 App ID(`FEISHU_APP_ID`) | Variables 里的 `FEISHU_APP_ID`,或飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 |
+| KV 命名空间 id | **`adopt` 自动**(`npx wrangler kv namespace list` 里 `KEYS` 那条);找不到时用 `--kv-id` |
+| D1 `database_id` | **`adopt` 自动**(`npx wrangler d1 list`);找不到时用 `--d1-id` |
+| 飞书主表 token / 表 ID | **`adopt` 只问一条链接**:飞书里打开那张表,地址栏 `/base/<app_token>?table=<table_id>` 整条粘进去 |
+| 飞书 App ID(`FEISHU_APP_ID`) | 飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID |
+| 后端地址 `SUBMIT_URL` | 打开托盘菜单「设置」,『提交地址』那一栏里就是它 |
 | 本地飞书 App Secret | 只用于 CLI 直连飞书:飞书开放平台同一页的 App Secret;写入本机钥匙串 `security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。线上那一份是 Cloudflare secret,读不回明文,也**不需要**重建 |
 
-> 从「知识库 / Wiki」里打开多维表格时,地址栏是 `/wiki/…`,取不到 `bascn…` / `tbl…`。
-> 这种情况请用 Cloudflare 里那个 Worker 的 Variables,或在飞书里把该表从知识库中单独打开一次。
-> `adopt` 在提问前会把上面这些取法逐条打印出来,不用回来翻文档。
+> **不要**指望从 Cloudflare 控制台的 Worker 变量里找回旧值 —— 那里看不到部署时写入的明文(token 只存服务端,
+> 且部署后不保证在界面上可读)。要恢复配置,上面这几条才是可靠路径。
 
 ## 子命令(等价能力)
 

@@ -44,3 +44,54 @@ export function pickD1DatabaseId(d1ListOutput, name = 'daily-agent-digest-logs')
   const id = hit ? String(hit.uuid ?? hit.database_id ?? '').trim() : '';
   return /^[0-9a-f-]{36}$/.test(id) ? id : '';
 }
+
+/// 账号里现有的 KV 命名空间名字,按名字找不到时列出来给人看(好让他用 --kv-id 指定)。
+export function kvNamespaceTitles(kvListOutput) {
+  return parseArray(kvListOutput)
+    .map((item) => String(item?.title ?? '').trim())
+    .filter(Boolean);
+}
+
+/// 账号里现有的 D1 数据库名字,同上。
+export function d1DatabaseNames(d1ListOutput) {
+  return parseArray(d1ListOutput)
+    .map((item) => String(item?.name ?? '').trim())
+    .filter(Boolean);
+}
+
+/// 从飞书多维表格的链接(或直接粘的 id)里解析出 app_token 与 table_id。
+///
+/// 用户手上只有一条地址栏 URL,却要为 app_token 和 table_id 回答两个问题 ——
+/// 那两个值本来就在同一条 URL 里,拆不出人情味:(token 在 /base/ 之后,表 id 在 ?table= 之后)
+///
+/// 支持三种输入:
+///   1. 完整链接   https://<租户>.feishu.cn/base/<app_token>?table=<table_id>&view=…
+///   2. 知识库链接 https://<租户>.feishu.cn/wiki/<node_token>?table=<table_id>
+///      —— wiki 给的是 node_token,不是 app_token,需要再调一次接口换算(kind='wiki')
+///   3. 直接粘 id   app_token 或 table_id
+export function parseBitableInput(input) {
+  const raw = String(input ?? '').trim().replace(/^<|>$/g, '');
+  const result = { appToken: '', tableId: '', nodeToken: '', kind: 'unknown' };
+  if (!raw) return result;
+
+  // 纯 id:没有斜杠/空白
+  if (!/[/\s]/.test(raw)) {
+    if (/^tbl[A-Za-z0-9]{6,}$/.test(raw)) { result.tableId = raw; result.kind = 'tableId'; return result; }
+    if (/^[A-Za-z0-9_-]{10,64}$/.test(raw)) { result.appToken = raw; result.kind = 'appToken'; return result; }
+    return result;
+  }
+
+  let url = null;
+  try { url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`); } catch { url = null; }
+  const path = url ? url.pathname : raw;
+  const search = url ? `${url.search}${url.hash}` : (raw.includes('?') ? raw.slice(raw.indexOf('?')) : '');
+
+  const base = /\/(?:base|bitable)\/([A-Za-z0-9_-]+)/.exec(path);
+  const wiki = /\/wiki\/([A-Za-z0-9_-]+)/.exec(path);
+  if (base) { result.appToken = base[1]; result.kind = 'base'; }
+  else if (wiki) { result.nodeToken = wiki[1]; result.kind = 'wiki'; }
+
+  const table = /[?&#]table=([A-Za-z0-9_-]+)/.exec(search);
+  if (table) result.tableId = table[1];
+  return result;
+}

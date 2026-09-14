@@ -29,7 +29,8 @@ import {
   listKeysLocally, logsLocally, revokeLocally,
 } from './local-admin.mjs';
 import { isPlaceholder, issueReportLines, knownSubmitUrl, parseDeployedUrl, placeholderLabels, resolveSubmitUrl } from './issue-report.mjs';
-import { pickD1DatabaseId, pickKvNamespaceId } from './recover.mjs';
+import { d1DatabaseNames, kvNamespaceTitles, parseBitableInput, pickD1DatabaseId, pickKvNamespaceId } from './recover.mjs';
+import { listTables, resolveWikiNode } from '../src/feishu.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TOML_PATH = path.join(ROOT, 'wrangler.toml');
@@ -662,6 +663,52 @@ async function cmdDeploy(flags) {
   else warn('部署成功但没解析到地址,请手动把 SUBMIT_URL 写进 wrangler.toml');
 }
 
+/// 用飞书接口校验刚写下的 app_token / table_id,并在缺表 id 时按表名自动补上。
+///
+/// 这一步的价值:token 粘错、表 id 不对、应用没有该表的权限,都会立刻变成一条
+/// 看得懂的报错,而不是等到跑 tables / employees 时才失败。
+async function verifyFeishuAndFillTable(flags) {
+  const feishu = await resolvedFeishu(flags);
+  const appToken = realVar('BITABLE_APP_TOKEN');
+  if (!appToken) return;
+  if (!feishu.appId || !feishu.appSecret) {
+    warn('跳过飞书校验:本机没有 App ID / App Secret。');
+    say(c.dim('    补一次即可(仅本机 CLI 用):'));
+    say(c.dim(`      security add-generic-password -s ${KEYCHAIN_SERVICE} -a feishu-app-secret -w`));
+    say(c.dim('      node workers/scripts/digest-admin.mjs feishu'));
+    return;
+  }
+  const env = { BITABLE_APP_TOKEN: appToken, FEISHU_APP_ID: feishu.appId, FEISHU_APP_SECRET: feishu.appSecret };
+  let tables;
+  try {
+    tables = await withSpinner('用飞书接口校验表格 token', () => listTables(env));
+  } catch (err) {
+    warn(`飞书校验失败:${err?.message ?? err}`);
+    say(c.dim('    常见原因:token 粘错、应用没有这张表的权限(需要在表里把应用加为协作者)。'));
+    return;
+  }
+  const names = tables.map((t) => String(t.name ?? '')) .filter(Boolean);
+  ok(`飞书校验通过:该 base 下有 ${tables.length} 张表${names.length ? `(${names.slice(0, 4).join('、')}${names.length > 4 ? '…' : ''})` : ''}`);
+
+  const wanted = realVar('BITABLE_TABLE_ID');
+  if (wanted) {
+    if (!tables.some((t) => t.table_id === wanted)) {
+      warn(`配置里的表 id ${wanted} 不在这个 base 里:表 id 或 app_token 有一个不对。`);
+    }
+    return;
+  }
+  // 没给表 id:按表名找(与 bootstrap 的行为一致,少问一个问题)
+  const tableName = tomlVar('BITABLE_TABLE_NAME') || '日报明细';
+  const hit = tables.find((t) => String(t.name ?? '').trim() === tableName);
+  if (hit) {
+    setTomlVar('BITABLE_TABLE_ID', hit.table_id);
+    ok(`按表名「${tableName}」补上 table_id = ${hit.table_id}`);
+  } else {
+    warn(`这个 base 里没有名为「${tableName}」的表:跑 \`tables\` 会按这个名字建一张,或把表 id 直接填进配置。`);
+  }
+}
+
+
 /// 把 id 写进对应的绑定块(块存在就改其中的 id,不存在才追加整块)。
 function setBindingValue(kind, key, value, blockText) {
   let toml = readToml();
@@ -673,54 +720,97 @@ function setBindingValue(kind, key, value, blockText) {
 
 /// 恢复到已有部署:配置被清理或换机器后,不用手抄 id。
 ///
-/// KV 命名空间与 D1 数据库的 id 都能从 Cloudflare 查回来,飞书那三项要从
-/// Worker 的变量里看(它们只在部署时写过一次,云端 secret 读不回明文)。
+/// KV / D1 的 id 从 Cloudflare 查回来;飞书那几项只需要**一条多维表格链接** ——
+/// app_token 与 table_id 本来就在同一条 URL 里,不该让人回答两个问题。
 async function cmdAdopt(flags) {
   await requireLogin();
   ensureLocalConfig();
   say(c.bold('\n恢复到已有部署'));
   say(c.dim('    写回本地配置 workers/wrangler.toml(该文件不被 git 跟踪)。'));
 
-  // KV / D1:能自动找回来,失败才让人手填
+  // KV / D1:能自动找回来;找不到就把账号里现有的名字列出来,好让人用 --kv-id 指定
   const kvOut = await withSpinner('在 Cloudflare 上找 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'list']));
   const kvId = flags['kv-id'] || pickKvNamespaceId(kvOut.out ?? '');
   if (kvId) setBindingValue('kv_namespaces', 'id', kvId, `[[kv_namespaces]]\nbinding = "KEYS"\nid = "${kvId}"`);
   const d1Out = await withSpinner('在 Cloudflare 上找 D1 数据库', () => wrangler(['d1', 'list', '--json']));
   const d1Id = flags['d1-id'] || pickD1DatabaseId(d1Out.out ?? '');
   if (d1Id) setBindingValue('d1_databases', 'database_id', d1Id, `[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${d1Id}"`);
+  const kvTitles = kvNamespaceTitles(kvOut.out ?? '');
+  const d1Names = d1DatabaseNames(d1Out.out ?? '');
   ok(`KV ${kvId || c.red('未找到')}  ${c.dim(`D1 ${d1Id || c.red('未找到')}`)}`);
-  if (!kvId) warn('没在账号里找到名为 KEYS 的 KV 命名空间:核对是否登录了正确的账号,或显式给 --kv-id');
-  if (!d1Id) warn(`没在账号里找到名为 ${D1_NAME} 的 D1 数据库:或显式给 --d1-id`);
+  if (!kvId) {
+    warn(kvTitles.length
+      ? `账号里没有叫 KEYS 的 KV 命名空间。现有:${kvTitles.join('、')}`
+      : '账号里没有任何 KV 命名空间:可能登错了账号,或这份部署从未跑过 deploy。');
+    say(c.dim('    确认真实 id 后指定:npx wrangler kv namespace list,再 --kv-id <32位id>'));
+  }
+  if (!d1Id) {
+    warn(d1Names.length
+      ? `账号里没有叫 ${D1_NAME} 的 D1 数据库。现有:${d1Names.join('、')}`
+      : '账号里没有任何 D1 数据库:可能登错了账号,或这份部署从未跑过 deploy。');
+    say(c.dim(`    确认真实 id 后指定:npx wrangler d1 list,再 --d1-id <uuid>`));
+  }
 
-  // 飞书侧与地址:只能人工确认(Cloudflare 控制台里该 Worker 的变量就是部署时的旧值)
-  // 每个值都把"在哪找"讲清楚再问:这几项只有人能提供,光给字段名等于没说。
-  const workerName = tomlVar('name') || 'daily-agent-digest-submit';
-  const varsPath = `Cloudflare 控制台 → Workers → ${workerName} → Settings → Variables`;
-  const baseToken = flags['base-token'] ?? await askConfigValue('飞书主表 token(bitable app token)', 'BITABLE_APP_TOKEN', [
-    `${varsPath} → BITABLE_APP_TOKEN(部署时写进去的旧值,最可靠)`,
-    '或:飞书里打开那张多维表格,地址栏 /base/ 后面那一段(形如 bascnAbCd…)',
-    '注意:从「知识库/Wiki」里打开的地址栏是 /wiki/…,那种取不到,请用上面两种方式',
-  ]);
-  const tableId = flags['table-id'] ?? await askConfigValue('飞书主表 ID', 'BITABLE_TABLE_ID', [
-    `${varsPath} → BITABLE_TABLE_ID`,
-    '或:同一段地址栏 URL 里 ?table=tblXXXX 那一段',
-  ]);
+  // 飞书:一次问一条链接,自己拆出 app_token / table_id
+  say('  ── 飞书多维表格 ──');
+  say(c.dim('     在飞书里打开那张日报表,把地址栏整条粘进来即可(两种写法都认):'));
+  say(c.dim('       https://<租户>.feishu.cn/base/<app_token>?table=<table_id>'));
+  say(c.dim('       https://<租户>.feishu.cn/wiki/<node_token>   (知识库里的表,会自动换算)'));
+  say(c.dim('     也可以只粘 app_token / table_id。直接回车=不改动。'));
+  const currentToken = realVar('BITABLE_APP_TOKEN');
+  if (currentToken) say(c.dim(`     当前:${currentToken}`));
+  const bitableInput = flags['base-url'] ?? flags['base-token'] ?? await ask('飞书多维表格链接(或 app_token / table id)', currentToken ? { defaultValue: currentToken } : {});
+  const parsed = parseBitableInput(bitableInput);
+  let appToken = parsed.appToken || (parsed.kind === 'unknown' ? '' : '');
+  let tableId = parsed.tableId;
+
+  // 知识库链接:给的是 node_token,需要换算成真正的 app_token
+  if (parsed.kind === 'wiki') {
+    const feishu = await resolvedFeishu(flags);
+    if (!feishu.appId || !feishu.appSecret) {
+      fail('这是知识库(Wiki)链接,里面只有 node_token,需要飞书凭据才能换算成表格 token。\n  请改用 /base/ 形式的链接(在飞书里单独打开那张表),或先跑 `feishu` 配置 App ID / Secret。');
+    }
+    const node = await withSpinner('换算知识库节点 → 表格 token', () => resolveWikiNode({ FEISHU_APP_ID: feishu.appId, FEISHU_APP_SECRET: feishu.appSecret }, parsed.nodeToken));
+    if (!node.objToken) fail(`换算失败:知识库节点 ${parsed.nodeToken} 没有返回表格 token。`);
+    if (node.objType && node.objType !== 'bitable') {
+      warn(`该知识库节点的类型是 ${node.objType},不是多维表格(bitable),请确认链接指向的是那张日报表。`);
+    }
+    appToken = node.objToken;
+    ok(`知识库节点 → app_token ${appToken}${node.title ? `(${node.title})` : ''}`);
+  }
+  if (appToken) ok(`解析到 app_token = ${appToken}`);
+  if (tableId) ok(`解析到 table_id = ${tableId}`);
+  if (!appToken && !tableId && bitableInput.trim()) {
+    warn(`没能从「${bitableInput.trim().slice(0, 80)}」里认出 app_token 或 table_id:请确认粘的是多维表格地址栏里的链接。`);
+  }
+
   const appId = flags['app-id'] ?? await askConfigValue('飞书 App ID', 'FEISHU_APP_ID', [
-    `${varsPath} → FEISHU_APP_ID`,
-    '或:飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID',
-    'App ID 不敏感;对应的 App Secret 存在 Cloudflare secret 里,这里不需要填',
+    '飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID(形如 cli_…)',
+    'App ID 不敏感;App Secret 只在 CLI 直连飞书时用,填不进这里(见文末提示)',
   ]);
   const submitUrlInput = flags['submit-url'] ?? await askConfigValue('后端提交地址(Worker 地址)', 'SUBMIT_URL', [
-    `${varsPath} → SUBMIT_URL`,
-    '或:成员端托盘菜单「设置 → 提交地址」里已经填着的那个地址',
+    '打开托盘菜单「设置」,『提交地址』那一栏里填着的就是它',
     '形如 https://<worker>.<子域>.workers.dev,填到域名即可(不要带 /api/v1/digests)',
   ]);
 
-  for (const [name, value] of [['BITABLE_APP_TOKEN', baseToken], ['BITABLE_TABLE_ID', tableId], ['FEISHU_APP_ID', appId], ['SUBMIT_URL', submitUrlInput]]) {
+  const previousToken = currentToken;
+  if (appToken) setTomlVar('BITABLE_APP_TOKEN', appToken);
+  if (tableId) setTomlVar('BITABLE_TABLE_ID', tableId);
+  else if (appToken && previousToken && appToken !== previousToken) {
+    // 换了 base 又没在链接里给表 id:旧 table_id 属于上一个 base,留着反而会误导,
+    // 清空后由下面的校验按表名重找。
+    setTomlVar('BITABLE_TABLE_ID', '');
+    say(c.dim('     换了 base 且链接里没有 ?table=:已清空旧表 id,稍后按表名重新定位。'));
+  }
+  for (const [name, value] of [['FEISHU_APP_ID', appId], ['SUBMIT_URL', submitUrlInput]]) {
     const trimmed = String(value ?? '').trim();
     if (trimmed && !isPlaceholder(trimmed)) setTomlVar(name, trimmed);
   }
   ok(`已写入 ${path.relative(process.cwd(), TOML_PATH)}`);
+
+  // 用飞书接口把刚填的东西验一遍:token 错、表 id 错、缺权限都会在这里暴露,
+  // 而不是等到跑 tables/employees 时才报一个看不懂的错。
+  await verifyFeishuAndFillTable(flags);
 
   // 地址能立刻验一下:填错的话这里就能看出来
   const url = submitUrl();

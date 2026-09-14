@@ -2,7 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { pickD1DatabaseId, pickKvNamespaceId } from '../scripts/recover.mjs';
+import {
+  d1DatabaseNames, kvNamespaceTitles, parseBitableInput, pickD1DatabaseId, pickKvNamespaceId,
+} from '../scripts/recover.mjs';
 
 const KV_ID = '0123456789abcdef0123456789abcdef';
 const D1_ID = 'fedcba98-7654-3210-fedc-ba9876543210';
@@ -56,4 +58,61 @@ test('an id of the wrong shape is rejected rather than trusted', () => {
   assert.equal(pickKvNamespaceId(wrong), '', '占位符不是合法 id');
   const wrongD1 = '[{"uuid": "not-a-uuid", "name": "daily-agent-digest-logs"}]';
   assert.equal(pickD1DatabaseId(wrongD1), '');
+});
+
+// ---- 一条链接顶两个问题:app_token 与 table_id -------------------------------
+
+test('parses app_token and table_id out of a bitable URL', () => {
+  const p = parseBitableInput('https://acme.feishu.cn/base/JHoFbrmTBaTN8nsmoYScZyTpnEb?table=tblAbCdEf123&view=vewX');
+  assert.equal(p.kind, 'base');
+  assert.equal(p.appToken, 'JHoFbrmTBaTN8nsmoYScZyTpnEb');
+  assert.equal(p.tableId, 'tblAbCdEf123');
+});
+
+test('accepts the older bascn token, Lark hosts and a missing scheme', () => {
+  for (const url of [
+    'https://acme.feishu.cn/base/bascnAbCdEf123456?table=tblXyZ',
+    'https://acme.larksuite.com/base/bascnAbCdEf123456?table=tblXyZ',
+    'acme.feishu.cn/base/bascnAbCdEf123456?table=tblXyZ',
+    '  https://acme.feishu.cn/base/bascnAbCdEf123456?table=tblXyZ&view=v1  ',
+  ]) {
+    const p = parseBitableInput(url);
+    assert.equal(p.appToken, 'bascnAbCdEf123456', url);
+    assert.equal(p.tableId, 'tblXyZ', url);
+  }
+});
+
+test('a wiki link yields the node token, which is not the app token', () => {
+  const p = parseBitableInput('https://acme.feishu.cn/wiki/NodeToken123456?table=tblWiki1');
+  assert.equal(p.kind, 'wiki');
+  assert.equal(p.nodeToken, 'NodeToken123456');
+  assert.equal(p.appToken, '', 'wiki 链接里没有 app_token,必须再换算一次');
+  assert.equal(p.tableId, 'tblWiki1');
+});
+
+test('a bare app_token or table id is understood as such', () => {
+  assert.deepEqual(parseBitableInput('JHoFbrmTBaTN8nsmoYScZyTpnEb'), {
+    appToken: 'JHoFbrmTBaTN8nsmoYScZyTpnEb', tableId: '', nodeToken: '', kind: 'appToken',
+  });
+  assert.equal(parseBitableInput('tblAbCdEf123456').tableId, 'tblAbCdEf123456');
+  assert.equal(parseBitableInput('tblAbCdEf123456').kind, 'tableId');
+});
+
+test('nonsense input parses to nothing instead of guessing', () => {
+  for (const bad of ['', '   ', '随便一段文字', 'https://example.com/foo', undefined, null]) {
+    const p = parseBitableInput(bad);
+    assert.equal(p.appToken, '', JSON.stringify(bad));
+    assert.equal(p.tableId, '', JSON.stringify(bad));
+  }
+  // 表 id 一定是 tbl 开头,别把普通单词当表 id
+  assert.equal(parseBitableInput('tables').tableId, '');
+});
+
+// ---- 找不到目标时把账号里现有的列出来 --------------------------------------
+
+test('lists what the account actually has, so --kv-id / --d1-id can be used', () => {
+  assert.deepEqual(kvNamespaceTitles(KV_OUTPUT), ['KEYS', '别的命名空间']);
+  assert.deepEqual(d1DatabaseNames(D1_OUTPUT), ['daily-agent-digest-logs', 'unrelated']);
+  assert.deepEqual(kvNamespaceTitles('not json'), []);
+  assert.deepEqual(d1DatabaseNames(''), []);
 });
