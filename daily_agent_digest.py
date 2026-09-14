@@ -349,7 +349,12 @@ def collect_one(stats, out, provider, session, item, stamp, kind, raw_text, role
 def codex(root, start, end):
     """只抽取 userMessage(提示词)与 agentMessage(最终结果),过程记录不进入汇总。"""
     stats = new_stats(); out = []; include = keep_process()
-    db = root / '.codex/thread_history_1.sqlite'
+    # 不写死文件名:codex 换过库名/版本时,回退到目录里最新的 thread_history*.sqlite
+    candidates = sorted((root/'.codex').glob('thread_history*.sqlite'), key=lambda p: p.stat().st_mtime, reverse=True) if (root/'.codex').is_dir() else []
+    db = candidates[0] if candidates else root/'.codex/thread_history_1.sqlite'
+    if not db.exists():
+        # 明确记录"库里没有",而不是让 0 条看起来像"当天没工作"
+        stats['db_missing'] = str(db)
     if db.exists():
         con = open_sqlite_readonly(db)
         try:
@@ -382,6 +387,9 @@ def read_jsonl(path, provider, start, end, stats, out, include_process):
 
 def dsh(root, start, end):
     stats = new_stats(); out = []; include = keep_process()
+    if not zstd_available():
+        stats['zstd_missing'] = 'zstd 未安装,无法解压 .dsh 会话(brew install zstd)'
+        return dedupe(out), stats
     for f in (root/'.dsh/sessions').glob('**/*.zstd'):
         try: raw = subprocess.check_output(['zstd','-dc',str(f)], stderr=subprocess.DEVNULL, text=True)
         except (OSError, subprocess.CalledProcessError): continue
@@ -400,6 +408,13 @@ def pi(root, start, end):
     for f in (root/'.pi/agent/sessions').glob('**/*.jsonl'):
         read_jsonl(f, 'pi', start, end, stats, out, include)
     return dedupe(out), stats
+
+def zstd_available():
+    """zstd 不是 macOS 自带命令(通常来自 brew/anaconda)。
+    缺失时 dsh 会话无法解压 —— 必须让这件事**可见**,否则用户只会看到"今天没干活"。"""
+    from shutil import which
+    return which('zstd') is not None
+
 
 def open_sqlite_readonly(path):
     """以只读方式打开 SQLite 库,且在**目录不可写**时也能打开。

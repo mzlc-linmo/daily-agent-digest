@@ -59,31 +59,26 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# .env 用引擎的格式(JSON 字符串)。这两个函数只做最小转义,不引入任何外部依赖。
+json_quote() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+json_unquote() { printf '%s' "$1" | sed -e 's/^"//' -e 's/"$//' -e 's/\\"/"/g' -e 's/\\\\/\\/g'; }
 
-# .env 的读写一律交给 python3,与引擎 load_env 使用**同一种格式**:KEY=<json 字符串>。
 # 之前这里写 shell 单引号而引擎按 JSON 解析,两者不互逆(带引号的 Key 会被读坏);
 # 更严重的是 run.sh 用 `. .env` 加载配置,配置值里的 $(...) 会被 sh 直接执行。
 write_env() {
-  python3 - "$ENV_FILE" "$1" "$2" "$3" <<'PY'
-import json, os, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-pairs = (('LLM_BASE_URL', sys.argv[2]), ('LLM_MODEL', sys.argv[3]), ('LLM_API_KEY', sys.argv[4]))
-path.write_text(''.join(f'{k}={json.dumps(v)}\n' for k, v in pairs), encoding='utf-8')
-os.chmod(path, 0o600)
-PY
+  # 不依赖 python3(macOS 默认不带),也绝不 source 配置文件(值里的 $(...) 会被执行)。
+  # 格式与引擎 load_env 一致:KEY=<JSON 字符串>。
+  umask 077
+  {
+    printf 'LLM_BASE_URL=%s\n' "$(json_quote "$1")"
+    printf 'LLM_MODEL=%s\n' "$(json_quote "$2")"
+    printf 'LLM_API_KEY=%s\n' "$(json_quote "$3")"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 }
 read_env() {
-  python3 - "$ENV_FILE" "$1" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-if path.exists():
-    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
-        if line.startswith(sys.argv[2] + '='):
-            value = line.split('=', 1)[1].strip()
-            try: print(json.loads(value) if value[:1] == '"' else value.strip("'"))
-            except Exception: print(value.strip('"').strip("'"))
-            break
-PY
+  [ -f "$ENV_FILE" ] || return 0
+  json_unquote "$(sed -n "s|^$1=||p" "$ENV_FILE" | head -1)"
 }
 if [ ! -f "$ENV_FILE" ]; then
   if [ -z "$API_KEY" ] && { exec 3<>/dev/tty; } 2>/dev/null; then
