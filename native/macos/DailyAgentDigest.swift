@@ -1021,13 +1021,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func toggleLoginItem() {
         guard #available(macOS 13.0, *) else { showInfo("不支持", "开机自启需要 macOS 13 或更新版本。"); return }
+        var notice: (String, String)?
         do {
-            if loginItemEnabled() { try SMAppService.mainApp.unregister(); showInfo("已关闭", "已取消开机自启。") }
-            else { try SMAppService.mainApp.register(); showInfo("已开启", "开机后会随登录自动启动。") }
-        } catch { showInfo("设置失败", error.localizedDescription) }
-        // 不论成功失败都以系统状态为准刷新对勾:注册失败时不能显示成已开启。
+            if loginItemEnabled() { try SMAppService.mainApp.unregister(); notice = ("已关闭", "已取消开机自启。") }
+            else { try SMAppService.mainApp.register(); notice = ("已开启", "开机后会随登录自动启动。") }
+        } catch { notice = ("设置失败", error.localizedDescription) }
+        // 先按系统真实状态刷新对勾,再弹提示:showInfo 是模态的,放在后面会让对勾晚一步更新。
         refreshLoginItemState()
         DebugLog.write("login item toggled enabled=\(loginItemEnabled())")
+        if let notice = notice { showInfo(notice.0, notice.1) }
     }
 
     @objc func quit(){ timer.invalidate(); NSApp.terminate(nil) }
