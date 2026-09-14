@@ -59,8 +59,7 @@ export function d1DatabaseNames(d1ListOutput) {
     .filter(Boolean);
 }
 
-/// 从飞书多维表格的链接(或直接粘的 id)里解析出 app_token 与 table_id。
-///
+/// 从飞书多维表格的链接(或直接粘的 id)里解析出 app_token 与 table_id。///
 /// 用户手上只有一条地址栏 URL,却要为 app_token 和 table_id 回答两个问题 ——
 /// 那两个值本来就在同一条 URL 里,拆不出人情味:(token 在 /base/ 之后,表 id 在 ?table= 之后)
 ///
@@ -94,4 +93,45 @@ export function parseBitableInput(input) {
   const table = /[?&#]table=([A-Za-z0-9_-]+)/.exec(search);
   if (table) result.tableId = table[1];
   return result;
+}
+
+
+// ---- 从线上已部署的版本里读回配置 ----------------------------------------
+//
+// 这是恢复配置的**主路径**:换机器、换人、本地什么都没留下时,唯一权威的来源就是
+// Cloudflare 上正在跑的那个版本。wrangler 能把它整份吐出来:
+//
+//   wrangler deployments status --json     → { versions: [{ version_id, percentage }] }
+//   wrangler versions view <version_id> --json
+//        → { resources: { bindings: [
+//              { name: 'SUBMIT_URL', type: 'plain_text', text: 'https://…' },
+//              { name: 'KEYS',       type: 'kv_namespace', namespace_id: '…' },
+//              { name: 'DB',         type: 'd1', id: '…' },
+//              { name: 'FEISHU_APP_SECRET', type: 'secret_text' },   ← 读不回明文,也不该读
+//            ] } }
+
+/// 当前生效版本的 id(取流量占比最高的那个;单版本部署时就是它)。
+export function activeVersionId(deploymentsStatusJson) {
+  let parsed;
+  try { parsed = JSON.parse(String(deploymentsStatusJson ?? '')); } catch { return ''; }
+  const versions = Array.isArray(parsed?.versions) ? parsed.versions : [];
+  if (!versions.length) return '';
+  const best = versions.reduce((acc, v) => ((v?.percentage ?? 0) > (acc?.percentage ?? -1) ? v : acc), null);
+  return String(best?.version_id ?? '').trim();
+}
+
+/// 把版本 JSON 里的绑定拆成"可直接写进 wrangler.toml"的三类。
+/// secret 类绑定**不会被读取**(值本来就取不到,也不该在本地留下)。
+export function bindingsFromVersion(versionJson) {
+  let parsed;
+  try { parsed = JSON.parse(String(versionJson ?? '')); } catch { return { vars: {}, kv: {}, d1: {} }; }
+  const bindings = parsed?.resources?.bindings;
+  const out = { vars: {}, kv: {}, d1: {} };
+  for (const b of Array.isArray(bindings) ? bindings : []) {
+    if (!b || typeof b.name !== 'string') continue;
+    if (b.type === 'plain_text' && typeof b.text === 'string') out.vars[b.name] = b.text;
+    else if (b.type === 'kv_namespace' && typeof b.namespace_id === 'string') out.kv[b.name] = b.namespace_id;
+    else if (b.type === 'd1' && typeof b.id === 'string') out.d1[b.name] = b.id;
+  }
+  return out;
 }

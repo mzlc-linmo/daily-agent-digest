@@ -116,45 +116,42 @@ node scripts/digest-admin.mjs
 - **占位符状态下不要跑 `deploy` / `tables`**:那会把占位符写进线上 Worker,直接打断所有人上报。命令本身也会拦住你
   (KV/D1 是占位符时明确失败,而不是新建命名空间 —— 新建会丢掉已签发的 Key)。
 
-换机器或配置丢失后,一条命令就能恢复:
+### 换机器 / 配置丢了怎么恢复
 
 ```bash
 node workers/scripts/digest-admin.mjs adopt
 ```
 
-它先从 Cloudflare 按名字找回 KV `KEYS` 与 D1 `daily-agent-digest-logs`,然后**只问一条飞书多维表格链接** ——
-`app_token` 和 `table_id` 本来就在同一条地址栏 URL 里,不该让人分两次回答:
+它**从 Cloudflare 上正在跑的那个版本里把配置读回来**,不依赖本机任何历史文件 —— 新电脑、新同事、本地全空都成立:
 
 ```
-  ── 飞书多维表格 ──
-     在飞书里打开那张日报表,把地址栏整条粘进来即可(两种写法都认):
-       https://<租户>.feishu.cn/base/<app_token>?table=<table_id>
-       https://<租户>.feishu.cn/wiki/<node_token>   (知识库里的表,会自动换算)
-✓ 解析到 app_token = JHoFbrmTBaTN8nsmoYScZyTpnEb
-✓ 飞书校验通过:该 base 下有 2 张表(日报明细、成员)
-✓ 按表名「日报明细」补上 table_id = tblAbCdEf123
+  读取 Cloudflare 上的当前部署…
+  读取版本 v-live-1111… 的绑定…
+✓ 从线上版本 v-live-1111… 读回:SUBMIT_URL、BITABLE_APP_TOKEN、BITABLE_TABLE_ID、FEISHU_APP_ID、KV id、D1 id
+✓ 已写入 wrangler.toml
 ```
 
-细节:
+原理:`wrangler deployments status --json` 拿到生效版本 id,再用 `wrangler versions view <id> --json` 读出该版本的绑定 ——
+明文变量从 `plain_text` 绑定取,KV / D1 从 `kv_namespace.namespace_id` / `d1.id` 取。
+**secret 类绑定不会被读取**(值本来就取不回,也不该落到本地)。
 
-- 链接里带了 `?table=` 就直接用;**没带**就调飞书接口按 `BITABLE_TABLE_NAME`(默认「日报明细」)自动定位并回填;
-- 粘完之后会用飞书接口**校验**一次:token 粘错、表 id 不属于该 base、应用没有该表的权限,都会当场报出来,
-  而不是等到跑 `tables` / `employees` 时才失败;
-- 知识库(`/wiki/…`)链接给的是 `node_token`,会调用 `wiki/v2/spaces/get_node` 换算成真正的 `app_token`
-  (需要本机有飞书 App ID / Secret);
-- KV / D1 若按名字找不到,会**列出账号里现有的名字**,便于用 `--kv-id` / `--d1-id` 指定。
+所以正常情况下**你一个问题都不用回答**。只有在下面两种情形才会问你:
 
-| 缺失项 | 取回方式 |
+| 情形 | 行为 |
 | --- | --- |
-| KV 命名空间 id | **`adopt` 自动**(`npx wrangler kv namespace list` 里 `KEYS` 那条);找不到时用 `--kv-id` |
-| D1 `database_id` | **`adopt` 自动**(`npx wrangler d1 list`);找不到时用 `--d1-id` |
-| 飞书主表 token / 表 ID | **`adopt` 只问一条链接**:飞书里打开那张表,地址栏 `/base/<app_token>?table=<table_id>` 整条粘进去 |
-| 飞书 App ID(`FEISHU_APP_ID`) | 飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID |
-| 后端地址 `SUBMIT_URL` | 打开托盘菜单「设置」,『提交地址』那一栏里就是它 |
-| 本地飞书 App Secret | 只用于 CLI 直连飞书:飞书开放平台同一页的 App Secret;写入本机钥匙串 `security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。线上那一份是 Cloudflare secret,读不回明文,也**不需要**重建 |
+| 线上版本里缺某一项(例如部署时没写 `[vars]`) | 只问缺的那几项;飞书主表那两项会**一次问一条链接**:`https://<租户>.feishu.cn/base/<app_token>?table=<table_id>` 整条粘进来即可,`app_token` 与 `table_id` 自动拆开;链接里没有 `?table=` 就调飞书接口按表名(`BITABLE_TABLE_NAME`,默认「日报明细」)自动定位 |
+| 线上压根没有部署(全新用户) | 明确告诉你"这份后端还没部署过",并让你跑 `install` / `deploy` —— `adopt` 只用于"线上跑着、本地丢了" |
 
-> **不要**指望从 Cloudflare 控制台的 Worker 变量里找回旧值 —— 那里看不到部署时写入的明文(token 只存服务端,
-> 且部署后不保证在界面上可读)。要恢复配置,上面这几条才是可靠路径。
+补充细节:
+
+- 知识库(`/wiki/…`)链接给的是 `node_token` 而非表格 token,会自动调 `wiki/v2/spaces/get_node` 换算;
+- 粘完链接会用飞书接口**校验**:token 粘错、表 id 不属于该 base、应用没有该表权限,都会当场报错,
+  而不是等到跑 `tables` / `employees` 才失败;
+- KV / D1 若线上版本里没有(老部署),会退回按名字找(`KEYS` / `daily-agent-digest-logs`),找不到就**列出账号里现有的名字**,
+  便于用 `--kv-id` / `--d1-id` 指定;
+- 唯一恢复不了的是**本地飞书 App Secret**:它是 Cloudflare secret,读不回明文;只影响本机 CLI 直连飞书的命令,
+  补一次即可 —— `security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。
+  线上那份**不需要**重建。
 
 ## 子命令(等价能力)
 

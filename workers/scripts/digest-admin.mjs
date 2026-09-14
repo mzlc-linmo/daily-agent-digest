@@ -29,7 +29,9 @@ import {
   listKeysLocally, logsLocally, revokeLocally,
 } from './local-admin.mjs';
 import { isPlaceholder, issueReportLines, knownSubmitUrl, parseDeployedUrl, placeholderLabels, resolveSubmitUrl } from './issue-report.mjs';
-import { d1DatabaseNames, kvNamespaceTitles, parseBitableInput, pickD1DatabaseId, pickKvNamespaceId } from './recover.mjs';
+import {
+  activeVersionId, bindingsFromVersion, d1DatabaseNames, kvNamespaceTitles, parseBitableInput, pickD1DatabaseId, pickKvNamespaceId,
+} from './recover.mjs';
 import { listTables, resolveWikiNode } from '../src/feishu.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -718,80 +720,127 @@ function setBindingValue(kind, key, value, blockText) {
   writeFileSync(TOML_PATH, toml);
 }
 
-/// 恢复到已有部署:配置被清理或换机器后,不用手抄 id。
+/// 从线上正在跑的版本里读回配置(恢复流程的主路径)。
 ///
-/// KV / D1 的 id 从 Cloudflare 查回来;飞书那几项只需要**一条多维表格链接** ——
-/// app_token 与 table_id 本来就在同一条 URL 里,不该让人回答两个问题。
+/// 不依赖本机任何历史文件:换机器、换人、本地全空也一样成立 ——
+/// 值就是 Cloudflare 上那个版本自己带着的绑定。
+/// 返回 { vars, kv, d1 } 或 null(没有部署 / 读不到)。
+async function readDeployedBindings() {
+  const status = await withSpinner('读取 Cloudflare 上的当前部署', () => wrangler(['deployments', 'status', '--json']));
+  if (status.code !== 0) return null;
+  const versionId = activeVersionId(status.out ?? '');
+  if (!versionId) return null;
+  const view = await withSpinner(`读取版本 ${versionId.slice(0, 8)}… 的绑定`, () => wrangler(['versions', 'view', versionId, '--json']));
+  if (view.code !== 0) return null;
+  const bindings = bindingsFromVersion(view.out ?? '');
+  const total = Object.keys(bindings.vars).length + Object.keys(bindings.kv).length + Object.keys(bindings.d1).length;
+  return total ? { versionId, ...bindings } : null;
+}
+
+/// 恢复到已有部署:把自己能从线上读到的全部读回来;
+/// 读不到的(飞书 App Secret)才提示人去补。
 async function cmdAdopt(flags) {
   await requireLogin();
   ensureLocalConfig();
   say(c.bold('\n恢复到已有部署'));
   say(c.dim('    写回本地配置 workers/wrangler.toml(该文件不被 git 跟踪)。'));
 
-  // KV / D1:能自动找回来;找不到就把账号里现有的名字列出来,好让人用 --kv-id 指定
-  const kvOut = await withSpinner('在 Cloudflare 上找 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'list']));
-  const kvId = flags['kv-id'] || pickKvNamespaceId(kvOut.out ?? '');
-  if (kvId) setBindingValue('kv_namespaces', 'id', kvId, `[[kv_namespaces]]\nbinding = "KEYS"\nid = "${kvId}"`);
-  const d1Out = await withSpinner('在 Cloudflare 上找 D1 数据库', () => wrangler(['d1', 'list', '--json']));
-  const d1Id = flags['d1-id'] || pickD1DatabaseId(d1Out.out ?? '');
-  if (d1Id) setBindingValue('d1_databases', 'database_id', d1Id, `[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${d1Id}"`);
-  const kvTitles = kvNamespaceTitles(kvOut.out ?? '');
-  const d1Names = d1DatabaseNames(d1Out.out ?? '');
-  ok(`KV ${kvId || c.red('未找到')}  ${c.dim(`D1 ${d1Id || c.red('未找到')}`)}`);
-  if (!kvId) {
-    warn(kvTitles.length
-      ? `账号里没有叫 KEYS 的 KV 命名空间。现有:${kvTitles.join('、')}`
-      : '账号里没有任何 KV 命名空间:可能登错了账号,或这份部署从未跑过 deploy。');
-    say(c.dim('    确认真实 id 后指定:npx wrangler kv namespace list,再 --kv-id <32位id>'));
-  }
-  if (!d1Id) {
-    warn(d1Names.length
-      ? `账号里没有叫 ${D1_NAME} 的 D1 数据库。现有:${d1Names.join('、')}`
-      : '账号里没有任何 D1 数据库:可能登错了账号,或这份部署从未跑过 deploy。');
-    say(c.dim(`    确认真实 id 后指定:npx wrangler d1 list,再 --d1-id <uuid>`));
+  // 主路径:从线上版本读回 KV / D1 / 所有明文变量(URL、表 token、表 id、App ID…)
+  const deployed = await readDeployedBindings();
+  if (deployed) {
+    const written = [];
+    const vars = deployed.vars ?? {};
+    for (const name of ['SUBMIT_URL', 'BITABLE_APP_TOKEN', 'BITABLE_TABLE_ID', 'FEISHU_APP_ID', 'BITABLE_TABLE_NAME', 'SCAN_BASES']) {
+      const value = vars[name];
+      if (typeof value === 'string' && value.trim() && !isPlaceholder(value)) { setTomlVar(name, value.trim()); written.push(name); }
+    }
+    const kvId = deployed.kv?.KEYS || flags['kv-id'] || '';
+    if (kvId) { setBindingValue('kv_namespaces', 'id', kvId, `[[kv_namespaces]]\nbinding = "KEYS"\nid = "${kvId}"`); written.push('KV id'); }
+    const d1Id = deployed.d1?.DB || flags['d1-id'] || '';
+    if (d1Id) { setBindingValue('d1_databases', 'database_id', d1Id, `[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${d1Id}"`); written.push('D1 id'); }
+    ok(`从线上版本 ${deployed.versionId.slice(0, 8)}… 读回:${written.length ? written.join('、') : '(空)'}`);
+    if (!written.length) warn('这个版本里没有可用的明文配置(可能部署时就没写 vars)。');
+  } else {
+    warn('Cloudflare 上没有读到已部署的版本:这份后端可能还没部署过。');
+    say(c.dim('    全新安装请直接跑 `install`(或 `deploy`),它们会创建 KV/D1 并把地址写回配置;'));
+    say(c.dim('    `adopt` 是给"线上已经跑着、只是本地配置丢了"的情况用的。'));
   }
 
-  // 飞书:一次问一条链接,自己拆出 app_token / table_id
-  say('  ── 飞书多维表格 ──');
-  say(c.dim('     在飞书里打开那张日报表,把地址栏整条粘进来即可(两种写法都认):'));
-  say(c.dim('       https://<租户>.feishu.cn/base/<app_token>?table=<table_id>'));
-  say(c.dim('       https://<租户>.feishu.cn/wiki/<node_token>   (知识库里的表,会自动换算)'));
-  say(c.dim('     也可以只粘 app_token / table_id。直接回车=不改动。'));
+  // 线上读不到 KV / D1 时,退回到"按名字找",并把账号里现有的名字列出来
+  if (!kvNamespaceId() || !/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw())) {
+    const kvOut = await withSpinner('在 Cloudflare 上找 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'list']));
+    const kvId = kvNamespaceId() || flags['kv-id'] || pickKvNamespaceId(kvOut.out ?? '');
+    if (kvId) setBindingValue('kv_namespaces', 'id', kvId, `[[kv_namespaces]]\nbinding = "KEYS"\nid = "${kvId}"`);
+    const d1Out = await withSpinner('在 Cloudflare 上找 D1 数据库', () => wrangler(['d1', 'list', '--json']));
+    const d1Id = (/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? d1DatabaseIdRaw() : '') || flags['d1-id'] || pickD1DatabaseId(d1Out.out ?? '');
+    if (d1Id) setBindingValue('d1_databases', 'database_id', d1Id, `[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${d1Id}"`);
+    if (!kvId) {
+      const kvTitles = kvNamespaceTitles(kvOut.out ?? '');
+      warn(kvTitles.length
+        ? `账号里没有叫 KEYS 的 KV 命名空间。现有:${kvTitles.join('、')}`
+        : '账号里没有任何 KV 命名空间:可能登错了账号,或这份部署从未跑过 deploy。');
+      say(c.dim('    确认真实 id 后指定:npx wrangler kv namespace list,再 --kv-id <32位id>'));
+    }
+    if (!d1Id) {
+      const d1Names = d1DatabaseNames(d1Out.out ?? '');
+      warn(d1Names.length
+        ? `账号里没有叫 ${D1_NAME} 的 D1 数据库。现有:${d1Names.join('、')}`
+        : '账号里没有任何 D1 数据库:可能登错了账号,或这份部署从未跑过 deploy。');
+      say(c.dim('    确认真实 id 后指定:npx wrangler d1 list,再 --d1-id <uuid>'));
+    }
+  }
+  ok(`KV ${kvNamespaceId() || c.red('未找到')}  ${c.dim(`D1 ${/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? d1DatabaseIdRaw() : c.red('未找到')}`)}`);
+
+  // 只有线上**确实缺**的东西才问人。刚才都读回来了就一个都不问 ——
+  // 恢复流程不该让人回答本来能从云上拿到的问题。
   const currentToken = realVar('BITABLE_APP_TOKEN');
-  if (currentToken) say(c.dim(`     当前:${currentToken}`));
-  const bitableInput = flags['base-url'] ?? flags['base-token'] ?? await ask('飞书多维表格链接(或 app_token / table id)', currentToken ? { defaultValue: currentToken } : {});
-  const parsed = parseBitableInput(bitableInput);
-  let appToken = parsed.appToken || (parsed.kind === 'unknown' ? '' : '');
-  let tableId = parsed.tableId;
+  let appToken = '';
+  let tableId = '';
+  const wantBitable = Boolean(flags['base-url'] || flags['base-token']) || !currentToken || !realVar('BITABLE_TABLE_ID');
+  if (wantBitable) {
+    say('  ── 飞书多维表格 ──');
+    say(c.dim('     在飞书里打开那张日报表,把地址栏整条粘进来即可(两种写法都认):'));
+    say(c.dim('       https://<租户>.feishu.cn/base/<app_token>?table=<table_id>'));
+    say(c.dim('       https://<租户>.feishu.cn/wiki/<node_token>   (知识库里的表,会自动换算)'));
+    say(c.dim('     也可以只粘 app_token / table_id。直接回车=不改动。'));
+    if (currentToken) say(c.dim(`     当前:${currentToken}`));
+    const bitableInput = flags['base-url'] ?? flags['base-token'] ?? await ask('飞书多维表格链接(或 app_token / table id)', currentToken ? { defaultValue: currentToken } : {});
+    const parsed = parseBitableInput(bitableInput);
+    appToken = parsed.appToken;
+    tableId = parsed.tableId;
 
-  // 知识库链接:给的是 node_token,需要换算成真正的 app_token
-  if (parsed.kind === 'wiki') {
-    const feishu = await resolvedFeishu(flags);
-    if (!feishu.appId || !feishu.appSecret) {
-      fail('这是知识库(Wiki)链接,里面只有 node_token,需要飞书凭据才能换算成表格 token。\n  请改用 /base/ 形式的链接(在飞书里单独打开那张表),或先跑 `feishu` 配置 App ID / Secret。');
+    // 知识库链接:给的是 node_token,需要换算成真正的 app_token
+    if (parsed.kind === 'wiki') {
+      const feishu = await resolvedFeishu(flags);
+      if (!feishu.appId || !feishu.appSecret) {
+        fail('这是知识库(Wiki)链接,里面只有 node_token,需要飞书凭据才能换算成表格 token。\n  请改用 /base/ 形式的链接(在飞书里单独打开那张表),或先跑 `feishu` 配置 App ID / Secret。');
+      }
+      const node = await withSpinner('换算知识库节点 → 表格 token', () => resolveWikiNode({ FEISHU_APP_ID: feishu.appId, FEISHU_APP_SECRET: feishu.appSecret }, parsed.nodeToken));
+      if (!node.objToken) fail(`换算失败:知识库节点 ${parsed.nodeToken} 没有返回表格 token。`);
+      if (node.objType && node.objType !== 'bitable') {
+        warn(`该知识库节点的类型是 ${node.objType},不是多维表格(bitable),请确认链接指向的是那张日报表。`);
+      }
+      appToken = node.objToken;
+      ok(`知识库节点 → app_token ${appToken}${node.title ? `(${node.title})` : ''}`);
     }
-    const node = await withSpinner('换算知识库节点 → 表格 token', () => resolveWikiNode({ FEISHU_APP_ID: feishu.appId, FEISHU_APP_SECRET: feishu.appSecret }, parsed.nodeToken));
-    if (!node.objToken) fail(`换算失败:知识库节点 ${parsed.nodeToken} 没有返回表格 token。`);
-    if (node.objType && node.objType !== 'bitable') {
-      warn(`该知识库节点的类型是 ${node.objType},不是多维表格(bitable),请确认链接指向的是那张日报表。`);
+    if (appToken) ok(`解析到 app_token = ${appToken}`);
+    if (tableId) ok(`解析到 table_id = ${tableId}`);
+    if (!appToken && !tableId && bitableInput.trim()) {
+      warn(`没能从「${bitableInput.trim().slice(0, 80)}」里认出 app_token 或 table_id:请确认粘的是多维表格地址栏里的链接。`);
     }
-    appToken = node.objToken;
-    ok(`知识库节点 → app_token ${appToken}${node.title ? `(${node.title})` : ''}`);
-  }
-  if (appToken) ok(`解析到 app_token = ${appToken}`);
-  if (tableId) ok(`解析到 table_id = ${tableId}`);
-  if (!appToken && !tableId && bitableInput.trim()) {
-    warn(`没能从「${bitableInput.trim().slice(0, 80)}」里认出 app_token 或 table_id:请确认粘的是多维表格地址栏里的链接。`);
   }
 
-  const appId = flags['app-id'] ?? await askConfigValue('飞书 App ID', 'FEISHU_APP_ID', [
-    '飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID(形如 cli_…)',
-    'App ID 不敏感;App Secret 只在 CLI 直连飞书时用,填不进这里(见文末提示)',
-  ]);
-  const submitUrlInput = flags['submit-url'] ?? await askConfigValue('后端提交地址(Worker 地址)', 'SUBMIT_URL', [
-    '打开托盘菜单「设置」,『提交地址』那一栏里填着的就是它',
-    '形如 https://<worker>.<子域>.workers.dev,填到域名即可(不要带 /api/v1/digests)',
-  ]);
+  const appId = realVar('FEISHU_APP_ID') || flags['app-id']
+    || await askConfigValue('飞书 App ID', 'FEISHU_APP_ID', [
+      '飞书开放平台 → 开发者后台 → 该应用 → 凭证与基础信息 → App ID(形如 cli_…)',
+      'App ID 不敏感;App Secret 只在 CLI 直连飞书时用,填不进这里(见文末提示)',
+    ]);
+  const submitUrlInput = knownSubmitUrl(tomlVar('SUBMIT_URL')) || flags['submit-url']
+    || await askConfigValue('后端提交地址(Worker 地址)', 'SUBMIT_URL', [
+      'Cloudflare 控制台 → Workers & Pages → 这个 Worker → 概览里的 *.workers.dev 地址',
+      '或:跑一次 `deploy`,结尾会打印“后端已部署:https://…”并写回配置',
+      '形如 https://<worker>.<子域>.workers.dev,填到域名即可(不要带 /api/v1/digests)',
+    ]);
 
   const previousToken = currentToken;
   if (appToken) setTomlVar('BITABLE_APP_TOKEN', appToken);
