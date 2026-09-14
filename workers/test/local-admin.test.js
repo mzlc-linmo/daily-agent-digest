@@ -224,12 +224,24 @@ test('适配器支持异步 wrangler,且调用期间事件循环不被阻塞', a
   assert.ok(ticks >= 3, `调用期间定时器应持续触发,实际 ${ticks} 次`);
 });
 
+test('签发时拒绝会破坏过滤条件的 member_id', async () => {
+  const env = { KEYS: fakeKV() };
+  const feishu = fakeFeishu();
+  for (const bad of ['a" OR x', 'a\\b', 'a b', 'x'.repeat(65)]) {
+    await assert.rejects(
+      () => issueLocally(env, { member_id: bad, member: '张三', open_id: 'ou_z' }, feishu),
+      /member_id/,
+      `应拒绝 member_id:${JSON.stringify(bad)}`,
+    );
+  }
+  assert.equal(env.KEYS.store.size, 0, '被拒绝的签发不得留下 Key');
+});
+
 test('bootstrapLocally 只建主表且幂等', async () => {
   const env = { BITABLE_APP_TOKEN: 'bascn_test', BITABLE_TABLE_ID: 'tbl_main' };
   const feishu = fakeFeishu();
   const first = await bootstrapLocally(env, feishu);
   assert.equal(first.tableId, 'tbl_main');
-  assert.equal(first.registryTableId, undefined, '登记表已取消');
   const second = await bootstrapLocally(env, feishu);
   assert.equal(second.tableId, first.tableId, '重复执行应复用同一张表');
 });

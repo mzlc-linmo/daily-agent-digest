@@ -7,6 +7,12 @@ export const MAX_ITEMS = 100;
 export const MAX_TITLE = 200;
 export const MAX_DESC = 4000;
 export const MAX_BODY_BYTES = 512 * 1024;
+// 元信息字段的上限:它们会写进飞书单元格与 D1 审计日志,
+// 不设限的话一个成员就能把表撑大(甚至撑爆单元格长度限制)。
+export const MAX_RELEASE_VERSION = 64;
+export const MAX_COVERAGE_NOTE = 500;
+export const MAX_SOURCES = 20;
+export const MAX_SOURCE_LEN = 100;
 
 // 多维表格字段名 —— 与 bootstrap 建表时使用的名字必须一致。
 export const FIELDS = {
@@ -80,17 +86,20 @@ export function validatePayload(body) {
     if (desc.length > MAX_DESC) throw new ValidationError(`第 ${index + 1} 项 desc 过长`);
     const status = String(item.status ?? 'completed');
     if (!STATUS_VALUES.includes(status)) throw new ValidationError(`第 ${index + 1} 项 status 非法`);
+    // 来源会写成飞书多选字段:限制条数与单条长度,避免被撑爆
     const sources = Array.isArray(item.source_task_ids)
-      ? [...new Set(item.source_task_ids.map((s) => String(s).split('/')[0]).filter(Boolean))]
+      ? [...new Set(item.source_task_ids
+        .map((s) => String(s).split('/')[0].slice(0, MAX_SOURCE_LEN))
+        .filter(Boolean))].slice(0, MAX_SOURCES)
       : [];
     return { title, desc, status, sources };
   });
 
   return {
     date,
-    generatedAt: body.generated_at ? String(body.generated_at) : '',
-    releaseVersion: body.release_version ? String(body.release_version) : '',
-    coverageNote: body.coverage_note ? String(body.coverage_note) : '',
+    generatedAt: body.generated_at ? String(body.generated_at).slice(0, 40) : '',
+    releaseVersion: body.release_version ? String(body.release_version).slice(0, MAX_RELEASE_VERSION) : '',
+    coverageNote: body.coverage_note ? String(body.coverage_note).slice(0, MAX_COVERAGE_NOTE) : '',
     reportChars: Number.isFinite(Number(body.report_chars)) ? Number(body.report_chars) : 0,
     items: normalized,
   };

@@ -1,6 +1,8 @@
 .env
 .env.*
-*.json
+# 只忽略运行期产物,不要用 *.json —— 那会把 workers/package.json 这类源码配置一起忽略掉
+state.json
+*.local.json
 *.jsonl
 *.sqlite*
 *.log

@@ -42,8 +42,6 @@ async function makeEnv() {
     FEISHU_APP_SECRET: 'secret',
     BITABLE_APP_TOKEN: 'bascn_test',
     BITABLE_TABLE_ID: 'tbl_test',
-    REGISTRY_TABLE_ID: 'tbl_registry',
-    REQUEST_TABLE_ID: 'tbl_requests',
   };
 }
 
@@ -52,7 +50,7 @@ const KEY = `dag_k1_${SECRET}`;
 /// 假飞书客户端:内存里的多表实现,足以覆盖主表 + 两张管理表。
 function fakeFeishu() {
   const tables = new Map(); // tableId -> { name, fields:Set, rows:Map(record_id -> fields) }
-  const calls = { create: 0, update: 0, delete: 0, find: 0, resolve: 0, registryCreate: 0, registryUpdate: 0 };
+  const calls = { create: 0, update: 0, delete: 0, find: 0, resolve: 0 };
   let seq = 0;
   const newId = () => `rec${seq++}`;
   const ensure = (id) => {
@@ -89,13 +87,11 @@ function fakeFeishu() {
     async findRecordsBySubmitId(env, submitId) { return this.findRecords(env, env.BITABLE_TABLE_ID, `CurrentValue.[提交ID]="${submitId}"`); },
     async batchCreate(_env, tableId, rows) {
       calls.create += 1;
-      if (tableId !== ENV.BITABLE_TABLE_ID) calls.registryCreate += 1;
       const t = ensure(tableId);
       return rows.map((row) => { const record_id = newId(); t.rows.set(record_id, row.fields); return { record_id, fields: row.fields }; });
     },
     async batchUpdate(_env, tableId, records) {
       calls.update += 1;
-      if (tableId !== ENV.BITABLE_TABLE_ID) calls.registryUpdate += 1;
       const t = ensure(tableId);
       for (const r of records) t.rows.set(r.record_id, { ...(t.rows.get(r.record_id) ?? {}), ...r.fields });
       return records;
@@ -355,6 +351,47 @@ test('管理接口已彻底移除,公网不存在任何管理入口', async () =
     const posted = await handleRequest(post(path, {}), ENV, { feishu });
     assert.equal(posted.status, 404, `${path} 不应存在(POST)`);
   }
+});
+
+test('审计日志记录字数与版本(字段名必须与校验层一致)', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB() };
+  await handleRequest(post('/api/v1/digests', { ...REPORT, report_chars: 271, release_version: 'v9.9.9' }), env, { feishu });
+  const row = env.DB.inserted.find((r) => r.event === 'submit');
+  assert.equal(row.report_chars, 271, 'report_chars 不得为 null(曾因 camelCase/snake_case 不匹配恒为 null)');
+  assert.equal(row.release_version, 'v9.9.9');
+});
+
+test('未预期异常不回显内部信息', async () => {
+  const feishu = fakeFeishu();
+  feishu.batchCreate = async () => { throw new Error('内部细节:table=tbl_secret code=1254302'); };
+  const res = await handleRequest(post('/api/v1/digests', REPORT), ENV, { feishu });
+  const body = await res.json();
+  assert.equal(res.status, 500);
+  assert.equal(body.error.code, 'internal_error');
+  assert.ok(!JSON.stringify(body).includes('tbl_secret'), `不得泄露内部信息:${JSON.stringify(body)}`);
+});
+
+test('校验类错误仍然回显可读原因', async () => {
+  const feishu = fakeFeishu();
+  const res = await handleRequest(post('/api/v1/digests', { ...REPORT, date: '2026/09/13' }), ENV, { feishu });
+  assert.equal(res.status, 422);
+  assert.match((await res.json()).error.message, /date/);
+});
+
+test('元信息字段超长会被截断,不会撑大表格与日志', async () => {
+  const feishu = fakeFeishu();
+  const env = { ...ENV, DB: fakeDB() };
+  await handleRequest(post('/api/v1/digests', {
+    ...REPORT,
+    release_version: 'v'.repeat(500),
+    work_items: [{ title: 't', desc: 'd', status: 'completed',
+                   source_task_ids: Array.from({ length: 100 }, (_, i) => `source${i}`.repeat(20)) }],
+  }), env, { feishu });
+  const row = [...feishu.tables.get(ENV.BITABLE_TABLE_ID).rows.values()][0];
+  assert.ok(String(row[FIELDS.appVersion]).length <= 64, '版本号应被截断');
+  assert.ok(row[FIELDS.sources].length <= 20, `来源条数应被限制,实际 ${row[FIELDS.sources].length}`);
+  assert.ok(row[FIELDS.sources].every((x) => x.length <= 100), '单条来源应被截断');
 });
 
 test('未知路径返回 404', async () => {

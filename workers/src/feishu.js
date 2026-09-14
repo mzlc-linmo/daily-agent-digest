@@ -21,11 +21,6 @@ export class FeishuError extends Error {
 let cachedToken = null; // { value, expiresAt }
 let inflightToken = null;
 
-export function __resetTokenCache() {
-  cachedToken = null;
-  inflightToken = null;
-}
-
 async function requestToken(env) {
   const res = await fetch(`${FEISHU_BASE}/auth/v3/tenant_access_token/internal`, {
     method: 'POST',
@@ -84,7 +79,7 @@ async function call(env, path, { method = 'GET', body, query, retryOnAuth = true
   return payload.data ?? {};
 }
 
-/// 按 filter 查找行(幂等、登记表查找都用它)。tableId 省略时用 env.BITABLE_TABLE_ID。
+/// 按 filter 查找已有的行(幂等的关键)。tableId 必须显式传入。
 export async function findRecords(env, tableId, filter) {
   if (!tableId) throw new Error('缺少 tableId');
   const table = tableId;
@@ -158,10 +153,6 @@ export async function updateField(env, fieldId, body, tableId) {
 
 /// 把邮箱/手机号解析成 open_id(同一应用内有效)。结果按输入缓存,避免每次提交都查。
 const userIdCache = new Map();
-
-export function __resetUserIdCache() {
-  userIdCache.clear();
-}
 
 export async function resolveOpenIds(env, emails = [], mobiles = []) {
   const missing = [...emails, ...mobiles].filter((key) => key && !userIdCache.has(key));

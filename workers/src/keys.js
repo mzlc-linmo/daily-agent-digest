@@ -37,6 +37,13 @@ export async function issueKey(env, feishu, { member_id, member, email, open_id 
   const memberName = String(member ?? '').trim();
   if (!memberId) throw new ValidationError('必须提供 member_id(工号或账号)');
   if (!memberName) throw new ValidationError('必须提供 member(姓名)');
+  // member_id 会拼进飞书过滤条件 CurrentValue.[提交ID]="成员-日期" 并写进表格,
+  // 含引号/反斜杠/控制字符会破坏过滤条件,必须在签发时就挡住。
+  if (memberId.length > 64) throw new ValidationError('member_id 过长(最多 64 字符)');
+  if (!/^[A-Za-z0-9._@-]+$/.test(memberId)) {
+    throw new ValidationError('member_id 只能包含字母、数字、点、下划线、@ 与连字符');
+  }
+  if (memberName.length > 64) throw new ValidationError('member 过长(最多 64 字符)');
 
   let resolved = String(open_id ?? '').trim();
   if (!resolved) {

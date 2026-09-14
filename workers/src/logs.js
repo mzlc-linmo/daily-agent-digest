@@ -9,9 +9,20 @@ const COLUMNS = [
   'release_version', 'user_agent', 'country', 'detail',
 ];
 
+/// 单列长度上限:审计字段大多来自客户端(UA、版本号等),
+/// 不设限就能被用来把 D1 撑大。
+const LIMITS = {
+  member: 64, member_id: 64, key_id: 32, date: 10, mode: 16, outcome: 16,
+  error_code: 64, error_message: 500, release_version: 64, user_agent: 200,
+  country: 8, request_id: 64, detail: 2000,
+};
+
 export async function logEvent(env, event) {
   if (!env || !env.DB) return false;
   const row = { ts: new Date().toISOString(), outcome: 'ok', ...event };
+  for (const [key, max] of Object.entries(LIMITS)) {
+    if (typeof row[key] === 'string' && row[key].length > max) row[key] = row[key].slice(0, max);
+  }
   try {
     await env.DB
       .prepare(`INSERT INTO audit_log (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(() => '?').join(', ')})`)

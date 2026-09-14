@@ -17,10 +17,15 @@ function json(body, status = 200) {
   return new Response(JSON.stringify(body, null, 2), { status, headers: JSON_HEADERS });
 }
 
+/// 只有我们自己写出来的错误信息(校验/鉴权)才回显给客户端。
+/// 上游(飞书)与未预期异常的信息可能包含内部路径、参数甚至凭据片段,一律换成通用文案,
+/// 细节只写服务端日志 —— 客户端仍可通过 log_id 让管理员查证。
 function errorResponse(err) {
+  const expected = err instanceof ValidationError || err instanceof AuthError;
   const status = err.status ?? (err instanceof ValidationError ? 422 : 500);
   const code = err.code ?? (err instanceof ValidationError ? 'validation_failed' : 'internal_error');
-  const body = { error: { code, message: err.message } };
+  if (!expected) console.error(`请求失败(${code}):${err?.stack ?? err}`);
+  const body = { error: { code, message: expected ? err.message : '服务内部错误,请稍后重试' } };
   if (err.logId) body.error.log_id = err.logId;
   return json(body, status);
 }
@@ -30,6 +35,8 @@ function errorResponse(err) {
 export async function submitDigest(request, env, feishu, now, audit = {}) {
   const member = await authenticate(request, env);
 
+  const declared = Number(request.headers.get('content-length') ?? 0);
+  if (declared > MAX_BODY_BYTES) throw new ValidationError('请求体过大');
   const raw = await request.text();
   if (raw.length > MAX_BODY_BYTES) throw new ValidationError('请求体过大');
   let body;
@@ -100,8 +107,10 @@ export async function submitDigest(request, env, feishu, now, audit = {}) {
     date: report.date,
     mode,
     items: report.items.length,
-    report_chars: report.report_chars ?? null,
-    release_version: report.release_version ?? null,
+    // 注意:validatePayload 返回的是 camelCase(曾在这里写成 snake_case,导致这两个字段恒为 null)
+    report_chars: report.reportChars,
+    release_version: report.releaseVersion || null,
+    detail: JSON.stringify({ coverage_note: report.coverageNote }),
   });
   return json({ ...meta, mode, records }, existing.length ? 200 : 201);
 }
@@ -132,7 +141,11 @@ export async function healthz(env, feishu) {
     await feishu.healthcheck(env);
     return json({ status: 'ok', table_configured: Boolean(env.BITABLE_TABLE_ID) });
   } catch (err) {
-    return json({ status: 'degraded', message: err.message }, 503);
+    // 未鉴权接口:只回状态,细节不暴露(便于支持:仍给 log_id)
+    console.error(`healthz 失败:${err?.message ?? err}`);
+    const body = { status: 'degraded' };
+    if (err.logId) body.log_id = err.logId;
+    return json(body, 503);
   }
 }
 
@@ -159,7 +172,7 @@ export async function handleRequest(request, env, deps = {}) {
       default:
         // 管理接口已彻底移除:公网不暴露任何管理入口。
         // 管理动作(建表/发 Key/撤销/查日志)由本机 CLI 直连 KV/D1/飞书完成。
-        return json({ error: { code: 'not_found', message: `未知接口:${route}` } }, 404);
+        return json({ error: { code: 'not_found', message: '未知接口' } }, 404);
     }
   } catch (err) {
     const response = errorResponse(err);
