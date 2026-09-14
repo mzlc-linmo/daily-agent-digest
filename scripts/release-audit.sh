@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-repo=${1:-mzlc-linmo/daily-agent-digest-distribution}
+repo=${1:-mzlc-linmo/daily-agent-digest}
 tag=${2:?usage: release-audit.sh REPO TAG}
 base="https://github.com/$repo/releases/download/$tag"
 tmp=$(mktemp -d)

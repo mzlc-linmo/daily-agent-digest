@@ -284,18 +284,18 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 
 | 项 | 值 |
 | --- | --- |
-| Worker 地址 | `https://daily-agent-digest-submit.mzlc.workers.dev` |
-| 多维表格 | base「团队日报」`JHoFbrmTBaTN8nsmoYScZyTpnEb`,表「日报明细」`tbl77oxPmPcVVyVz` |
-| 飞书应用 | `cli_aa13a11707b89bdb`(凭据存于本机钥匙串 `zentao.mzlc.me`) |
+| Worker 地址 | `https://daily-agent-digest-submit.YOUR_SUBDOMAIN.workers.dev` |
+| 多维表格 | base「团队日报」`bascnREPLACE_WITH_YOUR_BASE_TOKEN`,表「日报明细」`tbl_REPLACE_WITH_YOUR_TABLE_ID` |
+| 飞书应用 | `cli_REPLACE_WITH_YOUR_APP_ID`(凭据存于本机钥匙串 `YOUR_KEYCHAIN_SERVICE`) |
 | secrets | `FEISHU_APP_SECRET`、`ADMIN_TOKEN`(已写入 Cloudflare) |
 | D1 | `daily-agent-digest-logs`(`audit_log` 表):提交(含失败)、签发、撤销、bootstrap 全部留痕,默认保留 180 天 |
 | 管理 CLI | `workers/scripts/digest-admin.mjs`:不带参数进入**管理台**(列出全部管理项按编号选择);子命令 menu / install / status / feishu / deploy / tables / employees / issue / keys / revoke / logs |
-| KV | `KEYS` 命名空间 `6f1b2801ee524cd7a3dab047e5c7e1a8`,存放成员 Key |
+| KV | `KEYS` 命名空间 `REPLACE_WITH_YOUR_KV_NAMESPACE_ID`,存放成员 Key |
 | Key 生命周期 | **线上已验证**:签发 → 用 Key 调 `/api/v1/me` 成功 → 列表不含哈希 → 撤销后立即 `403 key_revoked` |
 | 自动签发 | Worker `scheduled()` 每分钟轮询申请表:未签发的行自动生成 Key 并把明文写回该行;状态改为「已撤销」即停用。**成员填表 ≈1 分钟后就拿到 Key,无需管理员介入** |
 | 成员↔Key 映射 | 飞书两张表:「成员密钥」(台账,自动写入)与「密钥申请」(表单申请,签发后自动关单);权威仍在 KV |
-| 申请表单 | `https://kcnld55n87yl.feishu.cn/share/base/shrcngFJnMSxeEn760KVmhEiDve`(管理字段已隐藏) |
-| 端到端 | **已完成**:本地 App → 线上 Worker → 飞书表格,今日 6 项工作的「成员」列显示 **Master Cui**(已关联通讯录) |
+| 申请表单 | `https://YOUR_TENANT.feishu.cn/share/base/shrcngFJnMSxeEn760KVmhEiDve`(管理字段已隐藏) |
+| 端到端 | **已完成**:本地 App → 线上 Worker → 飞书表格,今日 6 项工作的「成员」列显示 **示例成员**(已关联通讯录) |
 | 客户端 UA | Cloudflare 会拦截 `Python-urllib`(403 / error code 1010),引擎已固定发送 `DailyAgentDigest/<版本>`;自研客户端必须带 UA |
 | open_id 获取 | **不需要新权限**:从企业已有表格的人员字段(「负责人」等)即可取到本应用可用的 open_id,实测写入「日报明细」的成员列成功(`code=0`) |
 | 已核验 | `/healthz` ok;bootstrap 幂等;鉴权边界(无 Key/错 Key → 401、未知路径 → 404);`created → unchanged → updated → unchanged` 且同日行数恒为 1;真实写入 6 行 |

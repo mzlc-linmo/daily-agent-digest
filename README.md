@@ -13,7 +13,7 @@ From this directory:
 Or install directly on macOS:
 
 ```bash
-curl -fsSL https://github.com/mzlc-linmo/daily-agent-digest-distribution/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/mzlc-linmo/daily-agent-digest/releases/latest/download/install.sh | sh
 ```
 
 The installer asks only for `LLM_API_KEY`. Base URL defaults to `https://api.deepseek.com/v1` and model defaults to `deepseek-flash`; both can be changed from the tray application's Settings menu or by editing `~/.local/share/daily-agent-digest/.env`. The key is entered without echo and saved with mode `600`. Re-running the installer preserves the existing file.
@@ -24,9 +24,9 @@ The tray controller uses the same runner protocol (`--app-command state|generate
 
 Set `DIGEST_DEBUG=1` in the runner environment to write provider and protocol errors to `debug.log` under the application directory. Reports are generated with one daily thematic LLM pass after local duplicate removal and excerpt truncation; if the LLM is unavailable, the fallback groups records by provider rather than exposing individual session rows.
 
-Production installs download a signed/released binary from `DIGEST_RELEASE_BASE`. The default points to the public distribution repository `mzlc-linmo/daily-agent-digest-distribution`; configure it to your public release host before publishing.
+Production installs download a signed/released binary from `DIGEST_RELEASE_BASE`. The default points to the public distribution repository `mzlc-linmo/daily-agent-digest`; configure it to your public release host before publishing.
 
-For CI publishing, add a fine-grained secret named `DISTRIBUTION_REPO_TOKEN` to the private source repository. It needs Contents: Read and write permission on `mzlc-linmo/daily-agent-digest-distribution`. Push a tag such as `v0.1.0` to build and publish both macOS binaries there.
+For CI publishing, add a fine-grained secret named `DISTRIBUTION_REPO_TOKEN` to the private source repository. It needs Contents: Read and write permission on `mzlc-linmo/daily-agent-digest`. Push a tag such as `v0.1.0` to build and publish both macOS binaries there.
 
 Manual workflow dispatch builds both architectures and uploads an unsigned draft Release to verify cross-repository permissions. Drafts are not public downloads. Version tags require Developer ID signing and Apple notarization before any public release can be created. The initial public installation URL will only work after the first signed release.
 

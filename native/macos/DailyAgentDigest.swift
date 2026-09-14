@@ -661,7 +661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// --check-version)时才会联网。
     static func fetchLatestVersion(completion: @escaping (Result<String, Error>) -> Void) {
         let urlString = ProcessInfo.processInfo.environment["DIGEST_RELEASES_API"]
-            ?? "https://api.github.com/repos/mzlc-linmo/daily-agent-digest-distribution/releases/latest"
+            ?? "https://api.github.com/repos/mzlc-linmo/daily-agent-digest/releases/latest"
         guard let url = URL(string: urlString) else {
             completion(.failure(NSError(domain: "digest", code: 1,
                                         userInfo: [NSLocalizedDescriptionKey: "无法解析发布仓库地址"])))

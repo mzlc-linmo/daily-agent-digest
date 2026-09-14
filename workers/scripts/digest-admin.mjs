@@ -33,8 +33,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TOML_PATH = path.join(ROOT, 'wrangler.toml');
 const WRANGLER = process.env.WRANGLER_CMD ?? 'npx --yes wrangler';
 const KEYCHAIN_SERVICE = 'daily-agent-digest';
-// 本机上已有的飞书应用凭据可能挂在别的服务名下,按顺序尝试
-const FEISHU_SERVICES = [KEYCHAIN_SERVICE, 'zentao.mzlc.me'];
+// 凭据统一存在这个服务名下(用 `digest-admin.mjs feishu` 写入)
+const FEISHU_SERVICES = [KEYCHAIN_SERVICE];
 const D1_NAME = 'daily-agent-digest-logs';
 
 const c = {

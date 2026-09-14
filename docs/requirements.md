@@ -5,7 +5,7 @@
 | 文档版本 | v1.0(已确认) |
 | 日期 | 2026-09-12 |
 | 代码基线 | `main` @ `1befe55`("Sign the native menu bar app before release") |
-| 已发布版本 | `v0.4.11`(公共分发库 `mzlc-linmo/daily-agent-digest-distribution`) |
+| 已发布版本 | `v0.4.11`(公共分发库 `mzlc-linmo/daily-agent-digest`) |
 | 文档地位 | **本文档取代 `docs/superpowers/plans/2026-09-12-production-delivery-plan.md`,作为后续开发的需求基线**;旧交付计划仅作历史参考 |
 | 相关文档 | `README.md` |
 
@@ -232,7 +232,7 @@
 - FR-13.1 CI 在 tag `v*` 时构建双架构、跑测试、签名、公证、生成 `SHA256SUMS`(`.github/workflows/build-release.yml`)。
 - FR-13.2 发布资产为显式清单:两个引擎二进制、两个 app zip、`install.sh`、`SHA256SUMS`;禁止目录或宽泛 glob。
 - FR-13.3 发布后必须审计公共资产(`scripts/release-audit.sh` 已存在,但未接入 workflow,见 D-9)。
-- FR-13.4 公共分发仓库 `mzlc-linmo/daily-agent-digest-distribution`(事实:已有 `v0.4.3`–`v0.4.11`)。
+- FR-13.4 公共分发仓库 `mzlc-linmo/daily-agent-digest`(事实:已有 `v0.4.3`–`v0.4.11`)。
 - FR-13.5 非 tag 的手动触发只产出 draft 预发布(已满足,`build-release.yml:112-114`)。
 
 #### FR-14 团队运营要求(P1,新增)

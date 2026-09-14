@@ -9,7 +9,7 @@
 //   ADMIN_TOKEN / API_KEYS
 //
 // 密钥建议从钥匙串读取后导出,不要写进文件:
-//   export FEISHU_APP_SECRET="$(security find-generic-password -s zentao.mzlc.me -a feishu-app-secret -w)"
+//   export FEISHU_APP_SECRET="$(security find-generic-password -s YOUR_KEYCHAIN_SERVICE -a feishu-app-secret -w)"
 
 import http from 'node:http';
 import { handleRequest } from '../src/handler.js';
