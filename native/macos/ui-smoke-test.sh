@@ -65,4 +65,20 @@ CHECK_OFF=$(printf '%s\n' "$MENU" | awk -F'|' '/^checkmark-when-disabled/{print 
 echo "checkmark follows state: enabled->on, disabled->off"
 
 echo
+echo "== edit menu shortcuts =="
+# ⌘V 这类快捷键由主菜单的「编辑」项提供;少了它,设置窗口里的输入框就粘贴不了。
+printf '%s\n' "$MENU" | grep '^mainmenu|' | sed 's/^/  /'
+for want in 'paste:|v|cmd' 'copy:|c|cmd' 'cut:|x|cmd' 'selectAll:|a|cmd' 'undo:|z|cmd'; do
+  printf '%s\n' "$MENU" | grep -q "^mainmenu|.*|${want}$" || {
+    echo "smoke: 编辑菜单缺少快捷键 ${want}" >&2; exit 1; }
+done
+echo "edit shortcuts present: cmd+x/c/v/a/z"
+
+echo
+echo "== paste into a settings field =="
+# 用户报的问题:设置窗口里 ⌘V 不能粘贴。这里真的合成一次 ⌘V 并检查剪贴板内容
+# 有没有落进输入框;拿不到 GUI 会话时会退化为只验证菜单接线。
+"$BIN" --paste-check
+
+echo
 echo "ui smoke test passed"

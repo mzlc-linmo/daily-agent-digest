@@ -568,7 +568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         lastTickAt = nil
         DebugLog.write("auto tick re-armed")
     }
-    func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image = {
+    func applicationDidFinishLaunching(_ n: Notification) { DebugLog.write("app launch pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") ui=\(Bundle.main.object(forInfoDictionaryKey: "DigestUIBuildID") ?? "unknown")"); installMainMenu(); statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength); statusItem.button?.image = {
             // 菜单栏用从 App 图标派生的单色 Template 图标;取不到再回退系统符号
             if let url = Bundle.main.url(forResource: "MenuBarIconTemplate", withExtension: "png"),
                let image = NSImage(contentsOf: url) {
@@ -994,6 +994,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         refreshLoginItemState()
     }
 
+    /// 托盘 App 默认**没有主菜单**,而 ⌘V / ⌘C / ⌘X / ⌘A / ⌘Z 并不是输入框自己处理的:
+    /// 它们是主菜单里「编辑」菜单项的快捷键(key equivalent),由菜单项去分发
+    /// paste: / copy: / cut: / selectAll: / undo:。没有主菜单,这些组合键就没有人响应,
+    /// 只有右键菜单里的「粘贴」还能用 —— 这正是设置窗口里 ⌘V 失效的原因。
+    /// 这个菜单栏在 .accessory 应用里不会显示出来,只为提供快捷键。
+    func installMainMenu() {
+        let main = NSMenu()
+
+        // 第一个菜单必须是"应用菜单",AppKit 依赖这个位置;顺便让 ⌘Q 可用。
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "退出 Daily Agent Digest", action: #selector(quit), keyEquivalent: "q"))
+        appItem.submenu = appMenu
+
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redo = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(redo)
+        edit.addItem(NSMenuItem.separator())
+        edit.addItem(NSMenuItem(title: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        edit.addItem(NSMenuItem(title: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        edit.addItem(NSMenuItem(title: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        edit.addItem(NSMenuItem(title: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editItem.submenu = edit
+
+        NSApp.mainMenu = main
+        DebugLog.write("main menu installed edit_items=\(edit.items.count)")
+    }
+
     /// 菜单单独成方法,好让 --dump-menu 在无头环境下检查结构(含「开机自启」的对勾)。
     func makeMenu() -> NSMenu {
         let m=NSMenu()
@@ -1190,6 +1223,57 @@ if CommandLine.arguments.contains("--check-version") {
     exit(output.hasPrefix("检查失败") ? 1 : 0)
 }
 
+if CommandLine.arguments.contains("--paste-check") {
+    // 「⌘V 到底能不能用」这件事值得真的试一次:合成一个 ⌘V 交给主菜单,
+    // 看剪贴板内容有没有落进输入框。没有主菜单时这一步根本不会发生。
+    _ = NSApplication.shared
+    let delegate = AppDelegate()
+    delegate.installMainMenu()
+
+    guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+                                       timestamp: 0, windowNumber: 0, context: nil,
+                                       characters: "v", charactersIgnoringModifiers: "v",
+                                       isARepeat: false, keyCode: 9) else {
+        print("FAIL 无法合成 ⌘V 事件"); exit(1)
+    }
+    // 1) 主菜单必须认领这个组合键(这是设置窗口里 ⌘V 失效的直接原因)
+    let claimed = NSApp.mainMenu?.performKeyEquivalent(with: event) ?? false
+    print(claimed ? "PASS 主菜单认领了 ⌘V" : "FAIL 主菜单没有认领 ⌘V(paste: 项缺失或键位不对)")
+    guard claimed else { exit(1) }
+
+    // 2) 真把内容粘进输入框。这需要窗口成为 key window;做不到就如实说跳过,
+    //    不把环境限制伪装成通过。
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 64),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+    let field = NSTextField(frame: NSRect(x: 10, y: 12, width: 300, height: 24))
+    window.contentView?.addSubview(field)
+    window.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+    _ = window.makeFirstResponder(field)
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    pb.setString("PASTED-BY-CMD-V", forType: .string)
+    field.stringValue = ""
+    _ = NSApp.mainMenu?.performKeyEquivalent(with: event)
+    if field.stringValue == "PASTED-BY-CMD-V" {
+        print("PASS ⌘V 把剪贴板内容粘进了输入框")
+        exit(0)
+    }
+    // 窗口拿不到 key 状态时,⌘V 不会被派发到字段;那就单独验证 paste: 动作本身。
+    // 加上上面"主菜单认领 ⌘V"一条,整条链路就是完整的(菜单接线 + 动作可用)。
+    if let editor = window.fieldEditor(true, for: field) as? NSTextView {
+        editor.paste(nil)
+        if field.stringValue == "PASTED-BY-CMD-V" {
+            print("PASS paste: 动作把剪贴板内容写进了输入框")
+            exit(0)
+        }
+        print("FAIL paste: 动作没有写入内容 -> \"\(field.stringValue)\"")
+        exit(1)
+    }
+    print("SKIP 当前环境无法构造 field editor,只验证了菜单接线")
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--dump-menu") {
     // 无头检查菜单结构:菜单是纯 GUI 的,不然「开机自启」的对勾只能靠肉眼确认。
     // 输出 `标题|动作|状态`,并额外给出系统里登录项的真实状态供断言比对。
@@ -1208,6 +1292,15 @@ if CommandLine.arguments.contains("--dump-menu") {
         let action = item.action.map { NSStringFromSelector($0) } ?? "-"
         let state = item.isSeparatorItem ? "separator" : (item.state == .on ? "on" : "off")
         print("\(item.title)|\(action)|\(state)")
+    }
+    // 主菜单里的「编辑」项提供 ⌘V/⌘C/⌘X/⌘A,没有它输入框就粘贴不了。
+    delegate.installMainMenu()
+    for top in NSApp.mainMenu?.items ?? [] {
+        for item in top.submenu?.items ?? [] {
+            let action = item.action.map { NSStringFromSelector($0) } ?? "-"
+            let mods = item.keyEquivalentModifierMask.contains(.command) ? "cmd" : "-"
+            print("mainmenu|\(item.title)|\(action)|\(item.keyEquivalent)|\(mods)")
+        }
     }
     exit(0)
 }
