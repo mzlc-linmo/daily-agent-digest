@@ -28,7 +28,7 @@ import {
   bootstrapLocally, d1Adapter, issueLocally, kvAdapter,
   listKeysLocally, logsLocally, revokeLocally,
 } from './local-admin.mjs';
-import { issueReportLines, parseDeployedUrl, resolveSubmitUrl } from './issue-report.mjs';
+import { isPlaceholder, issueReportLines, knownSubmitUrl, parseDeployedUrl, placeholderLabels, resolveSubmitUrl } from './issue-report.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TOML_PATH = path.join(ROOT, 'wrangler.toml');
@@ -161,6 +161,13 @@ function tomlVar(name) {
   return m ? m[1] : '';
 }
 
+/// 只返回"真实"的值:仓库模板里的占位符(YOUR_… / REPLACE_WITH_…)算未配置。
+/// 公开仓库里的 wrangler.toml 是模板,直接 tomlVar 会把占位符当成配好的值。
+function realVar(name) {
+  const value = tomlVar(name);
+  return value && !isPlaceholder(value) ? value : '';
+}
+
 function setTomlVar(name, value) {
   let toml = readToml();
   const line = `${name} = "${value}"`;
@@ -180,6 +187,15 @@ function submitUrl() {
 
 function kvNamespaceId() {
   return /\[\[kv_namespaces\]\][\s\S]*?id\s*=\s*"([0-9a-f]{32})"/.exec(readToml())?.[1] ?? '';
+}
+
+/// 原始值(可能是占位符):用于区分"没有绑定块"和"绑定块里是模板占位符"。
+function kvNamespaceRaw() {
+  return /\[\[kv_namespaces\]\][\s\S]*?id\s*=\s*"([^"]*)"/.exec(readToml())?.[1] ?? '';
+}
+
+function d1DatabaseIdRaw() {
+  return /\[\[d1_databases\]\][\s\S]*?database_id\s*=\s*"([^"]*)"/.exec(readToml())?.[1] ?? '';
 }
 
 function d1DatabaseName() {
@@ -477,17 +493,40 @@ async function cmdStatus() {
     'logged-out': c.red('未登录(需要 wrangler login)'),
     error: c.red('wrangler 执行失败(非登录问题,详情见 whoami 输出)'),
   }[auth.state];
+  // 仓库里的 wrangler.toml 是公开模板:占位符必须显示成"未配置",
+  // 否则会出现「主表 ID  tbl_REPLACE_WITH_YOUR_TABLE_ID」这种像是配好了的假象。
   const rows = [
     ['Cloudflare 登录', loginCell],
-    ['飞书 App ID', tomlVar('FEISHU_APP_ID') ? c.green('已配置') : c.red('缺失')],
-    ['飞书 App Secret', feishu.appSecret ? c.green('已配置(钥匙串/环境变量)') : c.red('缺失')],
-    ['KV 命名空间', hasBinding('kv_namespaces') ? c.green('已绑定') : c.red('缺失')],
-    ['D1 数据库', hasBinding('d1_databases') ? c.green('已绑定') : c.red('缺失')],
-    ['主表 ID', tomlVar('BITABLE_TABLE_ID') || c.red('缺失')],
+    ['飞书 App ID', realVar('FEISHU_APP_ID') ? c.green('已配置') : c.red('未配置(跑 `feishu`)')],
+    ['飞书 App Secret', feishu.appSecret ? c.green('已配置(钥匙串/环境变量)') : c.red('未配置(跑 `feishu`,或加 --app-secret)')],
+    ['KV 命名空间', kvNamespaceId() ? c.green('已绑定') : (kvNamespaceRaw() ? c.yellow('占位符(需填真实 id)') : c.red('未绑定(跑 `deploy`)'))],
+    ['D1 数据库', d1DatabaseName() && /^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? c.green('已绑定') : (d1DatabaseIdRaw() ? c.yellow('占位符(需填真实 id)') : c.red('未绑定(跑 `deploy`)'))],
+    ['主表 token', realVar('BITABLE_APP_TOKEN') ? c.green('已配置') : c.red('未配置(跑 `tables`)')],
+    ['主表 ID', realVar('BITABLE_TABLE_ID') ? c.green(realVar('BITABLE_TABLE_ID')) : c.red('未配置(跑 `tables`)')],
     ['定时任务', /crons\s*=/.test(readToml()) ? c.green('每小时清理日志') : c.red('未配置')],
   ];
   say(c.bold('\n当前配置'));
   for (const [k, v] of rows) say(`  ${k.padEnd(16)} ${v}`);
+  // 模板占位符要单独说清楚:线上 Worker 跑的是部署时的旧配置,
+  // 此时再跑 deploy / tables 会把占位符写进线上,直接打断上报。
+  const stubs = placeholderLabels([
+    ['KV 命名空间 id', kvNamespaceRaw()],
+    ['D1 database_id', d1DatabaseIdRaw()],
+    ['主表 token', tomlVar('BITABLE_APP_TOKEN')],
+    ['主表 ID', tomlVar('BITABLE_TABLE_ID')],
+    ['飞书 App ID', tomlVar('FEISHU_APP_ID')],
+    ['后端地址', tomlVar('SUBMIT_URL')],
+  ]);
+  if (stubs.length) {
+    warn(`wrangler.toml 里这些还是仓库模板的占位符:${stubs.join('、')}`);
+    say(c.dim('    线上 Worker 跑的是部署时写入的旧配置,现在仍然正常;'));
+    say(c.dim('    但在补齐真实值之前不要跑 `deploy` / `tables`,否则会把占位符写进线上,直接打断上报。'));
+    say(c.dim('    取回真实值:'));
+    say(c.dim('      KV 命名空间 id   npx wrangler kv namespace list(KEYS 那条的 id)'));
+    say(c.dim('      D1 database_id   npx wrangler d1 list(daily-agent-digest-logs 那条)'));
+    say(c.dim('      主表 token / 主表 ID / 飞书 App ID   Cloudflare 控制台里该 Worker 的变量(部署时写入的旧值)'));
+    say(c.dim('      后端地址         就是 Worker 地址(托盘菜单「设置」里的提交地址通常已经填着它)'));
+  }
   const url = submitUrl();
   if (url) {
     // 用异步执行:同期的 curl 也会阻塞事件循环,把动画冻住
@@ -552,6 +591,11 @@ async function cmdDeploy(flags) {
     if (!id) fail(`创建 KV 失败:${(r.out ?? '').trim()}`);
     appendBinding(`# API Key 存放在 KV:签发时绑定人员,撤销即时生效。\n[[kv_namespaces]]\nbinding = "KEYS"\nid = "${id}"`);
     ok(`KV 已创建并写入 wrangler.toml(${id})`);
+  } else if (!kvNamespaceId()) {
+    // 绑定块在、id 却是占位符(公开仓库模板就是这样)。这里**绝不能**当成"没绑定"去新建:
+    // 新命名空间里没有已签发的 Key,所有成员会立刻无法提交。必须让操作员填回真实 id。
+    fail(`wrangler.toml 里的 KV 命名空间 id 不是合法 id(当前值:${kvNamespaceRaw() || '空'})。
+  这多半是公开仓库模板的占位符。请填回真实 id(npx wrangler kv namespace list),不要新建 —— 新建会丢掉已签发的 Key。`);
   } else ok('KV 已绑定,跳过');
 
   if (!hasBinding('d1_databases')) {
@@ -560,6 +604,9 @@ async function cmdDeploy(flags) {
     if (!id) fail(`创建 D1 失败:${(r.out ?? '').trim()}`);
     appendBinding(`# 审计日志(提交/签发/撤销)持久化在 D1。\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${id}"`);
     ok(`D1 已创建并写入 wrangler.toml(${id})`);
+  } else if (!/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw())) {
+    fail(`wrangler.toml 里的 D1 database_id 不是合法 id(当前值:${d1DatabaseIdRaw() || '空'})。
+  这多半是公开仓库模板的占位符。请填回真实 id(npx wrangler d1 list),不要新建 —— 新建会丢掉已有审计日志。`);
   } else ok('D1 已绑定,跳过');
 
   const schema = await withSpinner('应用 schema.sql(建 audit_log 表)', () => wrangler(['d1', 'execute', D1_NAME, '--remote', '--file=schema.sql']));
@@ -700,20 +747,22 @@ async function cmdInstall(flags) {
   // 每一步的"当前配置"摘要:已配置的直接展示出来,作为是否重做的判断依据
   const summaries = {
     feishu: () => {
-      const id = tomlVar('FEISHU_APP_ID');
+      // 占位符不算已配置:否则一键全流程会把仓库模板当成"配好了"直接跳过。
+      const id = realVar('FEISHU_APP_ID');
       const secret = creds.appSecret;
       if (!id || !secret) return null;
       return `App ID ${id};App Secret ${c.dim('已配置(钥匙串/环境变量)')}`;
     },
     deploy: () => {
       const kv = kvNamespaceId();
-      const d1 = d1DatabaseName();
-      const url = tomlVar('SUBMIT_URL');
+      // D1 必须是真实 id:绑定块在、值是占位符时同样算未配置。
+      const d1 = d1DatabaseName() && /^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? d1DatabaseName() : '';
+      const url = knownSubmitUrl(tomlVar('SUBMIT_URL'));
       if (!kv || !d1) return null;
       return `KV ${kv.slice(0, 8)}…;D1 ${d1}${url ? `;地址 ${url}` : ''}`;
     },
     tables: () => {
-      const main = tomlVar('BITABLE_TABLE_ID');
+      const main = realVar('BITABLE_TABLE_ID');
       return main ? `主表 ${main}` : null;
     },
   };

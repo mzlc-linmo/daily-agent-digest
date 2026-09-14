@@ -103,6 +103,25 @@ node scripts/digest-admin.mjs
 ? 已配置,是否重新执行? [y/N]:
 ```
 
+### ⚠️ `wrangler.toml` 是公开仓库里的模板
+
+仓库里的 `workers/wrangler.toml` **只含占位符**(`bascnREPLACE_WITH_YOUR_BASE_TOKEN`、`tbl_REPLACE_WITH_YOUR_TABLE_ID`、
+`YOUR_SUBDOMAIN`、`REPLACE_WITH_YOUR_KV_NAMESPACE_ID`…),真实的 base token / 表 id / KV / D1 / App ID 只存在于
+**操作机本地**(由 `deploy` / `tables` 写入,且**不要提交**)。所以:
+
+- `status` 会把占位符显示成「未配置 / 占位符(需填真实 id)」并整体告警 —— 这是正常的,不是 CLI 坏了;
+- **占位符状态下不要跑 `deploy` / `tables`**:那会把占位符写进线上 Worker,直接打断所有人的上报。
+  命令本身也会拦住你(KV/D1 是占位符时会明确失败,而不是新建命名空间 —— 新建会丢掉已签发的 Key);
+- 换机器、或本地文件被清理后,按下表把真实值填回去(改完 `status` 应全部变成绿色):
+
+| 缺失项 | 取回方式 |
+| --- | --- |
+| KV 命名空间 id | `npx wrangler kv namespace list`(绑定 `KEYS` 的那条) |
+| D1 `database_id` | `npx wrangler d1 list`(`daily-agent-digest-logs`) |
+| 主表 token / 主表 ID / 飞书 App ID | Cloudflare 控制台 → Workers → 该 Worker → Settings → Variables(部署时写入的旧值);表 token/id 也能从飞书多维表格的 URL 里取 |
+| 后端地址 `SUBMIT_URL` | 就是 Worker 地址;成员端托盘菜单「设置」里的提交地址通常已经填着它 |
+| 本地飞书 App Secret | 只用于 CLI 直连飞书;`security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。线上那一份是 Cloudflare secret,不受影响 |
+
 ## 子命令(等价能力)
 
 ```bash

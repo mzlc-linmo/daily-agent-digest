@@ -2,9 +2,36 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { issueReportLines, knownSubmitUrl, parseDeployedUrl, resolveSubmitUrl } from '../scripts/issue-report.mjs';
+import {
+  isPlaceholder, issueReportLines, knownSubmitUrl, parseDeployedUrl, placeholderLabels, resolveSubmitUrl,
+} from '../scripts/issue-report.mjs';
 
 const textOf = (rows) => rows.map(([, text]) => text).join('\n');
+
+test('template placeholders are detected; empty values are "not configured" instead', () => {
+  assert.equal(isPlaceholder('bascnREPLACE_WITH_YOUR_BASE_TOKEN'), true);
+  assert.equal(isPlaceholder('tbl_REPLACE_WITH_YOUR_TABLE_ID'), true);
+  assert.equal(isPlaceholder('cli_REPLACE_WITH_YOUR_APP_ID'), true);
+  assert.equal(isPlaceholder('https://daily-agent-digest-submit.YOUR_SUBDOMAIN.workers.dev'), true);
+  assert.equal(isPlaceholder('<你的地址>'), true);
+  // 空值是"未配置",不是占位符:两者提示不同,不能混为一谈。
+  assert.equal(isPlaceholder(''), false);
+  assert.equal(isPlaceholder('   '), false);
+  assert.equal(isPlaceholder(undefined), false);
+  assert.equal(isPlaceholder(null), false);
+  assert.equal(isPlaceholder('tblABC123realtable'), false);
+});
+
+test('placeholderLabels lists only the entries still on the template', () => {
+  const entries = [
+    ['KV 命名空间 id', 'REPLACE_WITH_YOUR_KV_NAMESPACE_ID'],
+    ['D1 database_id', '0123456789abcdef0123456789abcdef'],
+    ['主表 ID', 'tbl_REPLACE_WITH_YOUR_TABLE_ID'],
+    ['飞书 App ID', ''],
+  ];
+  assert.deepEqual(placeholderLabels(entries), ['KV 命名空间 id', '主表 ID']);
+  assert.deepEqual(placeholderLabels([]), []);
+});
 
 // 真实的 `wrangler deploy` 输出形状(子域用占位名,不含任何真实标识)
 const DEPLOY_OUTPUT = ` ⛅️ wrangler 3.80.0

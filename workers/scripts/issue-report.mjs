@@ -1,19 +1,33 @@
-/// 提交地址工具 + 签发提示。
+/// 配置值判定 + 签发提示。
 ///
-/// 提交地址有两件事容易出错,都在这里处理并有单测覆盖:
-///   · 仓库模板里的 `YOUR_SUBDOMAIN` 占位符不能被当成真实地址;
-///   · `wrangler deploy` 的输出要能正确解析出成员的长期提交地址。
+/// 这里放的都是纯函数,便于单测。三件事容易出错:
+///   · 仓库模板里的 `YOUR_…` / `REPLACE_WITH_…` 占位符不能被当成真实配置;
+///   · `wrangler deploy` 的输出要能正确解析出成员的长期提交地址;
+///   · 签发 Key 时要把地址一起给出去。
+
+/// 判断一个值是否还是仓库模板里的占位符。
 ///
+/// wrangler.toml 是随公开仓库分发的模板,里面的 token / 表 id / App ID 都是
+/// `bascnREPLACE_WITH_YOUR_BASE_TOKEN`、`YOUR_SUBDOMAIN` 这类占位符。
+/// 空值不算占位符 —— 那是"未配置",另有提示。
+export function isPlaceholder(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return false;
+  return /YOUR_|REPLACE_WITH|[<>]/.test(text);
+}
+
+/// 找出仍然是占位符的配置项(传入 [标签, 值] 列表),用于状态页的整体告警。
+export function placeholderLabels(entries) {
+  return entries.filter(([, value]) => isPlaceholder(value)).map(([label]) => label);
+}
+
 /// 判断一个"提交地址"是否是真实可用的。
 ///
-/// wrangler.toml 是随仓库分发的模板,里面的 SUBMIT_URL 是
-/// `https://daily-agent-digest-submit.YOUR_SUBDOMAIN.workers.dev` 这样的占位符;
-/// 部署成功后 cmdDeploy 才会把它改写成真实地址。若不识别占位符,签发时就会把
-/// 一个根本不存在的地址当成"本人要对接的提交地址"发出去。
+/// 占位符必须当作"没有地址":否则签发时会把一个根本不存在的地址当成
+/// "本人要对接的提交地址"发出去。
 export function knownSubmitUrl(raw) {
   const url = String(raw ?? '').trim();
-  if (!url) return '';
-  if (/YOUR_|REPLACE_WITH|[<>]/.test(url)) return '';
+  if (!url || isPlaceholder(url)) return '';
   return url;
 }
 
