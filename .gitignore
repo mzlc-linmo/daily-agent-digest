@@ -21,3 +21,7 @@ dist/
 workers/node_modules/
 workers/.wrangler/
 workers/.dev.vars
+# 操作机上的真实配置(token / 表 id / KV / D1 / 子域)。仓库只跟踪模板
+# wrangler.toml.example;deploy / tables / adopt 都写入这份被忽略的文件,
+# 所以 `git status` 始终干净,也不会不小心把真实标识符提交进公开仓库。
+workers/wrangler.toml

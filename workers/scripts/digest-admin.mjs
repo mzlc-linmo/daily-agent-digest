@@ -19,7 +19,7 @@
 //   node workers/scripts/digest-admin.mjs logs         # 查审计日志
 
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,9 +29,13 @@ import {
   listKeysLocally, logsLocally, revokeLocally,
 } from './local-admin.mjs';
 import { isPlaceholder, issueReportLines, knownSubmitUrl, parseDeployedUrl, placeholderLabels, resolveSubmitUrl } from './issue-report.mjs';
+import { pickD1DatabaseId, pickKvNamespaceId } from './recover.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TOML_PATH = path.join(ROOT, 'wrangler.toml');
+/// 仓库里跟踪的只有模板;真实配置写在被 .gitignore 忽略的 wrangler.toml 里,
+/// 所以 `git status` 始终干净,也不会把真实 token / 子域提交进公开仓库。
+const TOML_EXAMPLE_PATH = path.join(ROOT, 'wrangler.toml.example');
 const WRANGLER = process.env.WRANGLER_CMD ?? 'npx --yes wrangler';
 const KEYCHAIN_SERVICE = 'daily-agent-digest';
 // 凭据统一存在这个服务名下(用 `digest-admin.mjs feishu` 写入)
@@ -152,8 +156,24 @@ async function tryAutoLogin() {
   }
 }
 
+/// 本地配置不存在时从模板创建一份(新机器 / 重新 clone 后的第一步)。
+function ensureLocalConfig() {
+  if (existsSync(TOML_PATH) || !existsSync(TOML_EXAMPLE_PATH)) return false;
+  copyFileSync(TOML_EXAMPLE_PATH, TOML_PATH);
+  warn('已从 wrangler.toml.example 创建本地配置 workers/wrangler.toml');
+  say(c.dim('    该文件不会被 git 跟踪;deploy / tables / adopt 会把真实值写进去。'));
+  return true;
+}
+
 function readToml() {
+  ensureLocalConfig();
   return existsSync(TOML_PATH) ? readFileSync(TOML_PATH, 'utf8') : '';
+}
+
+/// 本地配置是否被 git 跟踪:跟踪了就说明真实值有被提交的风险,必须提醒。
+function localConfigTracked() {
+  const r = spawnSync('git', ['ls-files', '--error-unmatch', 'wrangler.toml'], { cwd: ROOT, encoding: 'utf8' });
+  return r.status === 0;
 }
 
 function tomlVar(name) {
@@ -507,6 +527,8 @@ async function cmdStatus() {
   ];
   say(c.bold('\n当前配置'));
   for (const [k, v] of rows) say(`  ${k.padEnd(16)} ${v}`);
+  const tracked = localConfigTracked();
+  say(`  ${'配置文件'.padEnd(16)} ${path.relative(process.cwd(), TOML_PATH)}${tracked ? c.red('  ← 被 git 跟踪,真实值有泄露风险(见 workers/README.md)') : c.dim('  (未被 git 跟踪)')}`);
   // 模板占位符要单独说清楚:线上 Worker 跑的是部署时的旧配置,
   // 此时再跑 deploy / tables 会把占位符写进线上,直接打断上报。
   const stubs = placeholderLabels([
@@ -618,6 +640,64 @@ async function cmdDeploy(flags) {
   const url = parseDeployedUrl(deploy.out ?? '', tomlVar('name'));
   if (url) { setTomlVar('SUBMIT_URL', url); ok(`后端已部署:${url}`); }
   else warn('部署成功但没解析到地址,请手动把 SUBMIT_URL 写进 wrangler.toml');
+}
+
+/// 把 id 写进对应的绑定块(块存在就改其中的 id,不存在才追加整块)。
+function setBindingValue(kind, key, value, blockText) {
+  let toml = readToml();
+  const re = new RegExp(`(\\[\\[${kind}\\]\\][\\s\\S]*?${key}\\s*=\\s*")[^"]*(")`);
+  if (re.test(toml)) toml = toml.replace(re, `$1${value}$2`);
+  else toml += `\n${blockText}\n`;
+  writeFileSync(TOML_PATH, toml);
+}
+
+/// 恢复到已有部署:配置被清理或换机器后,不用手抄 id。
+///
+/// KV 命名空间与 D1 数据库的 id 都能从 Cloudflare 查回来,飞书那三项要从
+/// Worker 的变量里看(它们只在部署时写过一次,云端 secret 读不回明文)。
+async function cmdAdopt(flags) {
+  await requireLogin();
+  ensureLocalConfig();
+  say(c.bold('\n恢复到已有部署'));
+  say(c.dim('    写回本地配置 workers/wrangler.toml(该文件不被 git 跟踪)。'));
+
+  // KV / D1:能自动找回来,失败才让人手填
+  const kvOut = await withSpinner('在 Cloudflare 上找 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'list']));
+  const kvId = flags['kv-id'] || pickKvNamespaceId(kvOut.out ?? '');
+  if (kvId) setBindingValue('kv_namespaces', 'id', kvId, `[[kv_namespaces]]\nbinding = "KEYS"\nid = "${kvId}"`);
+  const d1Out = await withSpinner('在 Cloudflare 上找 D1 数据库', () => wrangler(['d1', 'list', '--json']));
+  const d1Id = flags['d1-id'] || pickD1DatabaseId(d1Out.out ?? '');
+  if (d1Id) setBindingValue('d1_databases', 'database_id', d1Id, `[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${d1Id}"`);
+  ok(`KV ${kvId || c.red('未找到')}  ${c.dim(`D1 ${d1Id || c.red('未找到')}`)}`);
+  if (!kvId) warn('没在账号里找到名为 KEYS 的 KV 命名空间:核对是否登录了正确的账号,或显式给 --kv-id');
+  if (!d1Id) warn(`没在账号里找到名为 ${D1_NAME} 的 D1 数据库:或显式给 --d1-id`);
+
+  // 飞书侧与地址:只能人工确认(Cloudflare 控制台里该 Worker 的变量就是部署时的旧值)
+  say(c.dim('\n  下面几项在 Cloudflare 控制台 → Workers → 该 Worker → Settings → Variables 里能看到旧值;'));
+  say(c.dim('  表 token / 表 ID 也可以直接从飞书多维表格的 URL 里取。回车表示保持不变。\n'));
+  const baseToken = flags['base-token'] ?? await ask('飞书主表 token(bitable app token)', { defaultValue: tomlVar('BITABLE_APP_TOKEN') });
+  const tableId = flags['table-id'] ?? await ask('飞书主表 ID', { defaultValue: tomlVar('BITABLE_TABLE_ID') });
+  const appId = flags['app-id'] ?? await ask('飞书 App ID', { defaultValue: tomlVar('FEISHU_APP_ID') });
+  const submitUrlInput = flags['submit-url'] ?? await ask('后端提交地址(Worker 地址)', { defaultValue: knownSubmitUrl(tomlVar('SUBMIT_URL')) });
+
+  for (const [name, value] of [['BITABLE_APP_TOKEN', baseToken], ['BITABLE_TABLE_ID', tableId], ['FEISHU_APP_ID', appId], ['SUBMIT_URL', submitUrlInput]]) {
+    const trimmed = String(value ?? '').trim();
+    if (trimmed && !isPlaceholder(trimmed)) setTomlVar(name, trimmed);
+  }
+  ok(`已写入 ${path.relative(process.cwd(), TOML_PATH)}`);
+
+  // 地址能立刻验一下:填错的话这里就能看出来
+  const url = submitUrl();
+  if (url) {
+    const r = await withSpinner('校验后端地址', () => runAsync('curl', ['-sS', '-o', '/dev/null', '-w', '%{http_code}', `${url.replace(/\/$/, '')}/healthz`]));
+    const code = (r.stdout ?? '').trim();
+    if (r.code === 0 && code === '200') ok(`后端可达:${url}`);
+    else warn(`后端暂不可达(HTTP ${code || r.code}):${url} —— 地址可能不对,或 Worker 未部署`);
+  }
+  say(c.dim('\n  接着建议:'));
+  say(c.dim('    1) node workers/scripts/digest-admin.mjs status        # 复核,占位符警告应消失'));
+  say(c.dim('    2) 本地飞书 App Secret(仅 CLI 直连飞书要用):'));
+  say(c.dim(`       security add-generic-password -s ${KEYCHAIN_SERVICE} -a feishu-app-secret -w`));
 }
 
 async function cmdTables(flags) {
@@ -966,6 +1046,9 @@ const MENU_SECTIONS = [
     ['创建 KV / D1 并部署 Worker', (f) => cmdDeploy(f)],
     ['建飞书表并回填 table id', (f) => cmdTables(f)],
   ]],
+  ['恢复与迁移', [
+    ['恢复到已有部署(自动找回 KV / D1 的 id)', (f) => cmdAdopt(f)],
+  ]],
   ['成员与 Key', [
     ['员工与 Key(列出 / 签发 / 轮换 / 撤销)', (f) => cmdMembers(f)],
   ]],
@@ -1036,6 +1119,7 @@ const COMMANDS = {
   status: cmdStatus,
   feishu: cmdFeishu,
   deploy: cmdDeploy,
+  adopt: cmdAdopt,
   tables: cmdTables,
   members: cmdMembers,
   employees: cmdEmployees,
@@ -1062,6 +1146,7 @@ if (!COMMANDS[command] || flags.help) {
   status           显示配置与 Cloudflare 登录状态
   feishu           配置并校验飞书应用凭据(App ID/Secret)
   deploy           创建 KV + D1、应用日志表结构、部署 Worker
+  adopt            恢复到已有部署:自动找回 KV / D1 的 id 并写回本地配置
   tables           建飞书表 → 回填 table id → 重新部署 → 配置表单
   members          员工与 Key 合并视图(列出 / 签发 / 轮换 / 撤销)
   employees        只列出员工(含 open_id 与来源)

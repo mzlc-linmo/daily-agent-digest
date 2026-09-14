@@ -271,7 +271,7 @@ Idempotency-Key: <date>:<content_sha256>   # 客户端追踪用;服务端幂等�
 | --- | --- | --- |
 | Worker:路由 / 鉴权 / 校验 / 幂等覆盖 / 错误语义 / bootstrap | **已实现** | `workers/src/*.js` |
 | Worker 单测(12 项:created·updated·unchanged·鉴权·校验·502) | **通过** | `workers/test/handler.test.js`(`npm test`,零依赖) |
-| 部署配置与操作说明 | **已就绪** | `workers/wrangler.toml`、`workers/README.md` |
+| 部署配置与操作说明 | **已就绪** | `workers/wrangler.toml.example`(入库模板)+ 本地 `workers/wrangler.toml`(git 忽略,真实值)、`workers/README.md` |
 | 客户端:设置项(提交地址 + API Key,保存一次长期复用) | **已实现** | `daily_agent_digest.py` 的 `settings`/`save_settings`,`DailyAgentDigest.swift` 设置面板 |
 | 客户端:提交载荷 + `Idempotency-Key` + 失败语义 | **已实现** | `daily_agent_digest.py` 的 `submit()` |
 | 客户端:Key 校验与姓名回填(`check-submit` → `GET /api/v1/me`) | **已实现** | 同上 + 设置面板「测试连接」 |

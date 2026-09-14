@@ -81,9 +81,9 @@ node scripts/digest-admin.mjs
     请立即发给本人;丢失在「员工与 Key」里轮换。
 ```
 
-地址取部署时写回 `wrangler.toml` 的 `SUBMIT_URL`(可用环境变量 `DIGEST_SUBMIT_URL` 覆盖)。仓库里的
-`SUBMIT_URL` 是 `YOUR_SUBDOMAIN` 这类**模板占位符**,会被当作"没有地址":此时签发只给一句可操作的提示,
-不会把占位符当真实地址发出去 —— 先把 `部署` 跑一次再来签发。
+地址取部署时写回本地配置的 `SUBMIT_URL`(可用环境变量 `DIGEST_SUBMIT_URL` 覆盖)。模板里的
+`SUBMIT_URL` 是 `YOUR_SUBDOMAIN` 这类**占位符**,会被当作"没有地址":此时签发只给一句可操作的提示,
+不会把占位符当真实地址发出去 —— 先跑 `deploy`(或 `adopt`)拿到真实地址再来签发。
 
 选中后按状态给出不同操作:
 
@@ -103,22 +103,33 @@ node scripts/digest-admin.mjs
 ? 已配置,是否重新执行? [y/N]:
 ```
 
-### ⚠️ `wrangler.toml` 是公开仓库里的模板
+### 配置:模板入库,真实值只在本地
 
-仓库里的 `workers/wrangler.toml` **只含占位符**(`bascnREPLACE_WITH_YOUR_BASE_TOKEN`、`tbl_REPLACE_WITH_YOUR_TABLE_ID`、
-`YOUR_SUBDOMAIN`、`REPLACE_WITH_YOUR_KV_NAMESPACE_ID`…),真实的 base token / 表 id / KV / D1 / App ID 只存在于
-**操作机本地**(由 `deploy` / `tables` 写入,且**不要提交**)。所以:
+仓库里跟踪的是**模板** `workers/wrangler.toml.example`;`workers/wrangler.toml` 是**你自己的配置文件,已被
+`.gitignore` 忽略**。`deploy` / `tables` / `adopt` 写进去的真实值(token、表 id、KV/D1 id、Worker 子域)因此
+**永远不会出现在 `git status` 里,也不会被提交**。`git checkout` / 重新 clone 不会再冲掉它们。
 
-- `status` 会把占位符显示成「未配置 / 占位符(需填真实 id)」并整体告警 —— 这是正常的,不是 CLI 坏了;
-- **占位符状态下不要跑 `deploy` / `tables`**:那会把占位符写进线上 Worker,直接打断所有人的上报。
-  命令本身也会拦住你(KV/D1 是占位符时会明确失败,而不是新建命名空间 —— 新建会丢掉已签发的 Key);
-- 换机器、或本地文件被清理后,按下表把真实值填回去(改完 `status` 应全部变成绿色):
+- 本地配置不存在时,任何命令都会自动从模板创建一份并提示(新机器第一步无需手动 `cp`);
+- `status` 会打印实际用的配置文件以及它是否被 git 跟踪(万一被跟踪会直接标红);
+- 模板里的值仍是占位符(`bascnREPLACE_WITH_YOUR_BASE_TOKEN`、`YOUR_SUBDOMAIN`…),`status` 会把它们显示成
+  「未配置 / 占位符(需填真实 id)」并整体告警 —— 这是提醒,不是 CLI 坏了;
+- **占位符状态下不要跑 `deploy` / `tables`**:那会把占位符写进线上 Worker,直接打断所有人上报。命令本身也会拦住你
+  (KV/D1 是占位符时明确失败,而不是新建命名空间 —— 新建会丢掉已签发的 Key)。
+
+换机器或配置丢失后,一条命令就能把 KV / D1 找回来:
+
+```bash
+node workers/scripts/digest-admin.mjs adopt
+```
+
+它会在 Cloudflare 上按名字找到 KV `KEYS` 与 D1 `daily-agent-digest-logs` 并写回本地配置,再问剩下四项
+(回车即保持原值),最后拿 `/healthz` 验一次地址。
 
 | 缺失项 | 取回方式 |
 | --- | --- |
-| KV 命名空间 id | `npx wrangler kv namespace list`(绑定 `KEYS` 的那条) |
-| D1 `database_id` | `npx wrangler d1 list`(`daily-agent-digest-logs`) |
-| 主表 token / 主表 ID / 飞书 App ID | Cloudflare 控制台 → Workers → 该 Worker → Settings → Variables(部署时写入的旧值);表 token/id 也能从飞书多维表格的 URL 里取 |
+| KV 命名空间 id | **`adopt` 自动**(`npx wrangler kv namespace list` 里 `KEYS` 那条) |
+| D1 `database_id` | **`adopt` 自动**(`npx wrangler d1 list`) |
+| 主表 token / 主表 ID / 飞书 App ID | Cloudflare 控制台 → Workers → 该 Worker → Settings → Variables(部署时写入的旧值);表 token/id 也能从飞书多维表格的 URL 里取,`adopt` 会逐个问 |
 | 后端地址 `SUBMIT_URL` | 就是 Worker 地址;成员端托盘菜单「设置」里的提交地址通常已经填着它 |
 | 本地飞书 App Secret | 只用于 CLI 直连飞书;`security add-generic-password -s daily-agent-digest -a feishu-app-secret -w`(或每次加 `--app-secret`)。线上那一份是 Cloudflare secret,不受影响 |
 
