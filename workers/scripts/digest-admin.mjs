@@ -149,6 +149,30 @@ function keychainSet(account, value, service = KEYCHAIN_SERVICE) {
   return true;
 }
 
+/// 终端里的显示宽度:中日韩文字与全角符号占 2 列。
+/// 直接用 padEnd 会按"字符数"补齐,导致中英文混排时列歪掉。
+function displayWidth(text) {
+  let width = 0;
+  for (const ch of String(text)) {
+    const cp = ch.codePointAt(0);
+    const wide = (cp >= 0x1100 && cp <= 0x115f)
+      || (cp >= 0x2e80 && cp <= 0xa4cf)
+      || (cp >= 0xac00 && cp <= 0xd7a3)
+      || (cp >= 0xf900 && cp <= 0xfaff)
+      || (cp >= 0xfe30 && cp <= 0xfe6f)
+      || (cp >= 0xff00 && cp <= 0xff60)
+      || (cp >= 0xffe0 && cp <= 0xffe6)
+      || (cp >= 0x20000 && cp <= 0x3fffd);
+    width += wide ? 2 : 1;
+  }
+  return width;
+}
+
+function padEndWidth(text, width) {
+  const s = String(text);
+  return s + ' '.repeat(Math.max(0, width - displayWidth(s)));
+}
+
 /* ------------------------------------------------------------------ 交互 */
 
 let rl = null;
@@ -251,13 +275,19 @@ async function listEmployees(token, extraBases = []) {
       for (const record of records) {
         for (const field of personFields) {
           for (const person of record.fields?.[field] ?? []) {
-            if (person?.id) people.set(person.id, { name: person.name ?? '(无名)', source: `${base.name}/${table.name}` });
+            if (!person?.id) continue;
+            const source = `${base.name}/${table.name}`;
+            const entry = people.get(person.id) ?? { name: person.name ?? '(无名)', sources: [] };
+            if (!entry.sources.includes(source)) entry.sources.push(source);
+            people.set(person.id, entry);
           }
         }
       }
     }
   }
-  return [...people].map(([open_id, v]) => ({ open_id, ...v })).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  return [...people]
+    .map(([open_id, v]) => ({ open_id, name: v.name, sources: v.sources }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
 }
 
 async function fetchEmployees(flags) {
@@ -445,7 +475,13 @@ async function cmdEmployees(flags) {
   const people = await fetchEmployees(flags);
   if (!people.length) fail('没找到任何员工(人员字段为空?)');
   say(c.bold(`\n共 ${people.length} 人`));
-  for (const p of people) say(`  ${p.name.padEnd(14)} ${p.open_id}   ${c.dim(p.source)}`);
+  say(c.dim(`  ${padEndWidth('姓名', 16)}${padEndWidth('open_id', 38)}读到的位置`));
+  for (const p of people) {
+    const where = p.sources.length > 1 ? `${p.sources[0]} 等${p.sources.length}处` : p.sources[0];
+    say(`  ${padEndWidth(p.name, 16)}${p.open_id}   ${c.dim(where)}`);
+  }
+  say(c.dim('  第三列是"这份 open_id 从哪张表读到的":飞书不允许跨应用使用 open_id,'));
+  say(c.dim('  所以只能从企业已有表格的人员字段里取,标出来源便于核对。'));
   say('');
 }
 
@@ -467,7 +503,10 @@ async function cmdIssue(flags) {
   const people = await fetchEmployees(flags);
   if (!people.length) fail('没找到员工');
   say(c.bold('\n选择员工(可多选,如 1,3,5)'));
-  people.forEach((p, i) => say(`  ${String(i + 1).padStart(2)}. ${p.name.padEnd(14)} ${c.dim(p.source)}`));
+  people.forEach((p, i) => {
+    const where = p.sources.length > 1 ? `${p.sources[0]} 等${p.sources.length}处` : p.sources[0];
+    say(`  ${String(i + 1).padStart(2)}. ${padEndWidth(p.name, 16)}${c.dim(where)}`);
+  });
   const picks = (await ask('序号')).split(/[,，\s]+/).map((s) => Number(s) - 1).filter((i) => people[i]);
   if (!picks.length) fail('没有选中任何人');
   for (const i of picks) {
@@ -489,7 +528,7 @@ async function cmdKeys(flags) {
   say(c.bold(`\n共 ${keys.length} 把 Key`));
   for (const k of keys) {
     const state = k.enabled ? c.green('启用') : c.dim('已撤销');
-    say(`  ${k.key_id}  ${String(k.member).padEnd(14)} ${String(k.member_id).padEnd(12)} ${state}  ${c.dim(k.created_at ?? '')}`);
+    say(`  ${k.key_id}  ${padEndWidth(k.member, 16)}${padEndWidth(k.member_id, 14)}${state}  ${c.dim(k.created_at ?? '')}`);
   }
   say('');
 }
@@ -557,7 +596,7 @@ async function cmdRevokeMenu(flags) {
   const keys = (await listKeysLocally(env)).filter((k) => k.enabled);
   if (!keys.length) { warn('当前没有启用中的 Key'); return; }
   say(c.bold('\n启用中的 Key:'));
-  keys.forEach((k, i) => say(`  ${String(i + 1).padStart(2)}. ${k.key_id}  ${String(k.member).padEnd(14)} ${c.dim(k.member_id)}`));
+  keys.forEach((k, i) => say(`  ${String(i + 1).padStart(2)}. ${k.key_id}  ${padEndWidth(k.member, 16)}${c.dim(k.member_id)}`));
   const answer = (await ask('要撤销的编号(或直接输入 key_id,留空取消)')).trim();
   if (!answer) { warn('已取消'); return; }
   const keyId = keys[Number(answer) - 1]?.key_id ?? answer;
