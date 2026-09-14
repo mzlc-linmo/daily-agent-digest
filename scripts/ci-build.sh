@@ -52,20 +52,6 @@ if [ -f native/macos/build.sh ]; then
   echo "ui_binary_sha256=$(shasum -a 256 "$native_app/Contents/MacOS/DailyAgentDigest" | awk '{print $1}')"
   plutil -p "$native_app/Contents/Info.plist"
   ditto -c -k --keepParent "$native_app" "dist/Daily-Agent-Digest-$BUILD_ARCH-app.zip"
-
-# DMG:拖拽安装。内容为 App + /Applications 软链;DMG 自身也要签名(公证在 ci-notarize.sh)。
-dmg="dist/Daily-Agent-Digest-$BUILD_ARCH.dmg"
-stage="$RUNNER_TEMP/digest-dmg-stage"
-rm -rf "$stage" "$dmg"; mkdir -p "$stage"
-cp -R "$native_app" "$stage/"
-ln -s /Applications "$stage/Applications"
-hdiutil create -volname "Daily Agent Digest" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
-echo "Built $dmg"
-if [ "$SIGN_RELEASE" = true ]; then
-  codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
-  codesign --verify --verbose=2 "$dmg"
-  echo "DMG signed"
-fi
 fi
 echo 'Running executable smoke tests'
 "$binary" --help

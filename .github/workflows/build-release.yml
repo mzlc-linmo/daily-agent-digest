@@ -87,7 +87,7 @@ jobs:
         run: |
           cp install.sh dist/install.sh
           for app in dist/Daily\ Agent\ Digest\ *.app; do [ -d "$app" ] && (cd dist && zip -qr "$(basename "$app" .app | tr ' ' '-')-app.zip" "$(basename "$app")"); done
-          for archive in dist/Daily-Agent-Digest-*-app.zip dist/Daily-Agent-Digest-*.dmg; do
+          for archive in dist/Daily-Agent-Digest-*-app.zip; do
             audit_dir=$(mktemp -d)
             unzip -q "$archive" -d "$audit_dir"
             app=$(find "$audit_dir" -name DailyAgentDigest -type f | head -1)
@@ -99,7 +99,7 @@ jobs:
             grep -a -q 'DigestUIBuildID' "$info"
           done
           cd dist
-          sha256sum daily-agent-digest-macos-* *.zip *.dmg > SHA256SUMS
+          sha256sum daily-agent-digest-macos-* *.zip > SHA256SUMS
       - name: Publish signed release or unsigned draft
         env:
           GH_TOKEN: ${{ secrets.DISTRIBUTION_REPO_TOKEN }}
@@ -110,7 +110,7 @@ jobs:
         run: |
           set -eu
           if [ "$RELEASE_SIGNED" = true ]; then
-            gh release create "$RELEASE_REF" dist/daily-agent-digest-* dist/Daily-Agent-Digest-*-app.zip dist/Daily-Agent-Digest-*.dmg dist/install.sh dist/SHA256SUMS --target main --title "$RELEASE_REF" --notes 'Developer ID signed and notarized macOS binaries and menu-bar app. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
+            gh release create "$RELEASE_REF" dist/daily-agent-digest-* dist/Daily-Agent-Digest-*-app.zip dist/install.sh dist/SHA256SUMS --target main --title "$RELEASE_REF" --notes 'Developer ID signed and notarized macOS binaries and menu-bar app. Requires macOS 15 or newer and zstd for DeepSeek Harness logs.'
           else
-            gh release create "ci-$BUILD_NUMBER" dist/daily-agent-digest-* dist/Daily-Agent-Digest-*-app.zip dist/Daily-Agent-Digest-*.dmg dist/install.sh dist/SHA256SUMS --draft --prerelease --title "CI verification $BUILD_NUMBER" --notes 'Unsigned build for private verification only. Not a public installable release. Run a version tag after configuring Apple signing secrets to publish.'
+            gh release create "ci-$BUILD_NUMBER" dist/daily-agent-digest-* dist/Daily-Agent-Digest-*-app.zip dist/install.sh dist/SHA256SUMS --draft --prerelease --title "CI verification $BUILD_NUMBER" --notes 'Unsigned build for private verification only. Not a public installable release. Run a version tag after configuring Apple signing secrets to publish.'
           fi
