@@ -348,14 +348,16 @@ def codex(root, start, end):
     stats = new_stats(); out = []; include = keep_process()
     db = root / '.codex/thread_history_1.sqlite'
     if db.exists():
-        con = sqlite3.connect(db)
-        query = 'select thread_id, turn_id, created_at_ms, item_json, item_type from thread_items where created_at_ms >= ? and created_at_ms < ?'
-        for tid, turn, created, raw, typ in con.execute(query, (int(start.timestamp()*1000), int(end.timestamp()*1000))):
-            try: data = json.loads(raw)
-            except json.JSONDecodeError: data = {'text': raw}
-            role, text = extract_codex(typ, data)
-            collect_one(stats, out, 'codex', tid, turn, created, typ, json.dumps(data, ensure_ascii=False)[:MESSAGE_CHAR_MAX], role, text, include)
-        con.close()
+        con = open_sqlite_readonly(db)
+        try:
+            query = 'select thread_id, turn_id, created_at_ms, item_json, item_type from thread_items where created_at_ms >= ? and created_at_ms < ?'
+            for tid, turn, created, raw, typ in con.execute(query, (int(start.timestamp()*1000), int(end.timestamp()*1000))):
+                try: data = json.loads(raw)
+                except json.JSONDecodeError: data = {'text': raw}
+                role, text = extract_codex(typ, data)
+                collect_one(stats, out, 'codex', tid, turn, created, typ, json.dumps(data, ensure_ascii=False)[:MESSAGE_CHAR_MAX], role, text, include)
+        finally:
+            con.close()  # 之前没有 try/finally:中途抛错会泄漏连接
     for f in (root/'.codex/archived_sessions').glob('*.jsonl'):
         read_jsonl(f, 'codex', start, end, stats, out, include)
     return dedupe(out), stats
@@ -396,12 +398,40 @@ def pi(root, start, end):
         read_jsonl(f, 'pi', start, end, stats, out, include)
     return dedupe(out), stats
 
+def open_sqlite_readonly(path):
+    """以只读方式打开 SQLite 库,且在**目录不可写**时也能打开。
+
+    背景:codex 的库是 WAL 模式,即使只读打开,SQLite 也要在同目录建 -shm 文件;
+    目录不可写(只读挂载/容器/沙箱)时会报 "unable to open database file",而引擎本来只需要读。
+    因此先按正常只读打开(保留锁语义),失败再退化为 immutable(不建任何文件、不加锁)。
+    """
+    last = None
+    for uri in (f'file:{path}?mode=ro', f'file:{path}?mode=ro&immutable=1'):
+        con = None
+        try:
+            con = sqlite3.connect(uri, uri=True, timeout=5)
+            # connect() 是惰性的,真正的打开发生在第一次读取 —— 必须在这里触发,
+            # 否则失败会漏到调用方,回退逻辑形同虚设。
+            con.execute('select 1 from sqlite_master limit 1').fetchone()
+            return con
+        except sqlite3.Error as exc:
+            last = exc
+            if con is not None: con.close()
+    raise sqlite3.OperationalError(f'unable to open database file: {path} ({last})')
+
+
 def collect(root, start, end):
     """返回 (events, stats):events 默认只含提示词 / 最终文本 / 交付物。"""
     events = []; stats = {}
     for name, fn in (('codex', codex), ('pi', pi), ('dsh', dsh)):
-        got, st = fn(root, start, end)
-        events.extend(got); stats[name] = st
+        # 逐个隔离:某个采集器损坏(库打不开、schema 不符、时间戳溢出)时,
+        # 只降级这一个来源并把原因写进 coverage,而不是让当天日报整体生成失败。
+        try:
+            got, st = fn(root, start, end)
+            events.extend(got); stats[name] = st
+        except Exception as exc:
+            debug(f'collector {name} failed: {type(exc).__name__}: {exc}')
+            stats[name] = {'error': f'{type(exc).__name__}: {exc}', 'events': 0, 'kept': 0, 'dropped': 0}
     return dedupe(events), stats
 
 def dedupe(rows):
