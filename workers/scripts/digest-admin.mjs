@@ -28,6 +28,7 @@ import {
   bootstrapLocally, d1Adapter, issueLocally, kvAdapter,
   listKeysLocally, logsLocally, revokeLocally,
 } from './local-admin.mjs';
+import { issueReportLines, resolveSubmitUrl } from './issue-report.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TOML_PATH = path.join(ROOT, 'wrangler.toml');
@@ -168,6 +169,13 @@ function setTomlVar(name, value) {
   else if (/^\[vars\]$/m.test(toml)) toml = toml.replace(/^\[vars\]$/m, `[vars]\n${line}`);
   else toml += `\n[vars]\n${line}\n`;
   writeFileSync(TOML_PATH, toml);
+}
+
+/// 成员要填的「提交地址」= 部署时写进 wrangler.toml 的 SUBMIT_URL(可用环境变量覆盖)。
+/// 给的是基地址:引擎自己会拼上 /api/v1/me 与 /api/v1/digests。
+/// 仓库模板里的占位符不算已知地址,会退到环境变量;两者都没有就别编造地址。
+function submitUrl() {
+  return resolveSubmitUrl(tomlVar('SUBMIT_URL'), process.env.DIGEST_SUBMIT_URL);
 }
 
 function kvNamespaceId() {
@@ -480,7 +488,7 @@ async function cmdStatus() {
   ];
   say(c.bold('\n当前配置'));
   for (const [k, v] of rows) say(`  ${k.padEnd(16)} ${v}`);
-  const url = tomlVar('SUBMIT_URL') || process.env.DIGEST_SUBMIT_URL || '';
+  const url = submitUrl();
   if (url) {
     // 用异步执行:同期的 curl 也会阻塞事件循环,把动画冻住
     // 注意:runAsync 返回 code(不是 spawnSync 的 status)—— 这里曾写错,导致恒显示"不可达"
@@ -629,10 +637,14 @@ async function cmdIssue(flags) {
 }
 
 function reportIssue(label, issued) {
-  ok(`「${label}」的 Key(只显示这一次):`);
-  say(`    ${c.bold(issued.key)}`);
-  say(c.dim('    请立即发给本人;丢失在「员工与 Key」里轮换。'));
-  if (issued.superseded?.length) say(c.dim(`    已作废旧 Key:${issued.superseded.join(', ')}(一人一把)`));
+  // 提示行由 issue-report.mjs 生成(纯函数,有单测):Key 只显示一次,
+  // 同时必须给出本人要对接的提交地址,否则对方拿到 Key 也不知道往哪提交。
+  for (const [kind, text] of issueReportLines(label, issued, submitUrl())) {
+    if (kind === 'ok') ok(text);
+    else if (kind === 'warn') warn(text);
+    else if (kind === 'dim') say(c.dim(text));
+    else say(text);
+  }
 }
 
 async function cmdKeys(flags) {
