@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 
 import {
   activeVersionId, bindingsFromVersion, d1DatabaseNames, kvNamespaceTitles, parseBitableInput,
-  pickD1DatabaseId, pickKvNamespaceId,
+  parseWhoamiAccounts, pickD1DatabaseId, pickKvNamespaceId,
 } from '../scripts/recover.mjs';
 
 const KV_ID = '0123456789abcdef0123456789abcdef';
@@ -169,4 +169,25 @@ test('malformed version json yields empty bindings instead of throwing', () => {
   for (const bad of ['', 'null', '{}', 'not json', undefined]) {
     assert.deepEqual(bindingsFromVersion(bad), { vars: {}, kv: {}, d1: {} });
   }
+});
+
+test('whoami output yields the current email and accounts', () => {
+  const sample = ` ⛅️ wrangler 3.114.17
+Getting User settings...
+👋 You are logged in with an OAuth Token, associated with the email cui.nicholas@gmail.com.
+┌──────────────────────────────────────┬──────────────────────────────────┐
+│ Account Name                         │ Account ID                       │
+├──────────────────────────────────────┼──────────────────────────────────┤
+│ Nicholas                             │ 0123456789abcdef0123456789abcdef │
+└──────────────────────────────────────┴──────────────────────────────────┘
+`;
+  const info = parseWhoamiAccounts(sample);
+  assert.equal(info.email, 'cui.nicholas@gmail.com');
+  assert.deepEqual(info.accounts, [{ name: 'Nicholas', id: '0123456789abcdef0123456789abcdef' }]);
+});
+
+test('whoami parsing survives not-logged-in and odd output', () => {
+  assert.deepEqual(parseWhoamiAccounts('You are not authenticated.'), { email: '', accounts: [] });
+  assert.deepEqual(parseWhoamiAccounts(''), { email: '', accounts: [] });
+  assert.deepEqual(parseWhoamiAccounts(undefined), { email: '', accounts: [] });
 });

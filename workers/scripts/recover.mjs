@@ -135,3 +135,23 @@ export function bindingsFromVersion(versionJson) {
   }
   return out;
 }
+
+/// 从 `wrangler whoami` 的输出里取出当前账号(邮箱 + 账号名/ID 列表)。
+///
+/// 恢复配置失败时最需要回答的问题是"我登的是哪个账号" —— 线上明明跑着一个后端,
+/// 而这个账号里什么也没有,基本就是登错了账号。
+export function parseWhoamiAccounts(text) {
+  const raw = String(text ?? '');
+  const email = /associated with the email\s+([^\s.]+(?:\.[^\s.]+)*)/.exec(raw)?.[1] ?? '';
+  const accounts = [];
+  for (const line of raw.split('\n')) {
+    if (!line.includes('│')) continue;
+    const cells = line.split('│').map((c) => c.trim()).filter((c) => c !== '');
+    if (cells.length < 2) continue;
+    const [name, id] = cells;
+    if (/^-+$/.test(name) || /^Account Name$/i.test(name)) continue;
+    if (!id || /^-+$/.test(id)) continue;
+    accounts.push({ name, id });
+  }
+  return { email, accounts };
+}

@@ -30,7 +30,8 @@ import {
 } from './local-admin.mjs';
 import { isPlaceholder, issueReportLines, knownSubmitUrl, parseDeployedUrl, placeholderLabels, resolveSubmitUrl } from './issue-report.mjs';
 import {
-  activeVersionId, bindingsFromVersion, d1DatabaseNames, kvNamespaceTitles, parseBitableInput, pickD1DatabaseId, pickKvNamespaceId,
+  activeVersionId, bindingsFromVersion, d1DatabaseNames, kvNamespaceTitles, parseBitableInput, parseWhoamiAccounts,
+  pickD1DatabaseId, pickKvNamespaceId,
 } from './recover.mjs';
 import { listTables, resolveWikiNode } from '../src/feishu.js';
 
@@ -724,17 +725,35 @@ function setBindingValue(kind, key, value, blockText) {
 ///
 /// 不依赖本机任何历史文件:换机器、换人、本地全空也一样成立 ——
 /// 值就是 Cloudflare 上那个版本自己带着的绑定。
-/// 返回 { vars, kv, d1 } 或 null(没有部署 / 读不到)。
+///
+/// 返回 { ok, bindings?, reason? }。**失败必须带原因**:以前这里把 wrangler 的
+/// 报错直接吞掉,于是"查询失败"被显示成"账号里没有部署",把人引向错误的方向。
 async function readDeployedBindings() {
   const status = await withSpinner('读取 Cloudflare 上的当前部署', () => wrangler(['deployments', 'status', '--json']));
-  if (status.code !== 0) return null;
+  if (status.code !== 0) return { ok: false, reason: firstErrorLine(status) || 'wrangler deployments status 失败' };
   const versionId = activeVersionId(status.out ?? '');
-  if (!versionId) return null;
+  if (!versionId) return { ok: false, reason: '该 Worker 在这个账号下没有可用版本(或名字对不上)' };
   const view = await withSpinner(`读取版本 ${versionId.slice(0, 8)}… 的绑定`, () => wrangler(['versions', 'view', versionId, '--json']));
-  if (view.code !== 0) return null;
+  if (view.code !== 0) return { ok: false, reason: firstErrorLine(view) || 'wrangler versions view 失败' };
   const bindings = bindingsFromVersion(view.out ?? '');
   const total = Object.keys(bindings.vars).length + Object.keys(bindings.kv).length + Object.keys(bindings.d1).length;
-  return total ? { versionId, ...bindings } : null;
+  if (!total) return { ok: false, reason: `版本 ${versionId.slice(0, 8)}… 里没有任何可用绑定` };
+  return { ok: true, versionId, ...bindings };
+}
+
+/// wrangler 失败时的第一行有用信息(跳过空行与 fetch 代理之类的噪音)。
+function firstErrorLine(result) {
+  const text = `${result?.stderr ?? ''}\n${result?.stdout ?? ''}`;
+  const line = text.split('\n').map((l) => l.trim())
+    .find((l) => l && !/^(Proxy environment variables|Getting User settings|⛅️|─+$)/.test(l));
+  return (line ?? '').slice(0, 200);
+}
+
+/// 当前登录的账号信息,用于"是不是登错账号了"这类排查。
+async function currentAccount() {
+  const r = await wrangler(['whoami']);
+  const info = parseWhoamiAccounts(`${r.stdout ?? ''}\n${r.stderr ?? ''}`);
+  return { ...info, ok: r.code === 0 };
 }
 
 /// 恢复到已有部署:把自己能从线上读到的全部读回来;
@@ -747,7 +766,7 @@ async function cmdAdopt(flags) {
 
   // 主路径:从线上版本读回 KV / D1 / 所有明文变量(URL、表 token、表 id、App ID…)
   const deployed = await readDeployedBindings();
-  if (deployed) {
+  if (deployed.ok) {
     const written = [];
     const vars = deployed.vars ?? {};
     for (const name of ['SUBMIT_URL', 'BITABLE_APP_TOKEN', 'BITABLE_TABLE_ID', 'FEISHU_APP_ID', 'BITABLE_TABLE_NAME', 'SCAN_BASES']) {
@@ -761,32 +780,62 @@ async function cmdAdopt(flags) {
     ok(`从线上版本 ${deployed.versionId.slice(0, 8)}… 读回:${written.length ? written.join('、') : '(空)'}`);
     if (!written.length) warn('这个版本里没有可用的明文配置(可能部署时就没写 vars)。');
   } else {
-    warn('Cloudflare 上没有读到已部署的版本:这份后端可能还没部署过。');
-    say(c.dim('    全新安装请直接跑 `install`(或 `deploy`),它们会创建 KV/D1 并把地址写回配置;'));
-    say(c.dim('    `adopt` 是给"线上已经跑着、只是本地配置丢了"的情况用的。'));
+    warn(`没能从线上读回配置:${deployed.reason}`);
+    if (/没有可用版本|名字对不上/.test(deployed.reason)) {
+      say(c.dim(`    核对 wrangler.toml 里的 name(当前:${tomlVar('name') || '空'})是否与 Cloudflare 上那个 Worker 同名,`));
+      say(c.dim('    以及当前登录的是不是部署它的账号(wrangler whoami)。'));
+    }
   }
 
-  // 线上读不到 KV / D1 时,退回到"按名字找",并把账号里现有的名字列出来
+  // 线上读不到 KV / D1 时,退回到"按名字找"。
+  // 关键:必须分清"命令失败"和"账号里确实没有" —— 以前两者都显示成"没有",
+  // 于是登录态/权限问题被误报成"这份部署从未跑过 deploy"。
+  let kvQueryFailed = '';
+  let d1QueryFailed = '';
+  let kvTitles = [];
+  let d1Names = [];
   if (!kvNamespaceId() || !/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw())) {
     const kvOut = await withSpinner('在 Cloudflare 上找 KV 命名空间 KEYS', () => wrangler(['kv', 'namespace', 'list']));
-    const kvId = kvNamespaceId() || flags['kv-id'] || pickKvNamespaceId(kvOut.out ?? '');
+    if (kvOut.code !== 0) kvQueryFailed = firstErrorLine(kvOut) || 'wrangler kv namespace list 失败';
+    else kvTitles = kvNamespaceTitles(kvOut.out ?? '');
+    const kvId = kvNamespaceId() || flags['kv-id'] || (kvQueryFailed ? '' : pickKvNamespaceId(kvOut.out ?? ''));
     if (kvId) setBindingValue('kv_namespaces', 'id', kvId, `[[kv_namespaces]]\nbinding = "KEYS"\nid = "${kvId}"`);
     const d1Out = await withSpinner('在 Cloudflare 上找 D1 数据库', () => wrangler(['d1', 'list', '--json']));
-    const d1Id = (/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? d1DatabaseIdRaw() : '') || flags['d1-id'] || pickD1DatabaseId(d1Out.out ?? '');
+    if (d1Out.code !== 0) d1QueryFailed = firstErrorLine(d1Out) || 'wrangler d1 list 失败';
+    else d1Names = d1DatabaseNames(d1Out.out ?? '');
+    const d1Id = (/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? d1DatabaseIdRaw() : '') || flags['d1-id'] || (d1QueryFailed ? '' : pickD1DatabaseId(d1Out.out ?? ''));
     if (d1Id) setBindingValue('d1_databases', 'database_id', d1Id, `[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${D1_NAME}"\ndatabase_id = "${d1Id}"`);
     if (!kvId) {
-      const kvTitles = kvNamespaceTitles(kvOut.out ?? '');
-      warn(kvTitles.length
+      if (kvQueryFailed) warn(`查询 KV 失败:${kvQueryFailed}`);
+      else warn(kvTitles.length
         ? `账号里没有叫 KEYS 的 KV 命名空间。现有:${kvTitles.join('、')}`
-        : '账号里没有任何 KV 命名空间:可能登错了账号,或这份部署从未跑过 deploy。');
+        : '这个账号里一个 KV 命名空间都没有。');
       say(c.dim('    确认真实 id 后指定:npx wrangler kv namespace list,再 --kv-id <32位id>'));
     }
     if (!d1Id) {
-      const d1Names = d1DatabaseNames(d1Out.out ?? '');
-      warn(d1Names.length
+      if (d1QueryFailed) warn(`查询 D1 失败:${d1QueryFailed}`);
+      else warn(d1Names.length
         ? `账号里没有叫 ${D1_NAME} 的 D1 数据库。现有:${d1Names.join('、')}`
-        : '账号里没有任何 D1 数据库:可能登错了账号,或这份部署从未跑过 deploy。');
+        : '这个账号里一个 D1 数据库都没有。');
       say(c.dim('    确认真实 id 后指定:npx wrangler d1 list,再 --d1-id <uuid>'));
+    }
+    // 三处都空且都不是"查询失败":几乎可以断定登错了账号 —— 这时不该再追问地址,
+    // 先把账号事实摆出来,并让人换账号重来。
+    const nothingHere = !kvQueryFailed && !d1QueryFailed && !kvTitles.length && !d1Names.length
+      && !kvNamespaceId() && !/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw());
+    if (nothingHere) {
+      const acct = await currentAccount();
+      say('');
+      warn('这个账号里既没有部署过的 Worker,也没有任何 KV / D1 —— 大概率不是部署这个后端的账号。');
+      if (acct.email) say(`    当前登录:${acct.email}${acct.accounts.length ? `(账号 ${acct.accounts.map((a) => `${a.name} / ${a.id.slice(0, 8)}…`).join('、')})` : ''}`);
+      say(c.dim('    请换成当时部署用的账号再跑一次:'));
+      say(c.dim('      npx --yes wrangler logout && npx --yes wrangler login'));
+      say(c.dim('    或者用那个账号的 API Token:export CLOUDFLARE_API_TOKEN=…(再跑本命令)'));
+      say(c.dim('    如果你确实知道各项的值,也可以直接指定:'));
+      say(c.dim('      node workers/scripts/digest-admin.mjs adopt --kv-id <32位id> --d1-id <uuid> --submit-url https://… '));
+      if (!flags['kv-id'] && !flags['d1-id'] && !flags['submit-url']) {
+        fail('恢复所需的信息都不在当前账号里:请先换账号,或用上面的参数手动指定。');
+      }
     }
   }
   ok(`KV ${kvNamespaceId() || c.red('未找到')}  ${c.dim(`D1 ${/^[0-9a-f-]{36}$/.test(d1DatabaseIdRaw()) ? d1DatabaseIdRaw() : c.red('未找到')}`)}`);
