@@ -9,7 +9,7 @@ import {
   REPORT_DATE, MAX_BODY_BYTES,
 } from './report.js';
 import * as realFeishu from './feishu.js';
-import { issueKey, listKeys, revokeKey } from './keys.js';
+import { issueKey, listKeys, revokeKey, revokeExistingFor } from './keys.js';
 import { ensureTable, recordIssued, recordRevoked, recordSubmission, REGISTRY, REQUESTS, registryFieldDefs, requestFieldDefs } from './registry.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
@@ -197,6 +197,10 @@ export async function adminIssueKey(request, env, feishu) {
     email: body.email,
     open_id: body.open_id,
   });
+  // 一人一把:同一成员重新签发时,旧 Key 立即失效(排除刚签发的这把,台账同步标记)
+  for (const oldKeyId of await revokeExistingFor(env, issued.open_id, issued.key_id)) {
+    await recordRevoked(env, feishu, { key_id: oldKeyId, revoked_at: new Date().toISOString() });
+  }
   let registry = [];
   try {
     registry = await recordIssued(env, feishu, {

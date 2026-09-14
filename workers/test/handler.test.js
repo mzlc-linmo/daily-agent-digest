@@ -488,6 +488,39 @@ test('定时任务:已签发的行不会被重复签发', async () => {
   assert.equal(env.KEYS.store.size, 1, '不应产生第二把 Key');
 });
 
+test('同一成员重新申请时,旧 Key 立即失效(一人一把)', async () => {
+  const feishu = fakeFeishu();
+  const env = await makeEnv();
+  env.KEYS = fakeKV();
+  const person = [{ id: 'ou_zhaoliu', name: '赵六' }];
+  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{ fields: { 申请人: person } }]);
+  await processRequests(env, feishu);
+  const firstKey = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['Key'];
+  const firstId = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()][0]['KeyID'];
+
+  // 第二次申请(同一个人)
+  await feishu.batchCreate(env, env.REQUEST_TABLE_ID, [{ fields: { 申请人: person } }]);
+  const result = await processRequests(env, feishu);
+  assert.equal(result.issued, 1);
+  const rows = [...feishu.tables.get(env.REQUEST_TABLE_ID).rows.values()];
+  const secondKey = rows[1]['Key'];
+  assert.notEqual(secondKey, firstKey, '应生成新的 Key');
+
+  // 旧 Key 失效
+  const old = await handleRequest(new Request('https://digest.example.com/api/v1/me', {
+    headers: { Authorization: `Bearer ${firstKey}` },
+  }), env, { feishu });
+  assert.equal(old.status, 403, '旧 Key 必须立即失效');
+  const fresh = await handleRequest(new Request('https://digest.example.com/api/v1/me', {
+    headers: { Authorization: `Bearer ${secondKey}` },
+  }), env, { feishu });
+  assert.equal(fresh.status, 200, '新 Key 可用');
+  // 台账:旧的那把被标为已撤销
+  const statuses = [...feishu.tables.get(env.REGISTRY_TABLE_ID).rows.values()].map((r) => r['状态']);
+  assert.ok(statuses.includes('已撤销') && statuses.includes('已启用'), JSON.stringify(statuses));
+  assert.ok(firstId);
+});
+
 test('未知路径返回 404', async () => {
   const res = await handleRequest(new Request('https://digest.example.com/nope'), ENV, { feishu: fakeFeishu() });
   assert.equal(res.status, 404);

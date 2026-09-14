@@ -33,7 +33,7 @@ export const REQUESTS = {
   },
 };
 
-import { issueKey } from './keys.js';
+import { issueKey, revokeExistingFor } from './keys.js';
 
 export const STATUS_ISSUED = '已启用';
 export const STATUS_REVOKED = '已撤销';
@@ -132,6 +132,10 @@ export async function processRequests(env, feishu) {
     const alreadyIssued = Boolean(fields[f.key]) || Boolean(keyId) || status === REQUEST_ISSUED;
     if (alreadyIssued || status === REQUEST_REVOKED || !person?.id) { skipped += 1; continue; }
     const memberId = String(fields[f.account] ?? '').trim() || `u${String(person.id).slice(-6)}`;
+    // 一人一把:作废该成员已有的有效 Key(重复提交不会留下多把永久凭证)
+    for (const oldKeyId of await revokeExistingFor(env, person.id)) {
+      await recordRevoked(env, feishu, { key_id: oldKeyId, revoked_at: new Date().toISOString() });
+    }
     const issuedKey = await issueKey(env, feishu, {
       member_id: memberId,
       member: person.name || memberId,

@@ -73,6 +73,27 @@ export async function issueKey(env, feishu, { member_id, member, email, open_id 
   };
 }
 
+/// 作废某人现有的全部有效 Key,返回被作废的 key_id 列表。
+///
+/// 规则:**一个成员同时只有一把有效 Key**。成员重复提交表单时,新 Key 生效、旧的立即失效
+/// —— 否则每提交一次就多留一把永久有效的凭证。历史记录保留在台账里(状态=已撤销)。
+export async function revokeExistingFor(env, open_id, exceptKeyId = '') {
+  if (!env.KEYS || !open_id) return [];
+  const listed = await env.KEYS.list({ prefix: KEY_PREFIX });
+  const revoked = [];
+  for (const item of listed.keys ?? []) {
+    const keyId = item.name.slice(KEY_PREFIX.length);
+    if (keyId === exceptKeyId) continue;
+    const record = await env.KEYS.get(item.name, 'json');
+    if (!record || record.open_id !== open_id || record.enabled === false) continue;
+    record.enabled = false;
+    record.revoked_at = new Date().toISOString();
+    await env.KEYS.put(item.name, JSON.stringify(record));
+    revoked.push(keyId);
+  }
+  return revoked;
+}
+
 /// 列出所有 Key(绝不返回哈希与明文)。
 export async function listKeys(env) {
   if (!env.KEYS) return [];
