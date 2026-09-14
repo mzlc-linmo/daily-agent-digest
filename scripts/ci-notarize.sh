@@ -13,7 +13,9 @@ cleanup_keychain() {
   rm -f "$RUNNER_TEMP/notarize-certificate.p12"
 }
 trap cleanup_keychain EXIT
-if [ "${SIGN_RELEASE:-false}" = true ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+# 只按 SIGN_RELEASE 判断:缺少签名密钥时下面的必填校验会明确报错退出,
+# 而不是被这个条件悄悄跳过、最后表现成"DMG 没做出来"。
+if [ "${SIGN_RELEASE:-false}" = true ]; then
   echo 'Importing Developer ID certificate for signing'
   for required in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
     if [ -z "${!required:-}" ]; then echo "Missing required signing secret: $required" >&2; exit 1; fi
@@ -85,12 +87,14 @@ fi
 
 # ---- DMG:制作 → 签名 → 公证 → 装订 → 挂载校验 -------------------------------
 # 放在 App 公证之后:DMG 里装的是已经公证并装订过的 App。
-if [ "${SIGN_RELEASE:-false}" = true ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -d "$app_path" ]; then
+if [ "${SIGN_RELEASE:-false}" = true ] && [ -d "$app_path" ]; then
   dmg="dist/Daily-Agent-Digest-$BUILD_ARCH.dmg"
   stage="$RUNNER_TEMP/dmg-stage-$BUILD_ARCH"
   rm -rf "$stage" "$dmg"
   mkdir -p "$stage"
-  cp -R "$app_path" "$stage/"
+  # 用 ditto 而不是 cp -R:它保证扩展属性(装订票据就存在那里)随 bundle 一起复制,
+  # 否则 DMG 里的 App 会丢掉 staple,用户离线打开时仍会被 Gatekeeper 拦。
+  ditto "$app_path" "$stage/$(basename "$app_path")"
   ln -s /Applications "$stage/Applications"
   hdiutil create -volname 'Daily Agent Digest' -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
   echo "Built $(basename "$dmg")"
@@ -115,7 +119,10 @@ if [ "${SIGN_RELEASE:-false}" = true ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ] &
   # 端到端校验:按用户实际接触它的方式验证 —— 挂载、检查内部 App 的签名与装订、确认拖拽入口
   mount_point=$(mktemp -d)
   hdiutil attach "$dmg" -mountpoint "$mount_point" -nobrowse -quiet
-  embedded_app=$(find "$mount_point" -maxdepth 1 -name '*.app' | head -1)
+  embedded_app=''
+  for candidate in "$mount_point"/*.app; do
+    if [ -d "$candidate" ]; then embedded_app="$candidate"; break; fi
+  done
   test -n "$embedded_app"
   codesign --verify --deep --strict "$embedded_app"
   xcrun stapler validate "$embedded_app"
@@ -123,5 +130,10 @@ if [ "${SIGN_RELEASE:-false}" = true ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ] &
   hdiutil detach "$mount_point" -quiet
   echo 'DMG signed, notarized, stapled and verified'
 else
-  echo 'Skipping DMG (unsigned build or no app bundle)'
+  # 静默跳过曾经导致整轮 CI 白跑:签名发布却没做 DMG,必须直接失败而不是继续。
+  if [ "${SIGN_RELEASE:-false}" = true ]; then
+    echo "SIGN_RELEASE=true 但没有可打包的 App 包($app_path),无法制作 DMG" >&2
+    exit 1
+  fi
+  echo 'Skipping DMG (unsigned build)'
 fi
