@@ -43,33 +43,38 @@ def pi_line(role, text, i=0, ts="2026-09-13T10:00:00+08:00"):
 
 
 class StubSubmitService:
-    """本地桩:验证客户端提交链路(请求头、载荷、响应处理)。"""
+    """本地桩:验证客户端上报链路(请求头、载荷、R 包装响应处理)。"""
 
-    def __init__(self, response):
+    def __init__(self, data=None, status=200, raw=None):
+        """data 是服务端 R 包装里 data 的内容;raw 用于返回自定义响应体(如非对象的 JSON)。"""
         import http.server, threading
-        payload = json.dumps(response).encode()
+        if raw is not None:
+            payload = raw.encode() if isinstance(raw, str) else json.dumps(raw).encode()
+        else:
+            ok = status < 400
+            payload = json.dumps({"code": 0 if ok else 1, "msg": None if ok else "服务端拒绝了这次上报",
+                                  "data": data, "ok": ok}).encode()
+        status_code = status
         captured = self.requests = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
-            def _handle(self):
+            def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length)
+                raw_body = self.rfile.read(length)
                 captured.append({
+                    "method": self.command,
                     "path": self.path,
                     "headers": {k.lower(): v for k, v in self.headers.items()},
-                    "body": json.loads(raw or b"{}"),
+                    "body": json.loads(raw_body or b"{}"),
                 })
-                self.send_response(200)
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
-
-            do_GET = _handle
-            do_POST = _handle
 
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
@@ -551,7 +556,7 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
     def test_excluding_after_submit_makes_the_report_pending_again(self):
         # 排除改变了内容,上一次上报就失效了。否则 submit() 会因 report_status=='submitted'
         # 直接早退,服务端永远拿不到更新,界面却仍显示"已上报"。
-        server = StubSubmitService({"mode": "created", "submitted_at": "2026-09-13T18:00:00+08:00"})
+        server = StubSubmitService({"result": "created"})
         try:
             with tempfile.TemporaryDirectory() as d:
                 home = Path(d)
@@ -571,7 +576,7 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
     def test_non_object_submit_response_is_recorded_as_failure(self):
         # 服务端返回合法 JSON 但不是对象时,以前会在 body.get 上抛 AttributeError,
         # submit_status 完全没落盘,界面无法区分"未提交"和"提交失败"。
-        server = StubSubmitService(["not", "an", "object"])
+        server = StubSubmitService(raw=["not", "an", "object"])
         try:
             with tempfile.TemporaryDirectory() as d:
                 home = Path(d)
@@ -605,8 +610,8 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
         self.assertNotEqual(result["report_status"], "submitted")
         self.assertNotIn("secret-value", json.dumps(stored), "状态里绝不能出现密钥内容")
 
-    def test_a_successful_submission_marks_submitted_with_the_returned_mode(self):
-        server = StubSubmitService({"mode": "created", "submitted_at": "2026-09-13T18:00:00+08:00"})
+    def test_a_successful_submission_marks_submitted_with_the_returned_result(self):
+        server = StubSubmitService({"result": "created", "username": "hudan", "date": "2026-09-16"})
         try:
             with tempfile.TemporaryDirectory() as d:
                 self.seed(d)
@@ -618,24 +623,135 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
         self.assertEqual(result["report_status"], "submitted")
         self.assertEqual(result["submit_status"], "submitted")
         self.assertEqual(result["submit_mode"], "created")
-        self.assertEqual(request["headers"]["authorization"], "Bearer dag_k1_secret")
+        # 上报地址由「基地址 + 固定路径」拼成:密钥的授权URL 按整条地址登记,拼错就是 403
+        self.assertEqual(request["path"], engine.REPORT_PATH)
+        self.assertEqual(request["method"], "POST")
+        # 使用人取自密钥,所以带密钥头即可,不发送任何身份字段
+        self.assertEqual(request["headers"]["x-api-key"], "dag_k1_secret")
+        self.assertNotIn("authorization", request["headers"])
+        self.assertNotIn("username", request["body"])
         # Cloudflare 会拦 Python-urllib 的默认 UA(1010),必须带自己的标识
         self.assertEqual(request["headers"]["user-agent"], engine.USER_AGENT)
         self.assertIn("DailyAgentDigest/", request["headers"]["user-agent"])
-        self.assertTrue(request["headers"]["idempotency-key"])
         self.assertEqual(request["body"]["work_items"][0]["title"], "采集器重构")
         self.assertEqual(request["body"]["release_version"], engine.RELEASE_VERSION)
 
-    def test_check_submit_validates_the_key_against_the_service(self):
-        server = StubSubmitService({"member": "张三", "member_id": "zhangsan"})
+    def test_the_submit_address_accepts_both_a_base_url_and_the_full_endpoint(self):
+        # 设置里两种写法都会有人填:密钥的授权URL 就是按完整接口地址登记的,从管理页面
+        # 复制过来自然带路径。当成基地址再拼一遍会变成 .../report/admin/.../report,
+        # 服务端只回 403「密钥未授权」,用户完全看不出是路径拼了两遍。
+        cases = {
+            "http://192.168.110.164/api": "http://192.168.110.164/api" + engine.REPORT_PATH,
+            "http://192.168.110.164/api/": "http://192.168.110.164/api" + engine.REPORT_PATH,
+            "http://192.168.110.164/api" + engine.REPORT_PATH:
+                "http://192.168.110.164/api" + engine.REPORT_PATH,
+            "http://192.168.110.164/api" + engine.REPORT_PATH + "/":
+                "http://192.168.110.164/api" + engine.REPORT_PATH,
+            "http://192.168.110.164:9999": "http://192.168.110.164:9999" + engine.REPORT_PATH,
+        }
+        for configured, expected in cases.items():
+            self.assertEqual(engine.report_url(configured), expected, f"配置值:{configured}")
+
+    def test_the_full_endpoint_address_uploads_without_doubling_the_path(self):
+        server = StubSubmitService({"result": "created", "username": "hudan", "date": today()})
         try:
             with tempfile.TemporaryDirectory() as d:
-                home = Path(d)
-                result = command(home, "check-submit", {},
+                self.seed(d)
+                command(Path(d), "submit", {"date": today()},
+                        extra_env={"DIGEST_SUBMIT_URL": server.url + engine.REPORT_PATH,
+                                   "DIGEST_API_KEY": "dag_k1_secret"})
+            request = server.requests[0]
+        finally:
+            server.stop()
+        self.assertEqual(request["path"], engine.REPORT_PATH)
+
+    def test_a_rejected_report_reports_the_address_it_actually_called(self):
+        # 服务端的授权URL 文案只说"这个密钥没授权本接口",不给实际请求地址就分不清
+        # 是密钥配错还是地址拼错。
+        server = StubSubmitService(status=403, raw=json.dumps(
+            {"code": 403, "msg": "该 API 密钥未授权访问本接口", "data": None, "ok": False}))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.seed(d)
+                result = command(Path(d), "submit", {"date": today()},
                                  extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
         finally:
             server.stop()
-        self.assertEqual(result["member"], "张三")
+        self.assertIn(server.url + engine.REPORT_PATH, result["submit_error"])
+
+    def test_a_rejected_report_is_not_marked_submitted_and_keeps_the_server_reason(self):
+        # 服务端 4xx 时把 R 包装里的 msg 显示出来,只说"HTTP 403"用户无法自救。
+        server = StubSubmitService(status=403, raw=json.dumps(
+            {"code": 403, "msg": "该 API 密钥未授权访问本接口", "data": None, "ok": False}))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.seed(d)
+                result = command(Path(d), "submit", {"date": today()},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+        finally:
+            server.stop()
+        self.assertNotEqual(result["report_status"], "submitted")
+        self.assertEqual(result["submit_status"], "failed")
+        self.assertIn("HTTP 403", result["submit_error"])
+        self.assertIn("未授权访问本接口", result["submit_error"])
+
+    def test_check_submit_validates_the_key_by_uploading_todays_report(self):
+        # 「测试连接」没有独立的校验接口可用(密钥授权URL 只放行上报路径),所以它真发一次
+        # 上报,用服务端回的使用人证明"地址对了、Key 有效、认到的是谁"。
+        server = StubSubmitService({"result": "updated", "username": "hudan", "date": today()})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                self.seed(home)
+                result = command(home, "check-submit", {},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+            request = server.requests[0]
+        finally:
+            server.stop()
+        self.assertEqual(result["member"], "hudan")
+        self.assertEqual(result["mode"], "updated")
+        self.assertEqual(result["item_count"], 1)
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["path"], engine.REPORT_PATH)
+        self.assertEqual(request["headers"]["x-api-key"], "dag_k1_secret")
+
+    def test_check_submit_refuses_to_probe_when_today_was_already_uploaded(self):
+        # 未归并时试传发的是空 work_items 探针,直接发会把服务端已有的日报覆盖成空内容。
+        server = StubSubmitService({"result": "created", "username": "hudan", "date": today()})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                state = {"schema_version": "1.2", "date": today(), "report_status": "generating",
+                         "work_items": [], "report_chars": 0, "submit_status": "submitted", "submit_error": None}
+                (home / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', 'check-submit'],
+                                   input="{}", text=True, capture_output=True, check=False,
+                                   env={**os.environ, "DIGEST_HOME": str(home), "DIGEST_SUBMIT_URL": server.url,
+                                        "DIGEST_API_KEY": "dag_k1_secret"})
+            sent = list(server.requests)
+        finally:
+            server.stop()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("已经成功上报过日报", p.stdout)
+        self.assertEqual(sent, [], "拒绝试传时不得发出任何请求")
+
+    def test_check_submit_probes_with_empty_items_before_the_report_is_ready(self):
+        # 还没归并时也要能验证配置:发空 work_items(服务端允许),不会丢任何真实内容。
+        server = StubSubmitService({"result": "created", "username": "hudan", "date": today()})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                state = {"schema_version": "1.2", "date": today(), "report_status": "generating",
+                         "work_items": [], "report_chars": 0, "submit_status": None, "submit_error": None}
+                (home / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                result = command(home, "check-submit", {},
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+            sent = server.requests[0]
+        finally:
+            server.stop()
+        self.assertEqual(result["member"], "hudan")
+        self.assertEqual(result["item_count"], 0)
+        self.assertEqual(sent["body"]["work_items"], [])
 
     def test_check_submit_without_configuration_reports_an_error(self):
         saved = {k: os.environ.pop(k, None) for k in ("DIGEST_SUBMIT_URL", "DIGEST_API_KEY")}

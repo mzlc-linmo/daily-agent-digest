@@ -8,6 +8,11 @@ RELEASE_VERSION = os.getenv('DIGEST_RELEASE_VERSION', 'dev')
 # 服务端/CDN 可能拦截 Python-urllib 的默认 UA(例如 Cloudflare 的 1010),所以带自己的标识。
 USER_AGENT = f'DailyAgentDigest/{RELEASE_VERSION}'
 
+# 工作日志管理模块(企业管理 → 工作日志管理)的日报上报接口,契约见 docs/backend-api.md。
+# 设置里填的是**基地址**(如 http://192.168.110.164/api),这个路径由客户端拼上去 ——
+# 密钥的「授权URL」按整条地址登记,所以拼接结果必须与服务端登记的完全一致。
+REPORT_PATH = '/admin/enterprise/worklog/api/report'
+
 # Report contract (docs/requirements.md FR-3.11). The whole report is
 # 工作总结 + every work-item title, counted in characters with whitespace
 # removed, capped at REPORT_CHAR_LIMIT. The report is a list of independent
@@ -566,7 +571,7 @@ def generate(day=None, source_root=None):
 def app_command(command, data):
     load_env(); day=data.get('date') or dt.datetime.now(TZ).date().isoformat()
     if command == 'settings': return settings()
-    if command == 'check-submit': return check_submit(data)
+    if command == 'check-submit': return check_submit(data, day)
     if command == 'save-settings': return save_settings(data)
     if command == 'clear':
         state=app_state(day); state.update({'schema_version':'1.2','release_version':RELEASE_VERSION,'work_items': [], 'report_chars': 0, 'included_count': 0, 'excluded_count': 0, 'submit_status': None, 'submit_error': None, 'generated_at': None, 'report_status': 'generating', 'last_error': None}); write_state(state); return state
@@ -595,13 +600,79 @@ def app_command(command, data):
     if command=='submit': return submit(day)
     raise ValueError('unknown app command')
 
+def report_payload(state, day, included):
+    """组装上报报文:字段与工作日志管理模块的 WorkLogReportDTO 一一对应。
+
+    date 只作留痕 —— 服务端按自己的当天决定这份日报归属哪一天,所以补传历史也不会散成多天。
+    """
+    items=[{'title':x.get('title',''),'desc':x.get('desc',''),'status':x.get('status','completed'),
+            'source_task_ids':x.get('source_task_ids',[])} for x in included]
+    return {'date':day,'generated_at':state.get('generated_at'),'release_version':RELEASE_VERSION,
+            'report_chars':state.get('report_chars',0) if included else 0,
+            'coverage_note':state.get('coverage_note') or '','work_items':items}
+
+def server_message(raw):
+    """把服务端的失败响应压成一句可读原因:Pig 的 R 包装把原因放在 msg 里。"""
+    text=raw.decode('utf-8','replace') if isinstance(raw,bytes) else str(raw)
+    try:
+        body=json.loads(text)
+        if isinstance(body,dict) and body.get('msg'): return str(body['msg'])
+    except ValueError: pass
+    return text[:300]
+
+def report_url(target):
+    """把设置里的提交地址补成完整的上报地址。
+
+    **两种写法都接受**,因为两种都会有人填 —— 密钥的「授权URL」通常就是按完整接口地址
+    登记的,从「API密钥管理」页面上复制过来的自然带着路径:
+
+      基地址        http://host/api                          -> 补上 REPORT_PATH
+      完整接口地址   http://host/api/admin/.../api/report       -> 原样使用
+
+    不做这层兼容的话,完整地址会被拼成 `.../report/admin/.../report`,服务端只会回一句
+    403「该 API 密钥未授权访问本接口」—— 看着像密钥问题,其实是路径拼了两遍。
+    """
+    url=(target or '').strip().rstrip('/')
+    return url if url.endswith(REPORT_PATH) else url+REPORT_PATH
+
+def post_report(target, key, payload):
+    """上报一次日报,返回服务端 R 包装里的 data。
+
+    成功判定与服务端一致:HTTP 2xx + code==0 + data.result ∈ created/updated/unchanged。
+    任何一条不满足都抛 ValueError —— 调用方据此把状态留在"未提交",绝不显示成已上报。
+    「上传」与设置里的「测试连接」共用这里,避免各写一份请求与错误处理。
+    """
+    url=report_url(target)
+    req=urllib.request.Request(url, data=json.dumps(payload,ensure_ascii=False).encode(),
+        headers={'Content-Type':'application/json','X-API-Key':key,'User-Agent':USER_AGENT}, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
+            body=json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx 的正文才是"为什么被拒"(缺少密钥/应用编码不对/授权URL不匹配/报文不合法),
+        # 只报状态码用户无法自救。
+        # 还要带上**实际请求的地址**:服务端的授权URL 文案只说"这个密钥没授权本接口",
+        # 分不清是密钥配错还是地址拼错(例如把完整接口地址又当基地址拼了一遍)。
+        raise ValueError(f'HTTP {exc.code}: {server_message(exc.read())}（客户端实际请求:{url}）')
+    except Exception as exc:
+        debug(f'report error: {type(exc).__name__}: {exc}')
+        raise ValueError(f'{type(exc).__name__}: {exc}（客户端实际请求:{url}）')
+    # 合法 JSON 但不是对象(数组/字符串)时,后面的 .get 会抛 AttributeError,
+    # 那样调用方区分不出"未提交"和"提交失败"。
+    if not isinstance(body,dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
+    if body.get('code'): raise ValueError(f'提交服务返回失败:{server_message(json.dumps(body,ensure_ascii=False))}')
+    data=body.get('data')
+    if not isinstance(data,dict) or data.get('result') not in ('created','updated','unchanged'):
+        raise ValueError(f'提交服务返回了无法识别的结果:{str(body)[:200]}')
+    return data
+
 def submit(day):
-    """把当天的日报提交到提交服务(地址与 Key 由设置界面配置)。
+    """把当天的日报上报到工作日志管理模块(地址与 Key 由设置界面配置)。
 
-    服务端实现不在本仓库:只要它提供 POST /api/v1/digests 并能按「成员 + 日期」覆盖即可。
-    (此前的 Cloudflare Worker + 飞书方案已废弃并删除。)
+    服务端按「使用人 + 服务器当天」覆盖:同一天重复上报只留最新一条(不会多出一行),
+    报文完全一致时回 unchanged 且不写库。使用人取自密钥,客户端**不发**任何身份字段。
 
-    未配置提交地址/Key,或服务端返回非 2xx 时**绝不**把状态置为 submitted:
+    未配置提交地址/Key,或服务端返回非 2xx / 无法识别的结果时**绝不**把状态置为 submitted:
     那会让界面以为日报已经送达。改为持久化 submit_status / submit_error,便于重试与排查。
     """
     state=app_state(day)
@@ -622,35 +693,15 @@ def submit(day):
         state['last_error']=state['submit_error']
         write_state(state); return state
 
-    items=[{'title':x.get('title',''),'desc':x.get('desc',''),'status':x.get('status','completed'),
-            'source_task_ids':x.get('source_task_ids',[])} for x in included]
-    payload={'date':day,'generated_at':state.get('generated_at'),'release_version':RELEASE_VERSION,
-             'report_chars':state.get('report_chars',0),'coverage_note':state.get('coverage_note') or '',
-             'work_items':items}
-    fingerprint=hashlib.sha256(json.dumps([[i['title'],i['desc'],i['status']] for i in items],ensure_ascii=False).encode()).hexdigest()
-    url=target.rstrip('/')+'/api/v1/digests'
-    req=urllib.request.Request(url, data=json.dumps(payload,ensure_ascii=False).encode(),
-        headers={'Content-Type':'application/json','Authorization':'Bearer '+key,
-                 'User-Agent':USER_AGENT,'Idempotency-Key':f'{day}:{fingerprint}'}, method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
-            body=json.loads(r.read() or b'{}')
-        # 合法 JSON 但不是对象(数组/字符串)时,后面的 body.get 会抛 AttributeError,
-        # 那样 submit_status/submit_error 完全没落盘,界面无法区分"未提交"和"提交失败"。
-        if not isinstance(body, dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
-    except urllib.error.HTTPError as exc:
-        detail=exc.read().decode('utf-8','replace')[:300]
-        return fail_submit(state, day, f'HTTP {exc.code}: {detail}')
-    except Exception as exc:
-        debug(f'submit error: {type(exc).__name__}: {exc}')
-        return fail_submit(state, day, f'{type(exc).__name__}: {exc}')
-    mode=body.get('mode')
-    if mode not in ('created','updated','unchanged'):
-        return fail_submit(state, day, f'提交服务返回了无法识别的结果:{str(body)[:200]}')
+        result=post_report(target, key, report_payload(state, day, included))
+    except ValueError as exc:
+        return fail_submit(state, day, str(exc))
     state['report_status']='submitted'; state['submitted_count']=len(included)
     state['submit_status']='submitted'; state['submit_error']=None; state['last_error']=None
-    state['submitted_at']=body.get('submitted_at') or dt.datetime.now(TZ).isoformat()
-    state['submit_mode']=mode
+    # 服务端不返回 submitted_at(时间以服务端的 last_report_time 为准),缺省用本机时间填充。
+    state['submitted_at']=result.get('submitted_at') or dt.datetime.now(TZ).isoformat()
+    state['submit_mode']=result.get('result')
     write_state(state); return state
 
 def fail_submit(state, day, message):
@@ -658,34 +709,31 @@ def fail_submit(state, day, message):
     state['submit_status']='failed'; state['submit_error']=message; state['last_error']=message
     write_state(state); return state
 
-def check_submit(data=None):
-    """调 GET /api/v1/me 校验地址与 Key,供设置界面"测试连接"并回填成员名。
+def check_submit(data=None, day=None):
+    """设置里的「测试连接」:用**上报接口本身**真发一次,验证地址与 Key。
+
+    原实现调 GET {地址}/api/v1/me 取成员名,但工作日志管理模块没有这个接口,而且密钥的
+    授权URL 一旦配置就只放行它登记的地址 —— 别的路径一律 403。所以改用上报接口验证:
+    服务端回的 username 由密钥解析而来,正好回答"地址对不对、Key 有没有效、认到的是谁"。
+
+    **这是真上报**(同人同日覆盖,不会多出一行):内容取当天已归并的日报;当天还没归并时
+    发一条空 work_items 的探针(服务端允许空数组,表示"当天没有计入的内容"),但当天已经
+    成功上报过就拒绝试传 —— 空内容会把服务端已有的那份日报覆盖掉。
 
     传入 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
     """
-    load_env(); data=data or {}
+    load_env(); data=data or {}; day=day or dt.datetime.now(TZ).date().isoformat()
     target=(data.get('submit_url') or os.getenv('DIGEST_SUBMIT_URL') or '').strip()
     key=(data.get('submit_api_key') or os.getenv('DIGEST_API_KEY') or '').strip()
     if not target or not key: raise ValueError('未配置提交地址或 API Key')
-    req=urllib.request.Request(target.rstrip('/')+'/api/v1/me',
-        headers={'Authorization':'Bearer '+key,'User-Agent':USER_AGENT}, method='GET')
-    try:
-        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
-            body=json.loads(r.read() or b'{}')
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode('utf-8', 'replace')
-        code = ''
-        try: code = (json.loads(raw).get('error') or {}).get('code', '')
-        except (ValueError, AttributeError): pass
-        # 把服务端的错误码翻成"下一步该做什么":只说"403"用户无法自救。
-        hint = {
-            'key_revoked': '该 Key 已被撤销(重新签发或轮换后旧 Key 会立即失效)。请在管理台「员工与 Key」里重新签发,并把新 Key 填到上面的输入框。',
-            'invalid_key': '该 Key 不存在或格式不对。请检查是否复制完整,或到管理台重新签发。',
-        }.get(code, '')
-        raise ValueError(f'HTTP {exc.code}: {raw[:200]}' + (f'\n\n{hint}' if hint else ''))
-    except Exception as exc:
-        raise ValueError(f'{type(exc).__name__}: {exc}')
-    return {'member':body.get('member',''),'member_id':body.get('member_id','')}
+    state=app_state(day)
+    ready=state.get('report_status')=='ready'
+    if not ready and state.get('submit_status') in ('submitted','stale'):
+        raise ValueError('今天已经成功上报过日报,试传会用空内容覆盖它。请先生成今天的日报,或直接用「上传」。')
+    included=[x for x in state.get('work_items',[]) if not x.get('excluded')] if ready else []
+    result=post_report(target, key, report_payload(state, day, included))
+    return {'member':result.get('username',''),'date':result.get('date',''),
+            'mode':result.get('result',''),'item_count':len(included)}
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); ap.add_argument('--app-command'); args=ap.parse_args()

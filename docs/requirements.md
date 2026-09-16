@@ -35,18 +35,22 @@
 
 > ### ⚠️ 路线变更(最新)
 >
-> **自建提交服务(Cloudflare Worker + 飞书多维表格)已被放弃,相关代码与文档已从仓库删除。**
+> **提交服务已确定:linmo-pig-full 的「工作日志管理」模块(企业管理 → 工作日志管理)。**
+> 更早的 Cloudflare Worker + 飞书多维表格方案已放弃,相关代码与文档已从仓库删除。
 >
-> - 客户端**保留**提交能力:设置里的「提交地址 + 提交 API Key」、「测试连接」与「上传」按钮都在,
->   协议不变(`GET /api/v1/me`、`POST /api/v1/digests`,见 README「Submission」一节),
->   将来接入新的服务端即可直接使用;未配置地址时状态为 `submit_status=not_configured`,不会假装已上报。
+> - 客户端设置里的「提交地址 + 提交 API Key」、「测试连接」与「上传」按钮都在,已按该模块的
+>   接口对齐:`POST {基地址}/admin/enterprise/worklog/api/report` + `X-API-Key`,
+>   响应取 Pig `R` 包装里的 `data.result`(见 README「Submission」与 `docs/backend-api.md`)。
+> - **身份与归属日都由服务端决定**:使用人取自密钥(客户端不发任何身份字段),
+>   归属日取服务端当天(客户端发的 `date` 只作留痕)。
+> - 「测试连接」改为**用上报接口试传一次** —— 该模块没有独立的校验接口,且密钥的授权URL
+>   只放行上报路径。试传受覆盖保护约束,详见 `docs/backend-api.md` §5。
+> - 未配置地址时状态为 `submit_status=not_configured`,不会假装已上报。
 > - 客户端**新增**「Markdown」按钮:把当日日报导出为 Markdown 文档,可复制/保存,用于人工交付。
 > - 已删除:`workers/`(Worker、KV/D1、密钥签发 CLI、审计日志、部署与恢复工具)、
 >   `docs/backend-design.md`、`docs/feishu-login-research.md`。
 > - 下文 FR-7 / §6.3 / A30 / D-10 等条目记录的是**废弃前**的方案,保留作历史依据,
 >   其中「飞书群 webhook」「飞书多维表格」两种通道均已不再实现。
->
-> 新的服务端方案待设计,不在本期范围。
 
 - **定位**:本地优先(Local-first)的 AI Agent 每日工作日报工具,面向 **3–10 人、全部 macOS、各自本地运行** 的内部团队。每人本地采集 → 一次 LLM 主题归并 → 本地复核 → 导出 Markdown(服务端上报待重新设计)。
 - **形态**(事实):命令行引擎(Python 3.10+,PyInstaller 构建)+ macOS 菜单栏托盘应用(AppKit/Swift)+ `launchd` 定时调度。发布页上的独立引擎是单文件二进制;App 包内则装 onedir 目录版——单文件每次调用都要解包再重新 exec(实测单次启动 3-6 秒),而 App 的每个菜单动作都会新起一个引擎进程,onedir 稳态约 0.07 秒。
@@ -80,7 +84,7 @@
 | 工作项(work item) | LLM 归并出的工作主题,含 `id/title/details/status/source_task_ids/excluded` |
 | 报告(report) | 某一天的结构化结果,含 `summary` + `work_items`,落盘为 `YYYY-MM-DD.json` 与 `state.json` |
 | 上报(submit) | 把未排除的工作项投递到团队飞书群(`:194-203`,本期改为飞书适配) |
-| 成员身份(member) | 上报载荷中的提交人标识(姓名或工号),本期新增 |
+| 成员身份(member) | 上报人。**由服务端从 API 密钥解析**,客户端不在载荷里发送姓名/工号 |
 | 引擎(engine) | `daily_agent_digest.py` 及其打包后的 `daily-agent-digest` |
 | 应用(app) | macOS 托盘控制器 `Daily Agent Digest *.app` |
 | DIGEST_HOME | 应用数据目录,默认 `~/Library/Application Support/Daily Agent Digest`(`:6`) |
@@ -175,8 +179,8 @@
 #### FR-7 上报到飞书群(P0,本期重点)
 
 - FR-7.1 **通道(已废弃)**:曾实现「App 用提交地址 + API Key 向自建 Cloudflare Worker 提交,由服务端写入飞书多维表格」。该后端与其文档已从仓库删除;客户端提交接口保留,服务端待重做。
-- FR-7.11 客户端凭据只填一次:提交地址与 API Key 存于 `APP_DIR/.env`(权限 `0600`),`settings` 只返回 `submit_url` 与 `submit_api_key_set`,**绝不回显密钥**;设置面板提供「测试连接」,经 `GET /api/v1/me` 校验并回填服务端成员名。
-- FR-7.12 提交幂等:服务端按「已认证成员 + 日期」覆盖既有行,内容指纹相同则幂等返回且不写表;客户端发送 `Idempotency-Key: <date>:<content_sha256>` 仅作追踪。
+- FR-7.11 客户端凭据只填一次:提交地址与 API Key 存于 `APP_DIR/.env`(权限 `0600`),`settings` 只返回 `submit_url` 与 `submit_api_key_set`,**绝不回显密钥**;设置面板提供「测试连接」,经**上报接口试传一次**校验地址与 Key,并回填服务端解析出的使用人(该模块没有独立的校验接口,见 `docs/backend-api.md` §5)。
+- FR-7.12 提交幂等:服务端按「密钥解析出的使用人 + 服务端当天」覆盖既有行,报文与上次完全一致时返回 `unchanged` 且不写库;客户端不发送 `Idempotency-Key`(该服务端按报文内容自行计算哈希去重)。
 - FR-7.1a(历史,**已废弃**):飞书自定义机器人(群 webhook)方案。该方案与后来的「自建 Cloudflare Worker + 飞书多维表格」方案均已不再实现,保留作历史依据。
 - FR-7.2 **未配置 webhook 时不得标记为已上报**(已实现):`submit` 保持 `report_status: ready`,写入 `submit_status: not_configured` 与 `submit_error` 说明;日报字数与内容不受影响,配置通道后可重试。
 - FR-7.3 **响应码校验**:飞书在业务失败时可能返回 HTTP 200 且响应体 `code != 0`,必须解析响应体并校验 `code == 0` 才算成功。
@@ -383,7 +387,7 @@ Content-Type: application/json
 - **A20** 日报形态与字数:任意输入下 `report_chars` ≤1000 且等于**未排除项**的 `title + desc` 之和;3 项时每项正文可写满 100–300 字;20 项时全部保留且总量仍 ≤1000。
 - **A21** 报告窗口中工作总结按「标题 + 内容」渲染全部未排除项并**完整可见**(按内容自适应高度),工作主题索引只显示标题,正文不重复出现。
 - **A27** 上下文选材:进入上下文的只有提示词/最终文本/交付物;任一来源都不会被另一个来源挤空;实际上下文 ≤ 预算;`coverage_note` 记录入库/送模型/省略各来源的条数并在界面显示。
-- **A30** 提交服务:未配置地址或 Key 时 `submit_status=not_configured`;服务端返回非 2xx 时 `submit_status=failed` 且 `report_status` 保持 `ready`;成功时 `report_status=submitted` 并记录 `submit_mode`;状态文件中不得出现密钥内容;`check-submit` 能返回服务端成员名(7 项客户端测试 + 12 项 worker 测试覆盖)。
+- **A30** 提交服务:未配置地址或 Key 时 `submit_status=not_configured`;服务端返回非 2xx 或 `code != 0` 时 `submit_status=failed` 且 `report_status` 保持 `ready`;成功时 `report_status=submitted` 并记录 `submit_mode`(取自 `data.result`);状态文件中不得出现密钥内容;`check-submit` 用上报接口试传并返回服务端解析出的使用人,当天已成功上报且未归并时拒绝试传(9 项客户端测试覆盖)。
 - **A29** 版本可追溯:「关于」显示的引擎版本来自引擎实时应答;`--check-version` 无头模式可验证三种判定(开发构建 / 有新版 / 已最新),退出码同时反映是否检查成功。
 - **A28** 抽取正确性:三个来源的提示词与最终文本都能取到且**忽略 reasoning/thinking/tool-call**;过程记录默认不入库;带 `reasoning`/`tool-call` 分片的记录只取 `text` 分片;提到 `automation_u` 等词的提示词与最终文本**必须保留**(旧子串规则会误删);超过 4000 字符的记录先抽取再截断(8 项回归测试)。
 - **A22** `--mode=verbose` 注入超长总结与超长标题时,引擎仍裁剪到 ≤1000 字、标题 ≤30 字,且工作项数量不变。
@@ -514,7 +518,7 @@ syspolicy_check distribution daily-agent-digest-macos-arm64
 | Q20 | 提交服务部署 | **云函数 / Serverless** | 无数据库:以表内 `提交ID` 检索实现幂等与覆盖;token 用模块级缓存 |
 | Q21 | 同日重新提交 | **覆盖旧行** | `batch_update` + 多余行 `batch_delete`;内容相同则幂等不写 |
 | Q22 | 多维表格结构 | **一行一个工作项** | 可直接按人/日期/状态/来源筛选与聚合 |
-| Q23 | 客户端配置 | **只需 API 地址 + API Key** | 移除 `DIGEST_FEISHU_WEBHOOK`;姓名由 `GET /api/v1/me` 回填 |
+| Q23 | 客户端配置 | **只需基地址 + API Key** | 移除 `DIGEST_FEISHU_WEBHOOK`;使用人由服务端从密钥解析,客户端不再配置/上报姓名 |
 | Q18 | 飞书登录(暂缓) | **调研完成,待定**:可行但非必要,详见 `docs/feishu-login-research.md`;需先明确是"身份标注"还是"发送者必须是本人" | 若选"发送者本人",需放弃群自定义机器人通道,改用自建应用 + `im:message.send_as_user`,并先验证 loopback 回调可否登记 |
 | Q17 | 「工作总结」的结构 | **每一项一个标题+内容,LLM 直接产出 `{title, desc}` JSON;排除 = 删除数组元素** | 取消自由叙述与 `summary` 字段;排除不再需要 LLM(见 D-24) |
 | Q16 | 「工作总结」显示什么 | **把摘要扩展成完整总结(报告主体),工作项只保留标题、不要正文** | 摘要预算从 150 字放开到 600–900 字;`work_items` 不再有 `details`;界面改为总结区自适应高度 + 标题列表 |

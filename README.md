@@ -24,9 +24,9 @@ work, and export the rest.
   item is a plain array filter — instant, no extra LLM call, fully reversible.
 - **Exports the report as Markdown.** One button in the report window opens the day's report
   as a Markdown document you can copy or save, ready to paste into a wiki, a ticket or a chat.
-- **Can submit to a server (server side not built yet).** The client keeps a working submit
-  path — an address plus a key, `POST /api/v1/digests` — but this repository no longer ships
-  a backend. See [Submission](#submission-server-side-pending).
+- **Submits to the 工作日志管理 module.** The client keeps a working submit path — an address
+  plus an API key, `POST /admin/enterprise/worklog/api/report` — against the Work Log module of
+  the `linmo-pig-full` server. See [Submission](#submission).
 
 ## Requirements
 
@@ -67,6 +67,30 @@ engine and the tray app under `~/Library/Application Support/Daily Agent Digest`
 registers a `launchd` job that runs the digest daily at 18:00. It prompts once for
 `LLM_API_KEY` (input hidden, file mode `600`); re-running it preserves your existing
 configuration.
+
+### Option 3: build a local DMG without an Apple certificate
+
+```bash
+scripts/build-dmg.sh                  # tests → engine → app → ad-hoc sign → DMG
+scripts/build-dmg.sh --skip-tests     # faster rebuild
+DIGEST_RELEASE_VERSION=v0.6.9 scripts/build-dmg.sh
+```
+
+It creates `.build/venv` with PyInstaller pinned to the CI version (your system Python is
+untouched), bundles the onedir engine into the app, ad-hoc signs every Mach-O, and writes
+`dist/Daily-Agent-Digest-<version>-<arch>.dmg`. Before packing it asserts the app resolves the
+**bundled** engine and that the engine really executes; afterwards it mounts the image and
+re-checks the app, its signature and the drag-to-Applications shortcut.
+
+The result is **not notarized**, so Gatekeeper rejects it on other machines until the
+quarantine flag is cleared:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Daily Agent Digest.app"
+```
+
+`DIGEST_RELEASE_VERSION` also becomes the `release_version` reported with each digest, so use
+a real version rather than the `dev` default if the digests are uploaded to a server.
 
 ## Using the menu-bar app
 
@@ -162,33 +186,28 @@ when the directory exists but its database is gone.
 If the LLM is unavailable, the report still lists what was collected, grouped by provider, so
 you can see which sources had sessions at all.
 
-## Submission (server side pending)
+## Submission
 
-The earlier plan — a Cloudflare Worker writing the digest into a Feishu Bitable — has been
-**dropped**, and its code has been removed from this repository. What remains is the client
-half of that contract, which still works against any server that implements it:
+Digests are uploaded to the **工作日志管理 (Work Log) module** of the `linmo-pig-full`
+server. The earlier Cloudflare Worker + Feishu Bitable plan was dropped, and its code removed;
+the client now speaks that module's API directly.
 
 | Client behaviour | Contract |
 | --- | --- |
-| 设置 → 提交地址 + 提交 API Key | Stored in `.env` as `DIGEST_SUBMIT_URL` / `DIGEST_API_KEY` (mode `600`) |
-| 测试连接 | `GET {DIGEST_SUBMIT_URL}/api/v1/me` with `Authorization: Bearer <key>` → `{member, member_id, key_id}` |
-| 上传 | `POST {DIGEST_SUBMIT_URL}/api/v1/digests` with the same header → `{mode: created\|updated\|unchanged, submitted_at}` |
-| 上传失败 | Recorded as `submit_status=failed` + `submit_error`; the report is **never** marked as sent unless the server answered with a recognised result |
+| 设置 → 提交地址 + 提交 API Key | Base address (`http://host/api`) **or** the full endpoint URL — both work; stored in `.env` as `DIGEST_SUBMIT_URL` / `DIGEST_API_KEY` (mode `600`) |
+| 上传 | `POST {DIGEST_SUBMIT_URL}/admin/enterprise/worklog/api/report`, `X-API-Key: <key>` → `{"code":0,"data":{"result":"created\|updated\|unchanged",...}}` |
+| 测试连接 | There is **no** separate key-check endpoint (the key's 授权URL whitelists only the report URL), so it uploads today's digest once and reads the member name back out of the response |
+| Identity | Comes from the key alone — the client sends no name, staff number or e-mail |
+| Report date | Decided by the **server's** day; the client's `date` is kept for the record only |
+| Overwrite | Same member + same server day = one row, updated in place. Identical payload → `unchanged`, no write |
+| 上传失败 | Recorded as `submit_status=failed` + `submit_error`; the report is **never** marked as sent unless the server answered with a recognised `result` |
 
-Until that server exists, use **Markdown** export (below) to hand the report over by hand,
-and leave 提交地址 empty — the app then reports `submit_status=not_configured` instead of
-pretending the digest was delivered.
+Leave 提交地址 empty and the app reports `submit_status=not_configured` instead of pretending
+the digest was delivered; **Markdown** export (below) remains available for hand-over.
 
-> Removed along with the Worker: member keys and their issuance CLI, the D1 audit log, the
-> Feishu Bitable writer, and the deployment/recovery tooling. If a future server is built,
-> the endpoints above are all it has to provide.
-
-**The full contract for that server — API-key issuance requirements, request/response shapes,
-field limits, idempotency and overwrite semantics, failure handling, a minimal acceptance
-checklist and ready-to-run `curl` examples — is written up in
-[`docs/backend-api.md`](docs/backend-api.md) (Chinese).** It deliberately prescribes nothing
-about the backend's stack, storage or hosting: it only fixes what the client already sends and
-what it needs back.
+**The full contract — API-key creation requirements (including the 授权URL trap), request and
+response shapes, field limits, overwrite/idempotency semantics, the failure table and
+ready-to-run `curl` examples — is in [`docs/backend-api.md`](docs/backend-api.md) (Chinese).**
 
 ## 日报 Markdown
 
