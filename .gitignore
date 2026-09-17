@@ -16,3 +16,5 @@ dist/
 # Local development harness runtime (scripts/dev.sh): isolated home, fixture
 # source tree, logs, dev app bundle and the seeded .env.
 .dev/
+# scripts/build-dmg.sh 的构建环境:独立 venv、PyInstaller 缓存与中间产物。
+.build/
