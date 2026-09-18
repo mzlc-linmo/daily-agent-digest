@@ -43,8 +43,8 @@
 >   响应取 Pig `R` 包装里的 `data.result`(见 README「Submission」与 `docs/backend-api.md`)。
 > - **身份与归属日都由服务端决定**:使用人取自密钥(客户端不发任何身份字段),
 >   归属日取服务端当天(客户端发的 `date` 只作留痕)。
-> - 「测试连接」改为**用上报接口试传一次** —— 该模块没有独立的校验接口,且密钥的授权URL
->   只放行上报路径。试传受覆盖保护约束,详见 `docs/backend-api.md` §5。
+> - 「测试连接」改为调 **API 密钥验证接口**(`POST /admin/api-key/verify`),**只校验不写入**;
+>   密钥的授权URL 需同时放行上报地址与该验证地址,详见 `docs/backend-api.md` §5。
 > - 未配置地址时状态为 `submit_status=not_configured`,不会假装已上报。
 > - 客户端**新增**「Markdown」按钮:把当日日报导出为 Markdown 文档,可复制/保存,用于人工交付。
 > - 已删除:`workers/`(Worker、KV/D1、密钥签发 CLI、审计日志、部署与恢复工具)、
@@ -179,7 +179,7 @@
 #### FR-7 上报到飞书群(P0,本期重点)
 
 - FR-7.1 **通道(已废弃)**:曾实现「App 用提交地址 + API Key 向自建 Cloudflare Worker 提交,由服务端写入飞书多维表格」。该后端与其文档已从仓库删除;客户端提交接口保留,服务端待重做。
-- FR-7.11 客户端凭据只填一次:提交地址与 API Key 存于 `APP_DIR/.env`(权限 `0600`),`settings` 只返回 `submit_url` 与 `submit_api_key_set`,**绝不回显密钥**;设置面板提供「测试连接」,经**上报接口试传一次**校验地址与 Key,并回填服务端解析出的使用人(该模块没有独立的校验接口,见 `docs/backend-api.md` §5)。
+- FR-7.11 客户端凭据只填一次:提交地址与 API Key 存于 `APP_DIR/.env`(权限 `0600`),`settings` 只返回 `submit_url` 与 `submit_api_key_set`,**绝不回显密钥**;设置面板提供「测试连接」,经**API 密钥验证接口**只读校验地址与 Key,并回填服务端解析出的使用人与密钥元数据(见 `docs/backend-api.md` §5)。
 - FR-7.12 提交幂等:服务端按「密钥解析出的使用人 + 服务端当天」覆盖既有行,报文与上次完全一致时返回 `unchanged` 且不写库;客户端不发送 `Idempotency-Key`(该服务端按报文内容自行计算哈希去重)。
 - FR-7.1a(历史,**已废弃**):飞书自定义机器人(群 webhook)方案。该方案与后来的「自建 Cloudflare Worker + 飞书多维表格」方案均已不再实现,保留作历史依据。
 - FR-7.2 **未配置 webhook 时不得标记为已上报**(已实现):`submit` 保持 `report_status: ready`,写入 `submit_status: not_configured` 与 `submit_error` 说明;日报字数与内容不受影响,配置通道后可重试。
@@ -387,7 +387,7 @@ Content-Type: application/json
 - **A20** 日报形态与字数:任意输入下 `report_chars` ≤1000 且等于**未排除项**的 `title + desc` 之和;3 项时每项正文可写满 100–300 字;20 项时全部保留且总量仍 ≤1000。
 - **A21** 报告窗口中工作总结按「标题 + 内容」渲染全部未排除项并**完整可见**(按内容自适应高度),工作主题索引只显示标题,正文不重复出现。
 - **A27** 上下文选材:进入上下文的只有提示词/最终文本/交付物;任一来源都不会被另一个来源挤空;实际上下文 ≤ 预算;`coverage_note` 记录入库/送模型/省略各来源的条数并在界面显示。
-- **A30** 提交服务:未配置地址或 Key 时 `submit_status=not_configured`;服务端返回非 2xx 或 `code != 0` 时 `submit_status=failed` 且 `report_status` 保持 `ready`;成功时 `report_status=submitted` 并记录 `submit_mode`(取自 `data.result`);状态文件中不得出现密钥内容;`check-submit` 用上报接口试传并返回服务端解析出的使用人,当天已成功上报且未归并时拒绝试传(9 项客户端测试覆盖)。
+- **A30** 提交服务:未配置地址或 Key 时 `submit_status=not_configured`;服务端返回非 2xx 或 `code != 0` 时 `submit_status=failed` 且 `report_status` 保持 `ready`;成功时 `report_status=submitted` 并记录 `submit_mode`(取自 `data.result`);状态文件中不得出现密钥内容;`check-submit` 调密钥验证接口只读校验,返回使用人与密钥元数据,失败时把 401/424/403 翻成可操作提示(11 项客户端测试覆盖)。
 - **A29** 版本可追溯:「关于」显示的引擎版本来自引擎实时应答;`--check-version` 无头模式可验证三种判定(开发构建 / 有新版 / 已最新),退出码同时反映是否检查成功。
 - **A28** 抽取正确性:三个来源的提示词与最终文本都能取到且**忽略 reasoning/thinking/tool-call**;过程记录默认不入库;带 `reasoning`/`tool-call` 分片的记录只取 `text` 分片;提到 `automation_u` 等词的提示词与最终文本**必须保留**(旧子串规则会误删);超过 4000 字符的记录先抽取再截断(8 项回归测试)。
 - **A22** `--mode=verbose` 注入超长总结与超长标题时,引擎仍裁剪到 ≤1000 字、标题 ≤30 字,且工作项数量不变。

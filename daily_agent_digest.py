@@ -13,6 +13,10 @@ USER_AGENT = f'DailyAgentDigest/{RELEASE_VERSION}'
 # 密钥的「授权URL」按整条地址登记,所以拼接结果必须与服务端登记的完全一致。
 REPORT_PATH = '/admin/enterprise/worklog/api/report'
 
+# API 密钥验证接口(安全与凭证 → 密钥管理 → 内部密钥 → 验证密钥)。
+# 只校验不写入;密钥放请求体而不是 URL,避免明文进访问日志。
+VERIFY_PATH = '/admin/api-key/verify'
+
 # Report contract (docs/requirements.md FR-3.11). The whole report is
 # 工作总结 + every work-item title, counted in characters with whitespace
 # removed, capped at REPORT_CHAR_LIMIT. The report is a list of independent
@@ -571,7 +575,7 @@ def generate(day=None, source_root=None):
 def app_command(command, data):
     load_env(); day=data.get('date') or dt.datetime.now(TZ).date().isoformat()
     if command == 'settings': return settings()
-    if command == 'check-submit': return check_submit(data, day)
+    if command == 'check-submit': return check_submit(data)
     if command == 'save-settings': return save_settings(data)
     if command == 'clear':
         state=app_state(day); state.update({'schema_version':'1.2','release_version':RELEASE_VERSION,'work_items': [], 'report_chars': 0, 'included_count': 0, 'excluded_count': 0, 'submit_status': None, 'submit_error': None, 'generated_at': None, 'report_status': 'generating', 'last_error': None}); write_state(state); return state
@@ -620,20 +624,23 @@ def server_message(raw):
     except ValueError: pass
     return text[:300]
 
-def report_url(target):
-    """把设置里的提交地址补成完整的上报地址。
+def submit_base(target):
+    """把设置里的提交地址归一成**基地址**(去掉可能已经带上的上报路径)。
 
-    **两种写法都接受**,因为两种都会有人填 —— 密钥的「授权URL」通常就是按完整接口地址
-    登记的,从「API密钥管理」页面上复制过来的自然带着路径:
-
-      基地址        http://host/api                          -> 补上 REPORT_PATH
-      完整接口地址   http://host/api/admin/.../api/report       -> 原样使用
-
-    不做这层兼容的话,完整地址会被拼成 `.../report/admin/.../report`,服务端只会回一句
-    403「该 API 密钥未授权访问本接口」—— 看着像密钥问题,其实是路径拼了两遍。
+    设置里两种写法都会有人填 —— 密钥的「授权URL」通常就是按完整接口地址登记的,从
+    「API密钥管理」页面复制过来自然带路径。后面要在这个基地址上拼不同的接口
+    (上报 / 校验密钥),所以先归一,避免各拼各的。
     """
     url=(target or '').strip().rstrip('/')
-    return url if url.endswith(REPORT_PATH) else url+REPORT_PATH
+    return url[:-len(REPORT_PATH)].rstrip('/') if url.endswith(REPORT_PATH) else url
+
+def report_url(target):
+    """上报接口地址:基地址 + REPORT_PATH。"""
+    return submit_base(target)+REPORT_PATH
+
+def verify_url(target):
+    """API 密钥验证接口地址:基地址 + VERIFY_PATH。"""
+    return submit_base(target)+VERIFY_PATH
 
 def post_report(target, key, payload):
     """上报一次日报,返回服务端 R 包装里的 data。
@@ -709,31 +716,69 @@ def fail_submit(state, day, message):
     state['submit_status']='failed'; state['submit_error']=message; state['last_error']=message
     write_state(state); return state
 
-def check_submit(data=None, day=None):
-    """设置里的「测试连接」:用**上报接口本身**真发一次,验证地址与 Key。
+def post_verify(target, key):
+    """调 API 密钥验证接口,返回服务端 R 包装里的 data。
 
-    原实现调 GET {地址}/api/v1/me 取成员名,但工作日志管理模块没有这个接口,而且密钥的
-    授权URL 一旦配置就只放行它登记的地址 —— 别的路径一律 403。所以改用上报接口验证:
-    服务端回的 username 由密钥解析而来,正好回答"地址对不对、Key 有没有效、认到的是谁"。
+    **只校验不写入** —— 不像上报接口那样有副作用,所以「测试连接」随时可以点。
 
-    **这是真上报**(同人同日覆盖,不会多出一行):内容取当天已归并的日报;当天还没归并时
-    发一条空 work_items 的探针(服务端允许空数组,表示"当天没有计入的内容"),但当天已经
-    成功上报过就拒绝试传 —— 空内容会把服务端已有的那份日报覆盖掉。
-
-    传入 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
+    鉴权用**密钥自身**作 Bearer:该接口要 sys_apikey_view 权限,而密钥持有人的身份
+    正是由这把密钥 introspect 出来的(userId/username 就来自密钥记录)。
     """
-    load_env(); data=data or {}; day=day or dt.datetime.now(TZ).date().isoformat()
+    url=verify_url(target)
+    req=urllib.request.Request(url, data=json.dumps({'apiKey':key},ensure_ascii=False).encode(),
+        headers={'Content-Type':'application/json','Authorization':'Bearer '+key,'User-Agent':USER_AGENT},
+        method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
+            body=json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f'HTTP {exc.code}: {server_message(exc.read())}（客户端实际请求:{url}）')
+    except Exception as exc:
+        debug(f'verify error: {type(exc).__name__}: {exc}')
+        raise ValueError(f'{type(exc).__name__}: {exc}（客户端实际请求:{url}）')
+    if not isinstance(body,dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
+    if body.get('code'): raise ValueError(f'提交服务返回失败:{server_message(json.dumps(body,ensure_ascii=False))}')
+    data=body.get('data')
+    if not isinstance(data,dict):
+        raise ValueError(f'提交服务返回了无法识别的结果:{str(body)[:200]}')
+    return data
+
+def check_submit(data=None):
+    """设置里的「测试连接」:调 API 密钥验证接口,确认地址对不对、密钥能不能用。
+
+    接口是 POST {基地址}/admin/api-key/verify,请求体 {"apiKey": <密钥>}。
+    **校验不通过也返回 200**,结论由 data.valid + data.reason 表达("密钥不正确" /
+    "密钥已禁用" / "密钥已过期" …),所以这里把 valid=false 当成一条可展示的结论,
+    而不是"请求失败"。
+
+    传 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
+    """
+    load_env(); data=data or {}
     target=(data.get('submit_url') or os.getenv('DIGEST_SUBMIT_URL') or '').strip()
     key=(data.get('submit_api_key') or os.getenv('DIGEST_API_KEY') or '').strip()
     if not target or not key: raise ValueError('未配置提交地址或 API Key')
-    state=app_state(day)
-    ready=state.get('report_status')=='ready'
-    if not ready and state.get('submit_status') in ('submitted','stale'):
-        raise ValueError('今天已经成功上报过日报,试传会用空内容覆盖它。请先生成今天的日报,或直接用「上传」。')
-    included=[x for x in state.get('work_items',[]) if not x.get('excluded')] if ready else []
-    result=post_report(target, key, report_payload(state, day, included))
-    return {'member':result.get('username',''),'date':result.get('date',''),
-            'mode':result.get('result',''),'item_count':len(included)}
+    try:
+        result=post_verify(target, key)
+    except ValueError as exc:
+        message=str(exc)
+        # 该接口需要鉴权,而客户端正是拿**待验证的这把密钥**去鉴权 —— 于是"密钥本身
+        # 不可用"会先在鉴权层被拒(401/424),根本走不到接口里 valid=false 那条结论。
+        # 框架在这里的原话是 "token expired",对着一个 API 密钥看这句只会更糊涂。
+        if message.startswith(('HTTP 424','HTTP 401')):
+            raise ValueError('密钥未通过服务端鉴权:密钥无效、已禁用、已过期,或不是 '
+                             'sk-<主键ID>-<随机串> 的新格式。\n服务端原话:' + message)
+        # 密钥的授权URL 必须放行验证接口本身,否则拦截器先以 403 拦下,服务端原话只说
+        # "未授权访问本接口",不补一句用户很难想到要去改授权URL。
+        if '授权URL' in message:
+            raise ValueError(f'{message}\n\n提示:该密钥的「授权URL」需要包含 {VERIFY_PATH}'
+                             '(或留空表示不限制),否则验证接口本身会被拦下。')
+        raise
+    if not result.get('valid'):
+        raise ValueError('密钥校验未通过:' + str(result.get('reason') or '服务端未给出原因'))
+    # 验证通过时回显密钥元数据:让用户确认"服务端认到的是谁、这把钥匙是干嘛的"。
+    return {'member':result.get('username') or result.get('name') or '',
+            'name':result.get('name') or '','app_code':result.get('appCode') or '',
+            'reason':result.get('reason') or '','expires_at':result.get('expiresAt') or ''}
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); ap.add_argument('--app-command'); args=ap.parse_args()

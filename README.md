@@ -196,7 +196,7 @@ the client now speaks that module's API directly.
 | --- | --- |
 | 设置 → 提交地址 + 提交 API Key | Base address (`http://host/api`) **or** the full endpoint URL — both work; stored in `.env` as `DIGEST_SUBMIT_URL` / `DIGEST_API_KEY` (mode `600`) |
 | 上传 | `POST {DIGEST_SUBMIT_URL}/admin/enterprise/worklog/api/report`, `X-API-Key: <key>` → `{"code":0,"data":{"result":"created\|updated\|unchanged",...}}` |
-| 测试连接 | There is **no** separate key-check endpoint (the key's 授权URL whitelists only the report URL), so it uploads today's digest once and reads the member name back out of the response |
+| 测试连接 | `POST {提交地址}/admin/api-key/verify` with `{"apiKey": …}` and the key as `Bearer` — a **read-only** check (no digest is written); the key's 授权URL must also allow `/admin/api-key/verify` |
 | Identity | Comes from the key alone — the client sends no name, staff number or e-mail |
 | Report date | Decided by the **server's** day; the client's `date` is kept for the record only |
 | Overwrite | Same member + same server day = one row, updated in place. Identical payload → `unchanged`, no write |

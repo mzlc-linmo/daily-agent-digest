@@ -695,63 +695,79 @@ class SubmitNeverFakesSuccessTests(unittest.TestCase):
         self.assertIn("HTTP 403", result["submit_error"])
         self.assertIn("未授权访问本接口", result["submit_error"])
 
-    def test_check_submit_validates_the_key_by_uploading_todays_report(self):
-        # 「测试连接」没有独立的校验接口可用(密钥授权URL 只放行上报路径),所以它真发一次
-        # 上报,用服务端回的使用人证明"地址对了、Key 有效、认到的是谁"。
-        server = StubSubmitService({"result": "updated", "username": "hudan", "date": today()})
+    def test_check_submit_calls_the_api_key_verify_endpoint(self):
+        # 「测试连接」调后端的密钥验证接口:只校验不写入,所以不会再产生/覆盖任何日报。
+        server = StubSubmitService({"valid": True, "reason": "验证通过", "keyId": "2100863515600392194",
+                                    "name": "工作日志", "appCode": "work-log", "username": "admin"})
         try:
             with tempfile.TemporaryDirectory() as d:
                 home = Path(d)
                 self.seed(home)
                 result = command(home, "check-submit", {},
-                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
+                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "sk-1-secret"})
             request = server.requests[0]
         finally:
             server.stop()
-        self.assertEqual(result["member"], "hudan")
-        self.assertEqual(result["mode"], "updated")
-        self.assertEqual(result["item_count"], 1)
         self.assertEqual(request["method"], "POST")
-        self.assertEqual(request["path"], engine.REPORT_PATH)
-        self.assertEqual(request["headers"]["x-api-key"], "dag_k1_secret")
+        self.assertEqual(request["path"], engine.VERIFY_PATH)
+        # 无副作用:验证接口不带任何日报内容
+        self.assertEqual(set(request["body"]), {"apiKey"})
+        self.assertEqual(request["body"]["apiKey"], "sk-1-secret")
+        # 该接口要 sys_apikey_view 权限,身份由密钥自身 introspect 出来
+        self.assertEqual(request["headers"]["authorization"], "Bearer sk-1-secret")
+        self.assertEqual(result["member"], "admin")
+        self.assertEqual(result["app_code"], "work-log")
+        self.assertEqual(result["reason"], "验证通过")
 
-    def test_check_submit_refuses_to_probe_when_today_was_already_uploaded(self):
-        # 未归并时试传发的是空 work_items 探针,直接发会把服务端已有的日报覆盖成空内容。
-        server = StubSubmitService({"result": "created", "username": "hudan", "date": today()})
+    def test_check_submit_rejects_a_key_the_server_declares_invalid(self):
+        # 校验不通过也返回 200 + valid=false,原因在 reason 里,必须原样展示给用户。
+        server = StubSubmitService({"valid": False, "reason": "密钥已禁用"})
         try:
             with tempfile.TemporaryDirectory() as d:
-                home = Path(d)
-                state = {"schema_version": "1.2", "date": today(), "report_status": "generating",
-                         "work_items": [], "report_chars": 0, "submit_status": "submitted", "submit_error": None}
-                (home / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
                 p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', 'check-submit'],
                                    input="{}", text=True, capture_output=True, check=False,
-                                   env={**os.environ, "DIGEST_HOME": str(home), "DIGEST_SUBMIT_URL": server.url,
-                                        "DIGEST_API_KEY": "dag_k1_secret"})
-            sent = list(server.requests)
+                                   env={**os.environ, "DIGEST_HOME": d, "DIGEST_SUBMIT_URL": server.url,
+                                        "DIGEST_API_KEY": "sk-1-secret"})
         finally:
             server.stop()
         self.assertEqual(p.returncode, 1)
-        self.assertIn("已经成功上报过日报", p.stdout)
-        self.assertEqual(sent, [], "拒绝试传时不得发出任何请求")
+        self.assertIn("密钥已禁用", p.stdout)
 
-    def test_check_submit_probes_with_empty_items_before_the_report_is_ready(self):
-        # 还没归并时也要能验证配置:发空 work_items(服务端允许),不会丢任何真实内容。
-        server = StubSubmitService({"result": "created", "username": "hudan", "date": today()})
+    def test_check_submit_explains_the_403_when_the_key_scope_excludes_verify(self):
+        # 密钥配了授权URL 但不含 /api-key/verify 时,拦截器先拦下,服务端原话只说
+        # "未授权访问本接口";客户端要补一句该去改授权URL,否则用户根本想不到。
+        server = StubSubmitService(status=403, raw=json.dumps(
+            {"code": 403, "msg": "该 API 密钥未授权访问本接口，当前密钥的授权URL：/admin/enterprise/worklog/api/report",
+             "data": None, "ok": False}))
         try:
             with tempfile.TemporaryDirectory() as d:
-                home = Path(d)
-                state = {"schema_version": "1.2", "date": today(), "report_status": "generating",
-                         "work_items": [], "report_chars": 0, "submit_status": None, "submit_error": None}
-                (home / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-                result = command(home, "check-submit", {},
-                                 extra_env={"DIGEST_SUBMIT_URL": server.url, "DIGEST_API_KEY": "dag_k1_secret"})
-            sent = server.requests[0]
+                p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', 'check-submit'],
+                                   input="{}", text=True, capture_output=True, check=False,
+                                   env={**os.environ, "DIGEST_HOME": d, "DIGEST_SUBMIT_URL": server.url,
+                                        "DIGEST_API_KEY": "sk-1-secret"})
         finally:
             server.stop()
-        self.assertEqual(result["member"], "hudan")
-        self.assertEqual(result["item_count"], 0)
-        self.assertEqual(sent["body"]["work_items"], [])
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("授权URL", p.stdout)
+        self.assertIn(engine.VERIFY_PATH, p.stdout)
+
+    def test_check_submit_explains_a_key_the_auth_layer_rejects(self):
+        # 客户端用待验证的密钥本身去鉴权,所以"密钥不可用"会先在鉴权层被拒(424),
+        # 走不到接口里 valid=false 那条结论。框架原话是 "token expired" —— 对着一个
+        # API 密钥看这句只会更糊涂,必须翻成人话。
+        server = StubSubmitService(status=424, raw=json.dumps(
+            {"code": 1, "msg": "token expired", "data": "Invalid API Key", "ok": False}))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                p = subprocess.run([sys.executable, str(ROOT/'daily_agent_digest.py'), '--app-command', 'check-submit'],
+                                   input="{}", text=True, capture_output=True, check=False,
+                                   env={**os.environ, "DIGEST_HOME": d, "DIGEST_SUBMIT_URL": server.url,
+                                        "DIGEST_API_KEY": "sk-1-wrongsecret"})
+        finally:
+            server.stop()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("未通过服务端鉴权", p.stdout)
+        self.assertIn("token expired", p.stdout)
 
     def test_check_submit_without_configuration_reports_an_error(self):
         saved = {k: os.environ.pop(k, None) for k in ("DIGEST_SUBMIT_URL", "DIGEST_API_KEY")}

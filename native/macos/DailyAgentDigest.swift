@@ -1088,7 +1088,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if settingsCache == nil {
             status.stringValue = "正在读取当前配置…"
         } else {
-            setSettingsStatus("提交地址填基地址(如 http://host/api)或完整接口地址(…/worklog/api/report)都行；「测试连接」会用今天的日报试传一次,且不会自动保存。", .secondaryLabelColor)
+            setSettingsStatus("提交地址填基地址(如 http://host/api)或完整接口地址(…/worklog/api/report)都行；「测试连接」只校验密钥,不会写入日报。", .secondaryLabelColor)
         }
         panel.center()
         panel.makeKeyAndOrderFront(nil)
@@ -1152,7 +1152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func testConnectionFromPanel() {
-        setSettingsStatus("正在测试(会用今天的日报试传一次)…", .secondaryLabelColor)
+        setSettingsStatus("正在测试…", .secondaryLabelColor)
         // 只测当前输入(不落盘):测试失败也不会污染已保存的配置
         backend.call("check-submit", settingsPayload()) { [weak self] result in
             guard let self = self else { return }
@@ -1160,9 +1160,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self.setSettingsStatus("连接失败：\(error)", .systemRed)
             } else {
                 let member = result["member"] as? String ?? "未知"
-                let mode = result["mode"] as? String ?? "ok"
-                let count = result["item_count"] as? Int ?? 0
-                self.setSettingsStatus("连接成功：服务端识别为「\(member)」,并已试传今天的日报(\(mode),\(count) 项)。确认无误后点「保存」。", .systemGreen)
+                let app = result["app_code"] as? String ?? ""
+                let name = result["name"] as? String ?? ""
+                let expires = result["expires_at"] as? String ?? ""
+                var detail = app.isEmpty ? "" : ",应用「\(app)」"
+                if !name.isEmpty { detail += ",密钥「\(name)」" }
+                if !expires.isEmpty { detail += ",有效期至 \(expires)" }
+                self.setSettingsStatus("连接成功：服务端识别为「\(member)」\(detail)。确认无误后点「保存」。", .systemGreen)
             }
         }
     }
