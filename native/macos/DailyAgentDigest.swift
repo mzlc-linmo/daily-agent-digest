@@ -1088,7 +1088,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if settingsCache == nil {
             status.stringValue = "正在读取当前配置…"
         } else {
-            setSettingsStatus("改完点「保存」；「测试连接」只测试当前输入,不会自动保存。", .secondaryLabelColor)
+            setSettingsStatus("提交地址填基地址(如 http://host/api)或完整接口地址(…/worklog/api/report)都行；「测试连接」只校验密钥,不会写入日报。", .secondaryLabelColor)
         }
         panel.center()
         panel.makeKeyAndOrderFront(nil)
@@ -1160,7 +1160,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self.setSettingsStatus("连接失败：\(error)", .systemRed)
             } else {
                 let member = result["member"] as? String ?? "未知"
-                self.setSettingsStatus("连接成功：服务端识别为「\(member)」。确认无误后点「保存」。", .systemGreen)
+                let app = result["app_code"] as? String ?? ""
+                let name = result["name"] as? String ?? ""
+                let expires = result["expires_at"] as? String ?? ""
+                var detail = app.isEmpty ? "" : ",应用「\(app)」"
+                if !name.isEmpty { detail += ",密钥「\(name)」" }
+                if !expires.isEmpty { detail += ",有效期至 \(expires)" }
+                self.setSettingsStatus("连接成功：服务端识别为「\(member)」\(detail)。确认无误后点「保存」。", .systemGreen)
             }
         }
     }

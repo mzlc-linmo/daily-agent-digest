@@ -25,8 +25,16 @@ if [ ! -f "$ASSETS/AppIcon.icns" ] || [ "$ASSETS/app-icon-1024.png" -nt "$ASSETS
   iconutil -c icns "$TMP/AppIcon.iconset" -o "$ASSETS/AppIcon.icns"
 fi
 cp "$ASSETS/AppIcon.icns" "$OUT/Contents/Resources/AppIcon.icns"
+# 模块缓存显式指向可写目录:受限环境(沙箱/CI)下 TMPDIR 与
+# $DARWIN_USER_CACHE_DIR 里的缓存都不可写,会直接报
+# "unable to load standard library for target ..." / "could not build Objective-C module"。
+# Swift 与 Clang 是两套缓存,必须分别指定 —— 只设其中一个,另一个照样失败。
+export CLANG_MODULE_CACHE_PATH=/tmp/dag-clang-modcache
+SWIFT_MODULE_CACHE=/tmp/dag-swift-modcache
+mkdir -p "$SWIFT_MODULE_CACHE"
 # 从同一张源图派生菜单栏单色图标(纯黑+alpha,系统按深浅色自动反色)
-swift "$(dirname "$0")/make-menubar-icon.swift" "$ASSETS/app-icon-1024.png" "$ASSETS" >/dev/null
+swift -module-cache-path "$SWIFT_MODULE_CACHE" \
+  "$(dirname "$0")/make-menubar-icon.swift" "$ASSETS/app-icon-1024.png" "$ASSETS" >/dev/null
 cp "$ASSETS"/MenuBarIconTemplate*.png "$OUT/Contents/Resources/"
 
 # 引擎进包:DMG 安装后不需要额外下载引擎。CI 通过 DIGEST_ENGINE_BIN 指定产物,
@@ -38,10 +46,7 @@ if [ -n "$ENGINE_BIN" ] && [ -f "$ENGINE_BIN" ]; then
   echo "  bundled engine: $ENGINE_BIN"
 fi
 
-# 模块缓存显式指向可写目录:受限环境(沙箱/CI)下 TMPDIR 里的缓存不可写,
-# 会报 "could not build Objective-C module ..."(Swift 与 Clang 是两套缓存)
-export CLANG_MODULE_CACHE_PATH=/tmp/dag-clang-modcache
-swiftc "$(dirname "$0")/DailyAgentDigest.swift" -o "$OUT/Contents/MacOS/DailyAgentDigest"
+swiftc "$(dirname "$0")/DailyAgentDigest.swift" -module-cache-path "$SWIFT_MODULE_CACHE" -o "$OUT/Contents/MacOS/DailyAgentDigest"
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleInfoDictionaryVersion</key><string>6.0</string><key>CFBundleIdentifier</key><string>$APP_ID</string><key>CFBundleName</key><string>Daily Agent Digest</string><key>CFBundleDisplayName</key><string>Daily Agent Digest</string><key>CFBundleExecutable</key><string>DailyAgentDigest</string><key>CFBundleIconFile</key><string>AppIcon</string><key>LSUIElement</key><true/><key>LSMinimumSystemVersion</key><string>15.0</string><key>NSHighResolutionCapable</key><true/><key>CFBundleShortVersionString</key><string>$VERSION</string><key>CFBundleVersion</key><string>$VERSION</string><key>DigestUIBuildID</key><string>$UI_BUILD_ID</string></dict></plist>
 PLIST

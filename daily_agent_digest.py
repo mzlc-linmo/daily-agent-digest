@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, ssl, urllib.error, urllib.request
+import argparse, datetime as dt, hashlib, json, os, re, sqlite3, subprocess, ssl, urllib.error, urllib.request
 from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -7,6 +7,15 @@ APP_DIR = Path(os.getenv('DIGEST_HOME', Path.home()/'Library/Application Support
 RELEASE_VERSION = os.getenv('DIGEST_RELEASE_VERSION', 'dev')
 # 服务端/CDN 可能拦截 Python-urllib 的默认 UA(例如 Cloudflare 的 1010),所以带自己的标识。
 USER_AGENT = f'DailyAgentDigest/{RELEASE_VERSION}'
+
+# 工作日志管理模块(企业管理 → 工作日志管理)的日报上报接口,契约见 docs/backend-api.md。
+# 设置里填的是**基地址**(如 http://192.168.110.164/api),这个路径由客户端拼上去 ——
+# 密钥的「授权URL」按整条地址登记,所以拼接结果必须与服务端登记的完全一致。
+REPORT_PATH = '/admin/enterprise/worklog/api/report'
+
+# API 密钥验证接口(安全与凭证 → 密钥管理 → 内部密钥 → 验证密钥)。
+# 只校验不写入;密钥放请求体而不是 URL,避免明文进访问日志。
+VERIFY_PATH = '/admin/api-key/verify'
 
 # Report contract (docs/requirements.md FR-3.11). The whole report is
 # 工作总结 + every work-item title, counted in characters with whitespace
@@ -319,6 +328,209 @@ def extract_generic(obj):
         if role: return role, text
     return None, None
 
+# ------------------------------------------------------------ VS Code 及其分支 --
+# VS Code 与它的各个 fork 把 AI 对话存在
+#   <Application Support>/<产品>/User/workspaceStorage/<workspace-hash>/chatSessions/<uuid>.jsonl
+# 实测 VS Code 的格式（response[] 的 kind 分布来自真实会话，不是推测）：
+#
+#   {"kind":0,"v":{...}}                  ← 初态行，自带**完整** session
+#   {"kind":1,"k":...,"v":...}            ← 增量更新
+#   {"kind":2,"v":...,"completedAt":...}  ← 结束标记
+#
+# 初态行 v.requests[] 里每条 request 是一次问答：
+#   request.message.text   → 用户提示词
+#   request.response[]     → 回复片段；**只有 kind 为空且 value 是字符串的才是正文**
+#   request.requestId      → 稳定 id        request.timestamp → 毫秒
+#
+# 变更 op 的 kind（VS Code 源码 objectMutationLog.ts 的 EntryKind，非推测）：
+#   0 = Initial 首行，完整对象   1 = Set 属性更新
+#   2 = **Push** 数组更新        3 = Delete 删除属性
+# ⚠️ kind=2 **不是结束标记**。它的语义是"截断到 i 再追加 v"，按结束标记处理会
+# 丢数据。本机实测就有反例：
+#   {"kind":2,"k":["requests"],"v":[…]}}                    新增整整一轮问答
+#   {"kind":2,"k":["requests",0,"response"],"v":[…],"i":6}   把后 10 段回复整段换掉
+# 后者长度与初态相同、**内容却是旧的** —— 只读首行会拿到过期回复且毫无征兆。
+# 所以必须按 op 顺序重放。
+VSCODE_OP_INITIAL, VSCODE_OP_SET, VSCODE_OP_PUSH, VSCODE_OP_DELETE = 0, 1, 2, 3
+VSCODE_CHAT_GLOB = 'User/workspaceStorage/*/chatSessions/*.jsonl'
+# 「没有打开文件夹」的窗口会话落在 globalStorage 下（作用域不同、格式相同）。
+# 漏掉它会让"平时就靠空窗口问 Copilot"的人一条都采不到。
+VSCODE_EMPTY_WINDOW_GLOB = 'User/globalStorage/emptyWindowChatSessions/*.jsonl'
+
+# 除正文外，这些 kind 都是过程，必须排除。列全是为了让"什么被丢掉了"可审。
+#   thinking                  内部推理        toolInvocationSerialized 工具调用
+#   mcpServersStarting        MCP 启动        autoModeResolution       模式选择
+VSCODE_PROCESS_KINDS = ('thinking', 'toolInvocationSerialized', 'mcpServersStarting',
+                        'autoModeResolution', 'progressMessage', 'command', 'errorDetails')
+
+# VS Code 及其分支。分支按同一约定处理 —— 它们都是 VS Code 的 fork，沿用同一套
+# chatSessions 机制。若某个分支实际不同，它的 stats 会是 dir_missing / no_sessions，
+# 而不是一个看起来正常的 0（后者会被误读成"当天没聊"）。处理器名与层的归属见 README。
+VSCODE_PRODUCTS = (
+    ('vscode',          'Code'),
+    ('vscode-insiders', 'Code - Insiders'),
+    ('cursor',          'Cursor'),
+    ('windsurf',        'Windsurf'),
+    ('qoder',           'Qoder'),
+    ('kimi-code',       'Kimi Code'),
+    ('codebuddy',       'CodeBuddy'),
+)
+
+def _log_path_get(state, path):
+    """按 ObjectPath 取值，任一层缺失返回 None。"""
+    cur = state
+    for key in path or []:
+        if isinstance(cur, list):
+            if not isinstance(key, int) or not 0 <= key < len(cur): return None
+            cur = cur[key]
+        elif isinstance(cur, dict):
+            if key not in cur: return None
+            cur = cur[key]
+        else:
+            return None
+    return cur
+
+def _log_path_set(state, path, value):
+    """按 ObjectPath 写值。中间层是 dict 且缺失时，按下一段类型补 list / dict。
+
+    **越界的数组写入一律忽略**（不给数组补空洞）：补空洞等于凭空造出一条消息，
+    会让"重放"这个动作本身产生原始数据里不存在的内容。dict 的中间层可以补，
+    因为 dict 没有"位置"语义，补出来的是空容器而不是伪造的条目。
+    """
+    path = list(path or [])
+    if not path: return
+    cur = state
+    for idx, key in enumerate(path[:-1]):
+        nxt = path[idx + 1]
+        if isinstance(cur, list):
+            if not isinstance(key, int) or not 0 <= key < len(cur): return
+            cur = cur[key]
+        elif isinstance(cur, dict):
+            if not isinstance(cur.get(key), (dict, list)):
+                cur[key] = [] if isinstance(nxt, int) else {}
+            cur = cur[key]
+        else:
+            return
+    last = path[-1]
+    if isinstance(cur, list):
+        if isinstance(last, int) and 0 <= last < len(cur):
+            cur[last] = value
+    elif isinstance(cur, dict):
+        cur[last] = value
+
+def replay_vscode_log(lines):
+    """把 chatSessions 的变更日志重放成最终会话对象（即末态的 ``v``）。
+
+    没有初态行（kind=0）就直接返回 None —— 缺失基准的增量没有意义，不能瞎猜。
+    """
+    state = None
+    for obj in lines:
+        if not isinstance(obj, dict): continue
+        kind = obj.get('kind')
+        if kind == VSCODE_OP_INITIAL:
+            v = obj.get('v')
+            state = v if isinstance(v, dict) else None
+            continue
+        if state is None: continue
+        k = obj.get('k')
+        if kind == VSCODE_OP_SET:
+            _log_path_set(state, k, obj.get('v'))
+        elif kind == VSCODE_OP_PUSH:
+            arr = _log_path_get(state, k)
+            if isinstance(arr, list):
+                i = obj.get('i')
+                # Push 语义：i 存在时先删掉 i 之后的所有元素，再追加
+                if isinstance(i, int) and 0 <= i <= len(arr): del arr[i:]
+                extra = obj.get('v')
+                if isinstance(extra, list): arr.extend(extra)
+        elif kind == VSCODE_OP_DELETE:
+            _log_path_set(state, k, None)
+    return state
+
+
+def vscode_reply_text(response):
+    """从 request.response[] 里取 AI 正文，排除思考与工具调用。"""
+    if not isinstance(response, list):
+        return ''
+    out = []
+    for part in response:
+        if isinstance(part, str):
+            out.append(part)          # 少数版本把正文直接写成字符串
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get('kind') is not None:
+            continue                  # 带 kind 的一律是过程
+        value = part.get('value')
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, dict):
+            out.append(str(value.get('value') or ''))
+    return ' '.join(' '.join(out).split())
+
+def extract_vscode_session(v):
+    """把**重放后**的会话对象展平成 ``[(item_id, stamp, role, text), ...]``。
+
+    入参是 :func:`replay_vscode_log` 的结果（也就是末态的 ``v``），不是文件里的原始行。
+    返回列表而不是单个 ``(role, text)``：一个会话里有多轮问答，这是它与其它
+    ``extract_*`` 的唯一区别。
+    """
+    if not isinstance(v, dict):
+        return []
+    session = str(v.get('sessionId') or '')
+    rows = []
+    for i, req in enumerate(v.get('requests') or []):
+        if not isinstance(req, dict):
+            continue
+        rid = str(req.get('requestId') or f'{session}#{i}')
+        stamp = req.get('timestamp') or v.get('creationDate')
+        message = req.get('message')
+        if isinstance(message, dict):
+            prompt = str(message.get('text') or '')
+        elif isinstance(message, str):
+            prompt = message
+        else:
+            prompt = ''
+        prompt = ' '.join(prompt.split())
+        if prompt:
+            rows.append((rid, stamp, 'prompt', prompt))
+        reply = vscode_reply_text(req.get('response'))
+        if reply:
+            rows.append((f'{rid}#reply', stamp, 'result', reply))
+    return rows
+
+# 对话正文里会夹带**真实凭据**：实测本机 WorkBuddy/Hermes 采集结果里就有完整的
+# 飞书机器人 webhook（含 token），DSH 会话日志里也有 `Bearer <token>`。
+# 这些文本要送进第三方 LLM、还可能被上报，所以必须在**进入事件之前**就地脱敏。
+#
+# 放在 collect_one 这一个入口，而不是每个采集器里各写一遍：老采集器漏掉的，
+# 新加的十几个不可能凭空补上。只认**形状明确**的凭据，避免误删正常正文
+# （例如把一句含 "token=" 的技术讨论整段抹掉，比漏脱敏更糟）。
+SECRET_PATTERNS = (
+    # 飞书/钉钉机器人 webhook：URL 末尾那段就是凭证
+    (re.compile(r'(https://open\.feishu\.cn/open-apis/bot/v2/hook/)[\w-]+'), r'\1<redacted>'),
+    (re.compile(r'(https://oapi\.dingtalk\.com/robot/send\?access_token=)[\w-]+'), r'\1<redacted>'),
+    (re.compile(r'(https://hooks\.slack\.com/services/)[\w/-]+'), r'\1<redacted>'),
+    # 带前缀的 API key / token
+    (re.compile(r'\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}'), '<redacted-key>'),
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9]{20,}'), '<redacted-token>'),
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), '<redacted-aws-key>'),
+    (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}'), '<redacted-slack-token>'),
+    # HTTP 头与赋值式：只认字段名紧跟长值的情况
+    (re.compile(r'(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]{20,}'), r'\1 <redacted>'),
+    (re.compile(r'(?i)\b(authorization|api[-_]?key|access[-_]?token|secret[-_]?key|password)\b\s*[:=]\s*["\']?([A-Za-z0-9._~+/=-]{16,})'),
+     r'\1: <redacted>'),
+)
+
+def redact_secrets(text):
+    """把高置信度的凭据形态替换掉。返回替换后的文本（原样返回非字符串入参）。"""
+    if not isinstance(text, str) or not text:
+        return text
+    for pattern, repl in SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
 def make_event(provider, session, item, stamp, kind, role, text, truncated=False):
     """role: prompt | result | deliverable | process"""
     text = ' '.join(str(text or '').split())
@@ -336,6 +548,8 @@ def new_stats():
     return {'prompt': 0, 'result': 0, 'deliverable': 0, 'process': 0, 'truncated': 0, 'chars': 0}
 
 def collect_one(stats, out, provider, session, item, stamp, kind, raw_text, role, text, include_process):
+    # 唯一入口：所有采集器的正文都在这里落地，脱敏放这里才不会有漏网的来源
+    text = redact_secrets(text)
     if role:
         stats[role] += 1
         if len(' '.join(str(text or '').split())) > MESSAGE_CHAR_MAX: stats['truncated'] += 1
@@ -410,6 +624,172 @@ def pi(root, start, end):
         read_jsonl(f, 'pi', start, end, stats, out, include)
     return dedupe(out), stats
 
+def vscode(root, start, end, app_dir, provider):
+    """采集一个 VS Code 系产品的 chatSessions。
+
+    ``app_dir`` 是 Application Support 下的产品目录名；``provider`` 是上报用的来源名。
+    两者分开是为了让「同一份解析逻辑」服务多个 fork，而上报仍能按产品区分。
+    """
+    stats = new_stats(); out = []; include = keep_process()
+    product = root / 'Library/Application Support' / app_dir
+    if not product.is_dir():
+        # 明确记录"这个产品没装"，而不是让 0 条看起来像"当天没工作"
+        stats['dir_missing'] = str(product)
+        return dedupe(out), stats
+    files = sorted(product.glob(VSCODE_CHAT_GLOB)) + sorted(product.glob(VSCODE_EMPTY_WINDOW_GLOB))
+    stats['files'] = len(files)
+    if not files:
+        # 装了却一个会话文件都没有：这**不是**"当天没聊"，而是格式不同或对话不落在本地。
+        # 区分这两者很重要 —— 前者无需处理，后者说明这个源的采集路径选错了。
+        stats['no_sessions'] = str(product)
+    for f in files:
+        try:
+            raw = f.read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        objs = []
+        for line in raw:
+            try: objs.append(json.loads(line))
+            except json.JSONDecodeError: continue
+        # 先重放再抽取：只读首行会拿到被后续 Push 覆盖掉的旧回复（见上方注释里的实测反例）
+        session = replay_vscode_log(objs)
+        if session is None:
+            stats['no_initial'] = stats.get('no_initial', 0) + 1
+            continue
+        sid = str(session.get('sessionId') or f.stem)
+        for item, stamp, role, text in extract_vscode_session(session):
+            if not in_window(stamp, start, end): continue
+            collect_one(stats, out, provider, sid, item, stamp, 'chat', '', role, text, include)
+    return dedupe(out), stats
+
+# ---------------------------------------------------------------- Hermes Agent --
+# Hermes 把会话存进 **SQLite**（不是散落的 JSONL），实测结构：
+#   sessions(id, source, display_name, model, started_at REAL 秒, message_count, …)
+#   messages(id, session_id, role, content TEXT, tool_calls, tool_name,
+#            reasoning, reasoning_content, timestamp REAL 秒, active, compacted, …)
+# 实测 role 只有 user / assistant / tool 三种（3 会话 154 条里 21/75/58）。
+# `content` 是纯文本（assistant 是 Markdown 正文，tool 是 JSON），
+# 所以**只需要按 role 过滤**，不必再解析 content 内部结构。
+HERMES_DB = '.hermes/state.db'
+HERMES_ROLE_TO_KIND = {'user': 'prompt', 'assistant': 'result'}
+
+def hermes(root, start, end):
+    """从 ~/.hermes/state.db 取用户提示词与 AI 最终回复。
+
+    `tool` 角色的 content 是工具返回的 JSON、`reasoning*` 是内部推理 —— 都是过程，
+    不进汇总。`active=0` / `compacted=1` 的行已被压缩或作废，同样跳过。
+    """
+    stats = new_stats(); out = []; include = keep_process()
+    db = root / HERMES_DB
+    if not db.exists():
+        # 只是打不开不足以判断"没用过"，先记下路径让 collect_warnings 决定要不要提示
+        stats['db_missing'] = str(db)
+        return dedupe(out), stats
+    try:
+        con = open_sqlite_readonly(db)
+    except sqlite3.Error:
+        stats['db_missing'] = str(db)
+        return dedupe(out), stats
+    try:
+        # 用 REAL 秒直接与窗口比较：in_window 对 >1e10 的值才按毫秒解释，
+        # 秒级时间戳(约 1.7e9)不会被误判。
+        lo, hi = start.timestamp(), end.timestamp()
+        rows = con.execute(
+            'select id, session_id, role, content, timestamp from messages '
+            'where timestamp >= ? and timestamp < ? and active = 1 and compacted = 0 '
+            'order by timestamp', (lo, hi))
+        for mid, sid, role, content, stamp in rows:
+            kind = HERMES_ROLE_TO_KIND.get(str(role or '').lower())
+            if not kind:
+                if include and role:
+                    collect_one(stats, out, 'hermes', str(sid), str(mid), stamp, str(role),
+                                str(content or ''), 'process', str(content or ''), include)
+                continue
+            text = ' '.join(str(content or '').split())
+            if not text:
+                continue          # 只发起工具调用、没有正文的 assistant 行
+            collect_one(stats, out, 'hermes', str(sid), str(mid), stamp, str(role), '', kind, text, include)
+    finally:
+        con.close()
+    return dedupe(out), stats
+
+
+# ------------------------------------------------------------------- WorkBuddy --
+# `~/.workbuddy-ai/projects/<编码后的 cwd>/<sessionId>.jsonl`，Claude Code 同构的 JSONL：
+# 一行一个事件，`type` 取 message / reasoning / function_call / function_call_result /
+# file-history-snapshot / ai-title。只有 `type=message` 的才进汇总。
+# 实测一条 message 的 `content` 是分片数组，role=user 用 `input_text`、assistant 用 `output_text`。
+WORKBUDDY_ROOT = '.workbuddy-ai'
+WORKBUDDY_CHAT_GLOB = 'projects/*/*.jsonl'
+WORKBUDDY_ROLE_TO_KIND = {'user': 'prompt', 'assistant': 'result'}
+WORKBUDDY_PART_TYPES = ('input_text', 'output_text')
+WORKBUDDY_USER_QUERY = re.compile(r'<user_query>(.*?)</user_query>', re.S)
+WORKBUDDY_INJECTED = re.compile(r'<system-reminder.*?</system-reminder>', re.S)
+
+def workbuddy_prompt_text(text):
+    """从用户分片里取出**真正的问题**。
+
+    实测 19 条用户分片里 17 条以 ``<system-reminder>`` 开头 —— 那是 OS/Shell/工作区/
+    身份文件的注入上下文，单条可到 4000 字；真正的问题在末尾的 ``<user_query>`` 里。
+    整段照收会让日报被系统样板淹没（"重新部署Pig-ui"这种有效信息被埋掉）。
+    另外 2 条是裸文本，去掉注入块后原样使用。
+    """
+    t = str(text or '')
+    m = WORKBUDDY_USER_QUERY.search(t)
+    if m:
+        return ' '.join(m.group(1).split())
+    return ' '.join(WORKBUDDY_INJECTED.sub(' ', t).split())
+
+def workbuddy(root, start, end):
+    """采集 WorkBuddy 的会话（JSONL，逐行事件）。"""
+    stats = new_stats(); out = []; include = keep_process()
+    base = root / WORKBUDDY_ROOT
+    if not base.is_dir():
+        stats['dir_missing'] = str(base)
+        return dedupe(out), stats
+    files = sorted(base.glob(WORKBUDDY_CHAT_GLOB))
+    stats['files'] = len(files)
+    if not files:
+        stats['no_sessions'] = str(base)
+    for f in files:
+        sid = f.stem
+        try:
+            raw = f.read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(raw):
+            if not line.strip(): continue
+            try: obj = json.loads(line)
+            except json.JSONDecodeError: continue
+            if not isinstance(obj, dict) or obj.get('type') != 'message': continue
+            role = str(obj.get('role') or '')
+            kind = WORKBUDDY_ROLE_TO_KIND.get(role)
+            if not kind:
+                continue
+            parts = []
+            for part in (obj.get('content') or []):
+                if not isinstance(part, dict): continue
+                # 只认 input_text/output_text；其它分片类型属于过程
+                if part.get('type') not in WORKBUDDY_PART_TYPES: continue
+                if kind == 'prompt':
+                    text = workbuddy_prompt_text(part.get('text'))
+                else:
+                    text = ' '.join(str(part.get('text') or '').split())
+                if text: parts.append(text)
+            text = ' '.join(parts).strip()
+            if not text: continue
+            stamp = obj.get('timestamp')
+            if not in_window(stamp, start, end): continue
+            collect_one(stats, out, 'workbuddy', str(obj.get('sessionId') or sid),
+                        str(obj.get('id') or i), stamp, 'message', '', kind, text, include)
+    return dedupe(out), stats
+
+
+def _vscode_collector(app_dir, provider):
+    """把 (app_dir, provider) 绑定成一个 collect() 能直接调的采集器。"""
+    return lambda root, start, end: vscode(root, start, end, app_dir, provider)
+
+
 # zstd 不是 macOS 自带命令。**只查 PATH 是不够的**:从 Finder / 登录项启动的 App
 # 拿不到 shell 的 PATH(launchctl getenv PATH 为空),于是 brew(/opt/homebrew/bin)与
 # anaconda(/opt/anaconda3/bin)里的 zstd 全都看不见 —— 表现为"今天没干活"。
@@ -462,10 +842,20 @@ def open_sqlite_readonly(path):
     raise sqlite3.OperationalError(f'unable to open database file: {path} ({last})')
 
 
+# 采集器注册表。新增一个数据源 = 在这里加一项 + 写一个 extract_* + 一条回归测试。
+COLLECTORS = (
+    ('codex', codex),
+    ('pi', pi),
+    ('dsh', dsh),
+    ('hermes', hermes),
+    ('workbuddy', workbuddy),
+) + tuple((name, _vscode_collector(app_dir, name)) for name, app_dir in VSCODE_PRODUCTS)
+
+
 def collect(root, start, end):
     """返回 (events, stats):events 默认只含提示词 / 最终文本 / 交付物。"""
     events = []; stats = {}
-    for name, fn in (('codex', codex), ('pi', pi), ('dsh', dsh)):
+    for name, fn in COLLECTORS:
         # 逐个隔离:某个采集器损坏(库打不开、schema 不符、时间戳溢出)时,
         # 只降级这一个来源并把原因写进 coverage,而不是让当天日报整体生成失败。
         try:
@@ -545,6 +935,11 @@ def collect_warnings(payload, collect_stats):
             db=Path(str(st['db_missing']))
             if db.parent.is_dir(): out.append(f"未找到 {name} 的数据库:{db}")
         if st.get('error'): out.append(f"采集 {name} 失败:{st['error']}")
+    # 「装了却一条没采到」值得单独提示:否则界面看起来正常,而实际这个源根本没进来。
+    # 与 db_missing 同一套判断——**没装的产品不提示**(否则每台机器天天看到 7 条误报)。
+    barren=[n for n,st in (collect_stats or {}).items() if isinstance(st,dict) and st.get('no_sessions')]
+    if barren:
+        out.append(f"以下工具已安装但未采到对话(存储格式可能不同、或对话不在本地):{'、'.join(sorted(barren))}")
     # 去重但保序(同一个 zstd 提示可能来自多个采集器)
     seen=set(); uniq=[]
     for w in out:
@@ -595,13 +990,82 @@ def app_command(command, data):
     if command=='submit': return submit(day)
     raise ValueError('unknown app command')
 
+def report_payload(state, day, included):
+    """组装上报报文:字段与工作日志管理模块的 WorkLogReportDTO 一一对应。
+
+    date 只作留痕 —— 服务端按自己的当天决定这份日报归属哪一天,所以补传历史也不会散成多天。
+    """
+    items=[{'title':x.get('title',''),'desc':x.get('desc',''),'status':x.get('status','completed'),
+            'source_task_ids':x.get('source_task_ids',[])} for x in included]
+    return {'date':day,'generated_at':state.get('generated_at'),'release_version':RELEASE_VERSION,
+            'report_chars':state.get('report_chars',0) if included else 0,
+            'coverage_note':state.get('coverage_note') or '','work_items':items}
+
+def server_message(raw):
+    """把服务端的失败响应压成一句可读原因:Pig 的 R 包装把原因放在 msg 里。"""
+    text=raw.decode('utf-8','replace') if isinstance(raw,bytes) else str(raw)
+    try:
+        body=json.loads(text)
+        if isinstance(body,dict) and body.get('msg'): return str(body['msg'])
+    except ValueError: pass
+    return text[:300]
+
+def submit_base(target):
+    """把设置里的提交地址归一成**基地址**(去掉可能已经带上的上报路径)。
+
+    设置里两种写法都会有人填 —— 密钥的「授权URL」通常就是按完整接口地址登记的,从
+    「API密钥管理」页面复制过来自然带路径。后面要在这个基地址上拼不同的接口
+    (上报 / 校验密钥),所以先归一,避免各拼各的。
+    """
+    url=(target or '').strip().rstrip('/')
+    return url[:-len(REPORT_PATH)].rstrip('/') if url.endswith(REPORT_PATH) else url
+
+def report_url(target):
+    """上报接口地址:基地址 + REPORT_PATH。"""
+    return submit_base(target)+REPORT_PATH
+
+def verify_url(target):
+    """API 密钥验证接口地址:基地址 + VERIFY_PATH。"""
+    return submit_base(target)+VERIFY_PATH
+
+def post_report(target, key, payload):
+    """上报一次日报,返回服务端 R 包装里的 data。
+
+    成功判定与服务端一致:HTTP 2xx + code==0 + data.result ∈ created/updated/unchanged。
+    任何一条不满足都抛 ValueError —— 调用方据此把状态留在"未提交",绝不显示成已上报。
+    「上传」与设置里的「测试连接」共用这里,避免各写一份请求与错误处理。
+    """
+    url=report_url(target)
+    req=urllib.request.Request(url, data=json.dumps(payload,ensure_ascii=False).encode(),
+        headers={'Content-Type':'application/json','X-API-Key':key,'User-Agent':USER_AGENT}, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
+            body=json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx 的正文才是"为什么被拒"(缺少密钥/应用编码不对/授权URL不匹配/报文不合法),
+        # 只报状态码用户无法自救。
+        # 还要带上**实际请求的地址**:服务端的授权URL 文案只说"这个密钥没授权本接口",
+        # 分不清是密钥配错还是地址拼错(例如把完整接口地址又当基地址拼了一遍)。
+        raise ValueError(f'HTTP {exc.code}: {server_message(exc.read())}（客户端实际请求:{url}）')
+    except Exception as exc:
+        debug(f'report error: {type(exc).__name__}: {exc}')
+        raise ValueError(f'{type(exc).__name__}: {exc}（客户端实际请求:{url}）')
+    # 合法 JSON 但不是对象(数组/字符串)时,后面的 .get 会抛 AttributeError,
+    # 那样调用方区分不出"未提交"和"提交失败"。
+    if not isinstance(body,dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
+    if body.get('code'): raise ValueError(f'提交服务返回失败:{server_message(json.dumps(body,ensure_ascii=False))}')
+    data=body.get('data')
+    if not isinstance(data,dict) or data.get('result') not in ('created','updated','unchanged'):
+        raise ValueError(f'提交服务返回了无法识别的结果:{str(body)[:200]}')
+    return data
+
 def submit(day):
-    """把当天的日报提交到提交服务(地址与 Key 由设置界面配置)。
+    """把当天的日报上报到工作日志管理模块(地址与 Key 由设置界面配置)。
 
-    服务端实现不在本仓库:只要它提供 POST /api/v1/digests 并能按「成员 + 日期」覆盖即可。
-    (此前的 Cloudflare Worker + 飞书方案已废弃并删除。)
+    服务端按「使用人 + 服务器当天」覆盖:同一天重复上报只留最新一条(不会多出一行),
+    报文完全一致时回 unchanged 且不写库。使用人取自密钥,客户端**不发**任何身份字段。
 
-    未配置提交地址/Key,或服务端返回非 2xx 时**绝不**把状态置为 submitted:
+    未配置提交地址/Key,或服务端返回非 2xx / 无法识别的结果时**绝不**把状态置为 submitted:
     那会让界面以为日报已经送达。改为持久化 submit_status / submit_error,便于重试与排查。
     """
     state=app_state(day)
@@ -622,35 +1086,15 @@ def submit(day):
         state['last_error']=state['submit_error']
         write_state(state); return state
 
-    items=[{'title':x.get('title',''),'desc':x.get('desc',''),'status':x.get('status','completed'),
-            'source_task_ids':x.get('source_task_ids',[])} for x in included]
-    payload={'date':day,'generated_at':state.get('generated_at'),'release_version':RELEASE_VERSION,
-             'report_chars':state.get('report_chars',0),'coverage_note':state.get('coverage_note') or '',
-             'work_items':items}
-    fingerprint=hashlib.sha256(json.dumps([[i['title'],i['desc'],i['status']] for i in items],ensure_ascii=False).encode()).hexdigest()
-    url=target.rstrip('/')+'/api/v1/digests'
-    req=urllib.request.Request(url, data=json.dumps(payload,ensure_ascii=False).encode(),
-        headers={'Content-Type':'application/json','Authorization':'Bearer '+key,
-                 'User-Agent':USER_AGENT,'Idempotency-Key':f'{day}:{fingerprint}'}, method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
-            body=json.loads(r.read() or b'{}')
-        # 合法 JSON 但不是对象(数组/字符串)时,后面的 body.get 会抛 AttributeError,
-        # 那样 submit_status/submit_error 完全没落盘,界面无法区分"未提交"和"提交失败"。
-        if not isinstance(body, dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
-    except urllib.error.HTTPError as exc:
-        detail=exc.read().decode('utf-8','replace')[:300]
-        return fail_submit(state, day, f'HTTP {exc.code}: {detail}')
-    except Exception as exc:
-        debug(f'submit error: {type(exc).__name__}: {exc}')
-        return fail_submit(state, day, f'{type(exc).__name__}: {exc}')
-    mode=body.get('mode')
-    if mode not in ('created','updated','unchanged'):
-        return fail_submit(state, day, f'提交服务返回了无法识别的结果:{str(body)[:200]}')
+        result=post_report(target, key, report_payload(state, day, included))
+    except ValueError as exc:
+        return fail_submit(state, day, str(exc))
     state['report_status']='submitted'; state['submitted_count']=len(included)
     state['submit_status']='submitted'; state['submit_error']=None; state['last_error']=None
-    state['submitted_at']=body.get('submitted_at') or dt.datetime.now(TZ).isoformat()
-    state['submit_mode']=mode
+    # 服务端不返回 submitted_at(时间以服务端的 last_report_time 为准),缺省用本机时间填充。
+    state['submitted_at']=result.get('submitted_at') or dt.datetime.now(TZ).isoformat()
+    state['submit_mode']=result.get('result')
     write_state(state); return state
 
 def fail_submit(state, day, message):
@@ -658,34 +1102,69 @@ def fail_submit(state, day, message):
     state['submit_status']='failed'; state['submit_error']=message; state['last_error']=message
     write_state(state); return state
 
-def check_submit(data=None):
-    """调 GET /api/v1/me 校验地址与 Key,供设置界面"测试连接"并回填成员名。
+def post_verify(target, key):
+    """调 API 密钥验证接口,返回服务端 R 包装里的 data。
 
-    传入 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
+    **只校验不写入** —— 不像上报接口那样有副作用,所以「测试连接」随时可以点。
+
+    鉴权用**密钥自身**作 Bearer:该接口要 sys_apikey_view 权限,而密钥持有人的身份
+    正是由这把密钥 introspect 出来的(userId/username 就来自密钥记录)。
+    """
+    url=verify_url(target)
+    req=urllib.request.Request(url, data=json.dumps({'apiKey':key},ensure_ascii=False).encode(),
+        headers={'Content-Type':'application/json','Authorization':'Bearer '+key,'User-Agent':USER_AGENT},
+        method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
+            body=json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f'HTTP {exc.code}: {server_message(exc.read())}（客户端实际请求:{url}）')
+    except Exception as exc:
+        debug(f'verify error: {type(exc).__name__}: {exc}')
+        raise ValueError(f'{type(exc).__name__}: {exc}（客户端实际请求:{url}）')
+    if not isinstance(body,dict): raise ValueError(f'提交服务返回的不是 JSON 对象:{str(body)[:200]}')
+    if body.get('code'): raise ValueError(f'提交服务返回失败:{server_message(json.dumps(body,ensure_ascii=False))}')
+    data=body.get('data')
+    if not isinstance(data,dict):
+        raise ValueError(f'提交服务返回了无法识别的结果:{str(body)[:200]}')
+    return data
+
+def check_submit(data=None):
+    """设置里的「测试连接」:调 API 密钥验证接口,确认地址对不对、密钥能不能用。
+
+    接口是 POST {基地址}/admin/api-key/verify,请求体 {"apiKey": <密钥>}。
+    **校验不通过也返回 200**,结论由 data.valid + data.reason 表达("密钥不正确" /
+    "密钥已禁用" / "密钥已过期" …),所以这里把 valid=false 当成一条可展示的结论,
+    而不是"请求失败"。
+
+    传 submit_url / submit_api_key 可测试"尚未保存"的输入;留空则用已保存的值。
     """
     load_env(); data=data or {}
     target=(data.get('submit_url') or os.getenv('DIGEST_SUBMIT_URL') or '').strip()
     key=(data.get('submit_api_key') or os.getenv('DIGEST_API_KEY') or '').strip()
     if not target or not key: raise ValueError('未配置提交地址或 API Key')
-    req=urllib.request.Request(target.rstrip('/')+'/api/v1/me',
-        headers={'Authorization':'Bearer '+key,'User-Agent':USER_AGENT}, method='GET')
     try:
-        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
-            body=json.loads(r.read() or b'{}')
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode('utf-8', 'replace')
-        code = ''
-        try: code = (json.loads(raw).get('error') or {}).get('code', '')
-        except (ValueError, AttributeError): pass
-        # 把服务端的错误码翻成"下一步该做什么":只说"403"用户无法自救。
-        hint = {
-            'key_revoked': '该 Key 已被撤销(重新签发或轮换后旧 Key 会立即失效)。请在管理台「员工与 Key」里重新签发,并把新 Key 填到上面的输入框。',
-            'invalid_key': '该 Key 不存在或格式不对。请检查是否复制完整,或到管理台重新签发。',
-        }.get(code, '')
-        raise ValueError(f'HTTP {exc.code}: {raw[:200]}' + (f'\n\n{hint}' if hint else ''))
-    except Exception as exc:
-        raise ValueError(f'{type(exc).__name__}: {exc}')
-    return {'member':body.get('member',''),'member_id':body.get('member_id','')}
+        result=post_verify(target, key)
+    except ValueError as exc:
+        message=str(exc)
+        # 该接口需要鉴权,而客户端正是拿**待验证的这把密钥**去鉴权 —— 于是"密钥本身
+        # 不可用"会先在鉴权层被拒(401/424),根本走不到接口里 valid=false 那条结论。
+        # 框架在这里的原话是 "token expired",对着一个 API 密钥看这句只会更糊涂。
+        if message.startswith(('HTTP 424','HTTP 401')):
+            raise ValueError('密钥未通过服务端鉴权:密钥无效、已禁用、已过期,或不是 '
+                             'sk-<主键ID>-<随机串> 的新格式。\n服务端原话:' + message)
+        # 密钥的授权URL 必须放行验证接口本身,否则拦截器先以 403 拦下,服务端原话只说
+        # "未授权访问本接口",不补一句用户很难想到要去改授权URL。
+        if '授权URL' in message:
+            raise ValueError(f'{message}\n\n提示:该密钥的「授权URL」需要包含 {VERIFY_PATH}'
+                             '(或留空表示不限制),否则验证接口本身会被拦下。')
+        raise
+    if not result.get('valid'):
+        raise ValueError('密钥校验未通过:' + str(result.get('reason') or '服务端未给出原因'))
+    # 验证通过时回显密钥元数据:让用户确认"服务端认到的是谁、这把钥匙是干嘛的"。
+    return {'member':result.get('username') or result.get('name') or '',
+            'name':result.get('name') or '','app_code':result.get('appCode') or '',
+            'reason':result.get('reason') or '','expires_at':result.get('expiresAt') or ''}
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date',default=dt.datetime.now(TZ).date().isoformat()); ap.add_argument('--root',default=str(Path.home())); ap.add_argument('--out',default=None); ap.add_argument('--app-command'); args=ap.parse_args()
