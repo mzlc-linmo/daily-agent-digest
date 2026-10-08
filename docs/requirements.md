@@ -17,11 +17,24 @@
 
 **事实**:开发者日常在多个 AI Agent 客户端中工作,会话记录分散在各自的本地存储中:
 
-| 数据源 | 位置 | 读取方式 |
-| --- | --- | --- |
-| Codex | `~/.codex/thread_history_1.sqlite`、`~/.codex/archived_sessions/*.jsonl` | SQLite 查询 + JSONL(`daily_agent_digest.py:82-95`) |
-| Pi agent | `~/.pi/agent/sessions/**/*.jsonl` | JSONL(`:122-125`) |
-| DeepSeek Harness | `~/.dsh/sessions/**/*.zstd` | 外部 `zstd -dc` 解压后按行解析(`:110-120`) |
+| 数据源 | 位置 | 读取方式 | 状态 |
+| --- | --- | --- | --- |
+| Codex | `~/.codex/thread_history_1.sqlite`、`~/.codex/archived_sessions/*.jsonl` | SQLite 查询 + JSONL | 既有 |
+| Pi agent | `~/.pi/agent/sessions/**/*.jsonl` | JSONL | 既有（本机无数据） |
+| DeepSeek Harness | `~/.dsh/sessions/**/*.zstd` | 外部 `zstd -dc` 解压后按行解析 | 既有 |
+| **VS Code 系** | `<App Support>/<产品>/User/workspaceStorage/*/chatSessions/*.jsonl`（+ `globalStorage/emptyWindowChatSessions/`） | JSONL **变更日志，须按 op 重放** | **新增，本机实测** |
+| **Hermes Agent** | `~/.hermes/state.db`（表 `sessions` / `messages`） | SQLite | **新增，本机实测** |
+| **WorkBuddy** | `~/.workbuddy-ai/projects/<编码cwd>/<sessionId>.jsonl` | JSONL（Claude Code 同构） | **新增，本机实测** |
+
+VS Code 系按同一套解析逻辑覆盖多个产品（它们的 fork 沿用同一机制）：
+`vscode`、`vscode-insiders`、`cursor`、`windsurf`、`qoder`、`kimi-code`、`codebuddy`。
+未安装的产品会记 `dir_missing`、装了但拿不到会话文件会记 `no_sessions` —— 两者都不报警，
+但会在 coverage 里留痕，避免把"0 条"误读成"当天没工作"。
+
+其余工具（Claude Code / Gemini CLI / Qwen Code / Kimi Code / OpenCode / OpenClaw 等）
+的真实路径与字段结构见 `docs/source-formats-ide.md` 与 `docs/source-formats-cli.md`；
+其中 **Trae CN / TRAE SOLO CN 的会话正文为加密存储，官方明确不支持本地读取**，
+Windsurf / Devin 的正文是 protobuf 且无公开 schema —— 这三类已判定不做。
 
 由此产生的核心问题:
 
@@ -100,7 +113,7 @@
 - FR-1.1 按「本地日历日」窗口采集,窗口为 `[当天 00:00, 次日 00:00)`(`:68-70`)。
 - FR-1.2 时间戳兼容毫秒/秒级 epoch 与 ISO8601(含 `Z`),统一换算到报告时区(`:72-80`)。
 - FR-1.3 采集根目录必须可通过 `DIGEST_SOURCE_ROOT`(引擎)与 `--root`(CLI)覆盖,测试不得读取真实用户主目录(`:162`、`:206`)。
-- FR-1.4 provider 固定为 `codex`、`pi`、`deepseek-harness` 三个;本期不新增数据源,但采集器边界须可扩展。
+- FR-1.4 provider 为 `codex`、`pi`、`deepseek-harness`、`vscode`(含各 fork)、`hermes`、`workbuddy`;新增数据源须逐源提供**结构化抽取规则 + 回归测试**,不得依赖通用兜底解析(见 `docs/source-formats-*.md`)。
 - FR-1.5 采集只读;任一数据源缺失、损坏、无权限时降级跳过,不得中断整体生成(`:101`、`:113-114`)。
 - FR-1.6 单条事件文本截断上限集中定义(当前 4000 字符,`:90`、`:107`、`:119`)。
 - FR-1.7 依赖 `zstd` 可执行文件时,安装器必须检测并给出明确提示(当前仅在 README 声明)。
@@ -502,7 +515,7 @@ syspolicy_check distribution daily-agent-digest-macos-arm64
 | Q1 | 目标用户与分发范围 | **团队内部使用**(3–10 人) | 引入成员标识、共享群上报、团队安装说明;不做服务端 |
 | Q2 | 本期平台范围 | **只做 macOS**,Windows 标记为后续 | FR-10 降为 P2;Windows CI 仅保持编译绿 |
 | Q3 | 日报上报目标 | **飞书自定义机器人(群 webhook)** | 新增 FR-7 全节、D-10;`DIGEST_SUBMIT_URL` 被取代 |
-| Q4 | 采集数据源 | **保持 Codex / Pi / DeepSeek Harness 三源** | FR-1.4 冻结;采集器仅做健壮性补强 |
+| Q4 | 采集数据源 | **三源已扩展**：新增 VS Code 系(7 个产品同一套解析)、Hermes Agent、WorkBuddy，均由本机真实数据实测验证；Trae/Windsurf/Devin/Paperclip/豆包 判定不做 | FR-1.4 已更新;每源结构化抽取 + 回归测试，见 `docs/source-formats-ide.md` / `docs/source-formats-cli.md` |
 | Q5 | 调度时间 | **时区保持 UTC+8,时间在设置界面可配置** | FR-8.3 升级为 P0(需重写并重载 launchd) |
 | Q6 | 文档定位 | **取代 production-delivery-plan,作为新需求基线** | 旧计划归档为历史参考 |
 | Q7 | 历史与周期报表 | **只要当天** | 非目标 N4;不做历史 UI 与周报 |

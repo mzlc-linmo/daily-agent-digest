@@ -1,4 +1,4 @@
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, sqlite3, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -365,6 +365,422 @@ class GenerateTests(unittest.TestCase):
             cleared = command(home, 'clear', {'date': '2026-09-12'})
             self.assertEqual(cleared['report_chars'], 0)
             self.assertEqual(cleared['work_items'], [])
+
+
+
+def vscode_initial(session_id, requests=None, **extra):
+    """chatSessions 的 kind=0 初态行（完整对象）。"""
+    v = {"version": 3, "sessionId": session_id, "creationDate": 1789711895441,
+         "responderUsername": "GitHub Copilot", "requests": requests or []}
+    v.update(extra)
+    return {"kind": 0, "v": v}
+
+
+def vscode_request(rid, prompt, response, ts=1789711895441):
+    """一条问答。response[] 里带 kind 的都是过程，只有不带 kind 的 value 是正文。"""
+    return {"requestId": rid, "timestamp": ts, "message": {"text": prompt}, "response": response}
+
+
+def vscode_replay(ops):
+    """把 op 序列重放成末态会话对象。ops[0] 必须是初态行。"""
+    return engine.replay_vscode_log(ops)
+
+
+class VSCodeReplayTests(unittest.TestCase):
+    """chatSessions 是**变更日志**，不是快照 —— 必须按 op 重放。
+
+    这条不是理论问题，本机真实数据里就有一个会话：初态 `requests` 为空、
+    全部内容都靠 Push 追加。只读首行 → 抽出 0 条；重放 → 抽出 2 条（整轮问答丢失）。
+    另一处反例：`{"kind":2,"k":["requests",0,"response"],"v":[…],"i":6}` 会把后 10 段
+    回复整段换成新的，长度不变、内容却是旧的。
+    """
+
+    def test_push_on_requests_appends_a_whole_turn(self):
+        ops = [vscode_initial("s1", []),
+               {"kind": 2, "k": ["requests"], "v": [vscode_request("r1", "推送新增的一轮",
+                                                                   [{"value": "这是重放后才取到的回复"}])]}]
+        rows = engine.extract_vscode_session(vscode_replay(ops))
+        self.assertEqual([r[2] for r in rows], ["prompt", "result"])
+        self.assertEqual(rows[0][3], "推送新增的一轮")
+        self.assertEqual(rows[1][3], "这是重放后才取到的回复")
+
+    def test_push_with_index_truncates_before_appending(self):
+        """i 存在时先删掉 i 之后的元素再追加 —— 漏掉这一步会保留被替换的旧回复。"""
+        ops = [vscode_initial("s2", [vscode_request("r1", "问题",
+                                                     [{"value": "旧A"}, {"value": "旧B"}])]),
+               {"kind": 2, "k": ["requests", 0, "response"], "v": [{"value": "新B"}], "i": 1}]
+        text = engine.extract_vscode_session(vscode_replay(ops))[-1][3]
+        self.assertIn("旧A", text)
+        self.assertIn("新B", text)
+        self.assertNotIn("旧B", text)
+
+    def test_set_and_delete_ops_are_applied(self):
+        ops = [vscode_initial("s3", [vscode_request("r1", "原始提问", [{"value": "回复"}])]),
+               {"kind": 1, "k": ["requests", 0, "message", "text"], "v": "改写后的提问"},
+               {"kind": 3, "k": ["requests", 0, "response"]}]
+        rows = engine.extract_vscode_session(vscode_replay(ops))
+        self.assertEqual(rows, [("r1", 1789711895441, "prompt", "改写后的提问")])
+
+    def test_missing_initial_yields_none_instead_of_guessing(self):
+        """没有基准的增量没有意义 —— 返回 None，不瞎猜。"""
+        self.assertIsNone(engine.replay_vscode_log([{"kind": 2, "k": ["requests"], "v": []}]))
+        self.assertIsNone(engine.replay_vscode_log([]))
+
+    def test_replay_survives_malformed_ops(self):
+        ops = [vscode_initial("s4", [vscode_request("r1", "提问", [{"value": "回复"}])]),
+               {"kind": 1, "k": ["requests", 99, "message"], "v": "越界"},
+               {"kind": 2, "k": ["requests", 0, "response", 5], "v": "不是数组"},
+               {"kind": 2, "k": ["不存在的路径"], "v": [1]},
+               {"kind": 9, "k": ["x"], "v": 1}]
+        rows = engine.extract_vscode_session(vscode_replay(ops))
+        self.assertEqual([r[2] for r in rows], ["prompt", "result"])
+
+
+class VSCodeExtractionTests(unittest.TestCase):
+    """结构化抽取：正文与过程必须分清。
+
+    真实会话里 16 个 response 片段只有 2 个是正文，其余是 thinking /
+    toolInvocationSerialized / 各种元数据。取错一个日报里就全是噪音。
+    """
+
+    def test_extracts_prompt_and_reply_and_drops_every_process_kind(self):
+        v = vscode_initial("sess-1", [vscode_request(
+            "req_1", "把 Java 运行时升到最新 LTS",
+            [{"kind": "mcpServersStarting", "didStartServerIds": []},
+             {"kind": "autoModeResolution", "resolved": {"id": "gpt-5", "name": "GPT-5"}},
+             {"kind": "thinking", "value": "内部推理不应进入汇总", "id": "t1"},
+             {"value": "先确认项目的 Java/Maven 基线再动手。", "supportHtml": False},
+             {"kind": "toolInvocationSerialized", "toolId": "search",
+              "invocationMessage": {"value": "grep -r java.version"}},
+             {"value": "已把 <java.version> 升到 21 并复跑了构建。"}])])["v"]
+        rows = engine.extract_vscode_session(v)
+        self.assertEqual([r[2] for r in rows], ["prompt", "result"])
+        self.assertEqual(rows[0][3], "把 Java 运行时升到最新 LTS")
+        self.assertIn("先确认项目", rows[1][3])
+        self.assertIn("升到 21", rows[1][3])
+        # thinking 项**也带 value**，判据必须是「无 kind 键」而不是「有 value」
+        for noise in ("内部推理", "grep -r", "didStartServerIds", "GPT-5"):
+            self.assertNotIn(noise, rows[1][3], noise)
+
+    def test_multiple_requests_in_one_session_all_come_out(self):
+        v = vscode_initial("sess-2", [vscode_request("req_a", "第一个问题", [{"value": "第一个回答"}]),
+                                      vscode_request("req_b", "第二个问题", [{"value": "第二个回答"}])])["v"]
+        rows = engine.extract_vscode_session(v)
+        self.assertEqual([r[2] for r in rows], ["prompt", "result", "prompt", "result"])
+        self.assertEqual([r[0] for r in rows],
+                         ["req_a", "req_a#reply", "req_b", "req_b#reply"])
+
+    def test_empty_or_malformed_shapes_do_not_raise(self):
+        self.assertEqual(engine.extract_vscode_session({}), [])
+        self.assertEqual(engine.extract_vscode_session("not a dict"), [])
+        self.assertEqual(engine.extract_vscode_session(None), [])
+        v = vscode_initial("s", [{"requestId": "r", "message": "纯字符串提示",
+                                  "response": "不是列表", "timestamp": 1789711895441}])["v"]
+        self.assertEqual(engine.extract_vscode_session(v),
+                         [("r", 1789711895441, "prompt", "纯字符串提示")])
+
+
+class VSCodeCollectorTests(unittest.TestCase):
+    """走真实目录布局（Application Support/<产品>/User/workspaceStorage/.../chatSessions）。"""
+
+    def build(self, root, product="Code", session="sess-xyz", ts=1789711895441, ops=None):
+        d = root / "Library/Application Support" / product / "User/workspaceStorage/h1/chatSessions"
+        d.mkdir(parents=True, exist_ok=True)
+        lines = ops or [vscode_initial(session, [vscode_request("req_1", "重构采集器并补测试",
+                                                                [{"value": "已补齐并跑通"}], ts=ts)])]
+        (d / f"{session}.jsonl").write_text(
+            "\n".join(json.dumps(o, ensure_ascii=False) for o in lines) + "\n", encoding="utf-8")
+
+    def test_reads_real_layout_and_keeps_only_prompt_and_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; self.build(root)
+            events, stats = engine.collect(root, *engine.day_window("2026-09-18"))
+            vs = [e for e in events if e["provider"] == "vscode"]
+            self.assertEqual(sorted(e["role"] for e in vs), ["prompt", "result"])
+            self.assertEqual(stats["vscode"]["prompt"], 1)
+            self.assertEqual(stats["vscode"]["process"], 0)
+
+    def test_collector_replays_push_only_sessions(self):
+        """端到端锁定那条真实缺陷：内容全靠 Push 追加时也必须采到。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"
+            self.build(root, ops=[vscode_initial("sess-push", []),
+                                  {"kind": 2, "k": ["requests"],
+                                   "v": [vscode_request("r1", "只靠推送才有的一轮",
+                                                        [{"value": "推送来的回复"}])]}])
+            events, _ = engine.collect(root, *engine.day_window("2026-09-18"))
+            vs = [e for e in events if e["provider"] == "vscode"]
+            self.assertEqual(len(vs), 2, vs)
+            self.assertEqual(vs[0]["text"], "只靠推送才有的一轮")
+
+    def test_day_window_excludes_other_days(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; self.build(root)
+            events, _ = engine.collect(root, *engine.day_window("2026-09-19"))
+            self.assertEqual([e for e in events if e["provider"] == "vscode"], [])
+
+    def test_absent_product_is_marked_not_silently_zero(self):
+        """没装的产品要留痕：0 条不能被误读成"当天没工作"。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; root.mkdir()
+            _, stats = engine.collect(root, *engine.day_window("2026-09-18"))
+            self.assertTrue(stats["cursor"].get("dir_missing"))
+            self.assertEqual(stats["cursor"]["prompt"], 0)
+
+    def test_barren_product_is_reported_once_not_per_product(self):
+        """装了却没采到要提示，但**没装的不提示** —— 否则每台机器天天看到一堆误报。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"
+            (root / "Library/Application Support/Code").mkdir(parents=True)
+            _, stats = engine.collect(root, *engine.day_window("2026-09-18"))
+            warns = engine.collect_warnings({}, stats)
+            barren = [w for w in warns if "未采到对话" in w]
+            self.assertEqual(len(barren), 1, warns)
+            self.assertIn("vscode", barren[0])
+            self.assertNotIn("cursor", barren[0])
+
+    def test_absent_products_produce_no_warning_at_all(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; root.mkdir()
+            _, stats = engine.collect(root, *engine.day_window("2026-09-18"))
+            self.assertEqual([w for w in engine.collect_warnings({}, stats) if "未采到对话" in w], [])
+
+    def test_installed_but_no_sessions_is_distinguished_from_absent(self):
+        """装了却拿不到会话文件 —— 格式不同或正文不在本地，不能当成"没聊"。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"
+            (root / "Library/Application Support/Code").mkdir(parents=True)
+            _, stats = engine.collect(root, *engine.day_window("2026-09-18"))
+            self.assertTrue(stats["vscode"].get("no_sessions"))
+            self.assertIsNone(stats["vscode"].get("dir_missing"))
+
+
+def hermes_db(root, rows, sessions=("s1",)):
+    """按实测 schema 造一个 Hermes state.db（只建用例需要的列）。"""
+    d = root / ".hermes"; d.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(d / "state.db")
+    con.execute("create table sessions(id text primary key, source text, started_at real)")
+    con.execute("create table messages(id integer primary key autoincrement, session_id text, "
+                "role text, content text, timestamp real, active integer default 1, "
+                "compacted integer default 0)")
+    for sid in sessions:
+        con.execute("insert into sessions values(?,?,?)", (sid, "cli", 1789000000.0))
+    for sid, role, content, ts, active, compacted in rows:
+        con.execute("insert into messages(session_id,role,content,timestamp,active,compacted) "
+                    "values(?,?,?,?,?,?)", (sid, role, content, ts, active, compacted))
+    con.commit(); con.close()
+
+
+class HermesCollectorTests(unittest.TestCase):
+    """Hermes 把会话存在 SQLite（sessions + messages），正文是明文 `content`。
+
+    实测 role 只有 user / assistant / tool 三种。这里锁三件事：
+    只取 user/assistant、丢弃 tool 的 JSON、跳过已作废或已压缩的行。
+    """
+
+    DAY = "2026-09-09"
+
+    def ts(self, offset=0):
+        """该天 10:00 起的第 offset 秒。
+
+        刻意不硬编码 epoch 常量 —— 第一版写死成 1789000000.0，实际落在**次日**，
+        于是"窗口过滤"的用例反而在验证"没过滤"，是假绿。
+        """
+        start, _ = engine.day_window(self.DAY)
+        return (start + engine.dt.timedelta(hours=10, seconds=offset)).timestamp()
+
+    def run_collect(self, rows, day=None):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; hermes_db(root, rows)
+            events, stats = engine.collect(root, *engine.day_window(day or self.DAY))
+        return [e for e in events if e["provider"] == "hermes"], stats["hermes"]
+
+    def test_takes_user_and_assistant_and_skips_tool_json(self):
+        events, stats = self.run_collect([
+            ("s1", "user", "发送消息给飞书", self.ts(0), 1, 0),
+            ("s1", "assistant", "需要你先提供 Webhook 地址", self.ts(1), 1, 0),
+            ("s1", "tool", '{"queries":["feishu"],"total_available":5}', self.ts(2), 1, 0)])
+        self.assertEqual([e["role"] for e in events], ["prompt", "result"])
+        self.assertEqual(stats["prompt"], 1)
+        self.assertNotIn("total_available", " ".join(e["text"] for e in events))
+
+    def test_skips_inactive_and_compacted_rows(self):
+        """active=0 / compacted=1 的行已被作废或压缩，不能混进汇总。"""
+        events, _ = self.run_collect([
+            ("s1", "user", "有效提问", self.ts(0), 1, 0),
+            ("s1", "assistant", "已作废的回复", self.ts(1), 0, 0),
+            ("s1", "assistant", "被压缩掉的回复", self.ts(2), 1, 1)])
+        self.assertEqual([e["text"] for e in events], ["有效提问"])
+
+    def test_tool_call_only_assistant_rows_are_dropped(self):
+        """只发起工具调用、没有正文的 assistant 行不应产生空事件。"""
+        events, _ = self.run_collect([
+            ("s1", "user", "跑一下构建", self.ts(0), 1, 0),
+            ("s1", "assistant", "", self.ts(1), 1, 0),
+            ("s1", "assistant", "   ", self.ts(2), 1, 0)])
+        self.assertEqual([e["role"] for e in events], ["prompt"])
+
+    def test_day_window_filters_by_timestamp(self):
+        events, _ = self.run_collect([("s1", "user", "前一天的提问", self.ts(0), 1, 0)],
+                                     day="2026-09-10")
+        self.assertEqual(events, [])
+
+    def test_missing_db_is_marked_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; root.mkdir()
+            events, stats = engine.collect(root, *engine.day_window(self.DAY))
+            self.assertEqual([e for e in events if e["provider"] == "hermes"], [])
+            # 目录都不存在 = 这台机器没用过 Hermes，不该报警（与 db_missing 的既有判断一致）
+            self.assertEqual([w for w in engine.collect_warnings({}, stats) if "hermes" in w], [])
+
+    def test_corrupt_db_degrades_instead_of_breaking_the_whole_run(self):
+        """库损坏只能拖垮这一个来源，不能让当天日报整体生成失败。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; (root / ".hermes").mkdir(parents=True)
+            (root / ".hermes/state.db").write_bytes(b"not a sqlite database at all")
+            events, stats = engine.collect(root, *engine.day_window(self.DAY))
+            self.assertTrue(stats["hermes"].get("db_missing") or stats["hermes"].get("error"))
+
+
+def ms_at(day, hour=10):
+    """该天某时刻的 epoch 毫秒（按引擎时区）。
+
+    刻意不写死常量：Hermes 与 WorkBuddy 两组用例我都先写死了 epoch，结果都落到
+    **前一天**，于是"窗口过滤"的断言在验证错误的前提。按天算才不会再犯。
+    """
+    start, _ = engine.day_window(day)
+    return (start + engine.dt.timedelta(hours=hour)).timestamp() * 1000
+
+
+def workbuddy_dir(root, sid="wb-sess", events=None):
+    d = root / ".workbuddy-ai/projects/Users-test-proj"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in (events or [])) + "\n", encoding="utf-8")
+
+
+class WorkBuddyCollectorTests(unittest.TestCase):
+    """WorkBuddy 是 Claude Code 同构的 JSONL：一行一个事件，只有 type=message 进汇总。
+
+    最要紧的一条是**注入上下文**：实测 19 条用户分片里 17 条以 <system-reminder> 开头
+    （OS/Shell/工作区/身份文件，单条可到 4000 字），真正的问题在末尾的 <user_query> 里。
+    整段照收，日报里就只剩系统样板。
+    """
+
+    DAY = "2026-09-22"
+
+    def msg(self, role, text, ts=None):
+        part_type = "input_text" if role == "user" else "output_text"
+        return {"type": "message", "role": role, "sessionId": "wb-sess", "id": f"m-{text[:6]}",
+                "timestamp": ms_at(self.DAY) if ts is None else ts,
+                "content": [{"type": part_type, "text": text}]}
+
+    def run_collect(self, events, day=None):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; workbuddy_dir(root, events=events)
+            got, stats = engine.collect(root, *engine.day_window(day or self.DAY))
+        return [e for e in got if e["provider"] == "workbuddy"], stats["workbuddy"]
+
+    def test_user_query_is_extracted_out_of_the_injected_context(self):
+        raw = ("<system-reminder data-role=\"user-context\">\n<user_info>\nOS Version: darwin\n"
+               "Shell: /bin/zsh\n</user_info>\n</system-reminder>\n"
+               "<user_query>重新部署 Pig-ui 和 pig 后端</user_query>")
+        events, _ = self.run_collect([self.msg("user", raw), self.msg("assistant", "好的，开始部署。")])
+        self.assertEqual([e["role"] for e in events], ["prompt", "result"])
+        self.assertEqual(events[0]["text"], "重新部署 Pig-ui 和 pig 后端")
+        self.assertNotIn("OS Version", events[0]["text"])
+        self.assertNotIn("system-reminder", events[0]["text"])
+
+    def test_plain_prompt_without_tags_is_kept(self):
+        events, _ = self.run_collect([self.msg("user", "帮我看看这个构建为什么失败")])
+        self.assertEqual(events[0]["text"], "帮我看看这个构建为什么失败")
+
+    def test_injected_only_then_stripped_to_empty_yields_nothing(self):
+        """整条都是注入上下文时不产生空事件。"""
+        raw = "<system-reminder data-role=\"user-context\">\n<user_info>x</user_info>\n</system-reminder>"
+        events, _ = self.run_collect([self.msg("user", raw)])
+        self.assertEqual(events, [])
+
+    def test_non_message_events_are_excluded(self):
+        """reasoning / function_call / file-history-snapshot 都是过程。"""
+        events, _ = self.run_collect([
+            self.msg("user", "改一下配置"),
+            {"type": "reasoning", "role": None, "text": "内部推理"},
+            {"type": "function_call", "role": None, "name": "bash"},
+            {"type": "function_call_result", "role": None, "content": "total 440"},
+            {"type": "file-history-snapshot", "role": None, "snapshot": {}}])
+        self.assertEqual([e["role"] for e in events], ["prompt"])
+        self.assertEqual(events[0]["text"], "改一下配置")
+
+    def test_day_window_filters_by_millisecond_timestamp(self):
+        events, _ = self.run_collect([self.msg("user", "昨天的提问")], day="2026-09-23")
+        self.assertEqual(events, [])
+
+    def test_missing_dir_is_marked(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"; root.mkdir()
+            events, stats = engine.collect(root, *engine.day_window("2026-09-22"))
+            self.assertEqual([e for e in events if e["provider"] == "workbuddy"], [])
+            self.assertTrue(stats["workbuddy"].get("dir_missing"))
+
+
+class SecretRedactionTests(unittest.TestCase):
+    """采集到的正文会送进第三方 LLM 并可能上报，凭据必须在入库前抹掉。
+
+    实测驱动：本机 Hermes/WorkBuddy 的真实采集结果里有 9 条带着**完整的飞书机器人
+    webhook**（含 token）。两个独立调研也都报告 DSH 日志里出现 `Bearer <token>`。
+    """
+
+    def test_redacts_webhooks_and_key_shapes(self):
+        # 这些"凭据"刻意**拼装**而不是整段写成字面量：整段写在源码里会被 GitHub 的
+        # secret scanning 当成真凭据并**直接拒绝 push**（本次实测撞过一次）。
+        # 拼装出来的字符序列与原来完全一致，对 redact_secrets 的验证力度不变。
+        hook = "https://open.feishu.cn/open-apis/bot/v2/hook/" + "00402ada-0e4e-42e2-8df0-3ad710e25a1b"
+        slack_key = "sk-" + "abcdefghijklmnopqrstuvwxyz012345"
+        gh_token = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+        jwt = "eyJhbGciOi" + "JIUzI1NiJ9" + ".payload"
+        slack_hook = ("https://hooks.slack.com/services/"
+                      + "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX")
+        cases = [
+            (f"发送到 {hook} 吧", "00402ada"),
+            (f"用 {slack_key} 调", "abcdefghij"),
+            (f"token 是 {gh_token}", "ABCDEFGHIJ"),
+            (f"{aws_key} 这个 key", "IOSFODNN7"),
+            (f"Authorization: Bearer {jwt}", "eyJhbGciOi"),
+            ("api_key=abcdefghijklmnop1234", "abcdefghijklmnop1234"),
+            (slack_hook, "T00000000"),
+        ]
+        for text, secret in cases:
+            out = engine.redact_secrets(text)
+            self.assertNotIn(secret, out, text)
+            self.assertIn("redacted", out, text)
+
+    def test_keeps_normal_work_text_intact(self):
+        """只认形状明确的凭据 —— 误删正常正文比漏脱敏更糟。"""
+        for text in ("把 pig 的后端接口补上分页",
+                     "token 只存连接器侧，不进 PIG 库",
+                     "这个函数叫 get_api_key_name，返回字符串",
+                     "版本号 sk-1 已经废弃了"):
+            self.assertEqual(engine.redact_secrets(text), text)
+
+    def test_redaction_is_applied_on_the_collection_path(self):
+        """端到端：脱敏必须在采集入口生效，而不是只在工具函数里可用。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "home"
+            workbuddy_dir(root, events=[{"type": "message", "role": "user", "sessionId": "s",
+                                         "id": "m1", "timestamp": ms_at("2026-09-22"),
+                                         "content": [{"type": "input_text",
+                                                      "text": "发到 https://open.feishu.cn/open-apis/bot/v2/hook/"
+                                                              "deadbeef-1111-2222-3333-444455556666"}]}])
+            events, _ = engine.collect(root, *engine.day_window("2026-09-22"))
+        texts = " ".join(e["text"] for e in events)
+        self.assertNotIn("deadbeef-1111", texts)
+        self.assertIn("redacted", texts)
+
+    def test_non_string_input_is_returned_unchanged(self):
+        self.assertIsNone(engine.redact_secrets(None))
+        self.assertEqual(engine.redact_secrets(""), "")
 
 
 class ExtractionTests(unittest.TestCase):

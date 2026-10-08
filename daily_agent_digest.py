@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime as dt, hashlib, json, os, sqlite3, subprocess, ssl, urllib.error, urllib.request
+import argparse, datetime as dt, hashlib, json, os, re, sqlite3, subprocess, ssl, urllib.error, urllib.request
 from pathlib import Path
 
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -328,6 +328,209 @@ def extract_generic(obj):
         if role: return role, text
     return None, None
 
+# ------------------------------------------------------------ VS Code 及其分支 --
+# VS Code 与它的各个 fork 把 AI 对话存在
+#   <Application Support>/<产品>/User/workspaceStorage/<workspace-hash>/chatSessions/<uuid>.jsonl
+# 实测 VS Code 的格式（response[] 的 kind 分布来自真实会话，不是推测）：
+#
+#   {"kind":0,"v":{...}}                  ← 初态行，自带**完整** session
+#   {"kind":1,"k":...,"v":...}            ← 增量更新
+#   {"kind":2,"v":...,"completedAt":...}  ← 结束标记
+#
+# 初态行 v.requests[] 里每条 request 是一次问答：
+#   request.message.text   → 用户提示词
+#   request.response[]     → 回复片段；**只有 kind 为空且 value 是字符串的才是正文**
+#   request.requestId      → 稳定 id        request.timestamp → 毫秒
+#
+# 变更 op 的 kind（VS Code 源码 objectMutationLog.ts 的 EntryKind，非推测）：
+#   0 = Initial 首行，完整对象   1 = Set 属性更新
+#   2 = **Push** 数组更新        3 = Delete 删除属性
+# ⚠️ kind=2 **不是结束标记**。它的语义是"截断到 i 再追加 v"，按结束标记处理会
+# 丢数据。本机实测就有反例：
+#   {"kind":2,"k":["requests"],"v":[…]}}                    新增整整一轮问答
+#   {"kind":2,"k":["requests",0,"response"],"v":[…],"i":6}   把后 10 段回复整段换掉
+# 后者长度与初态相同、**内容却是旧的** —— 只读首行会拿到过期回复且毫无征兆。
+# 所以必须按 op 顺序重放。
+VSCODE_OP_INITIAL, VSCODE_OP_SET, VSCODE_OP_PUSH, VSCODE_OP_DELETE = 0, 1, 2, 3
+VSCODE_CHAT_GLOB = 'User/workspaceStorage/*/chatSessions/*.jsonl'
+# 「没有打开文件夹」的窗口会话落在 globalStorage 下（作用域不同、格式相同）。
+# 漏掉它会让"平时就靠空窗口问 Copilot"的人一条都采不到。
+VSCODE_EMPTY_WINDOW_GLOB = 'User/globalStorage/emptyWindowChatSessions/*.jsonl'
+
+# 除正文外，这些 kind 都是过程，必须排除。列全是为了让"什么被丢掉了"可审。
+#   thinking                  内部推理        toolInvocationSerialized 工具调用
+#   mcpServersStarting        MCP 启动        autoModeResolution       模式选择
+VSCODE_PROCESS_KINDS = ('thinking', 'toolInvocationSerialized', 'mcpServersStarting',
+                        'autoModeResolution', 'progressMessage', 'command', 'errorDetails')
+
+# VS Code 及其分支。分支按同一约定处理 —— 它们都是 VS Code 的 fork，沿用同一套
+# chatSessions 机制。若某个分支实际不同，它的 stats 会是 dir_missing / no_sessions，
+# 而不是一个看起来正常的 0（后者会被误读成"当天没聊"）。处理器名与层的归属见 README。
+VSCODE_PRODUCTS = (
+    ('vscode',          'Code'),
+    ('vscode-insiders', 'Code - Insiders'),
+    ('cursor',          'Cursor'),
+    ('windsurf',        'Windsurf'),
+    ('qoder',           'Qoder'),
+    ('kimi-code',       'Kimi Code'),
+    ('codebuddy',       'CodeBuddy'),
+)
+
+def _log_path_get(state, path):
+    """按 ObjectPath 取值，任一层缺失返回 None。"""
+    cur = state
+    for key in path or []:
+        if isinstance(cur, list):
+            if not isinstance(key, int) or not 0 <= key < len(cur): return None
+            cur = cur[key]
+        elif isinstance(cur, dict):
+            if key not in cur: return None
+            cur = cur[key]
+        else:
+            return None
+    return cur
+
+def _log_path_set(state, path, value):
+    """按 ObjectPath 写值。中间层是 dict 且缺失时，按下一段类型补 list / dict。
+
+    **越界的数组写入一律忽略**（不给数组补空洞）：补空洞等于凭空造出一条消息，
+    会让"重放"这个动作本身产生原始数据里不存在的内容。dict 的中间层可以补，
+    因为 dict 没有"位置"语义，补出来的是空容器而不是伪造的条目。
+    """
+    path = list(path or [])
+    if not path: return
+    cur = state
+    for idx, key in enumerate(path[:-1]):
+        nxt = path[idx + 1]
+        if isinstance(cur, list):
+            if not isinstance(key, int) or not 0 <= key < len(cur): return
+            cur = cur[key]
+        elif isinstance(cur, dict):
+            if not isinstance(cur.get(key), (dict, list)):
+                cur[key] = [] if isinstance(nxt, int) else {}
+            cur = cur[key]
+        else:
+            return
+    last = path[-1]
+    if isinstance(cur, list):
+        if isinstance(last, int) and 0 <= last < len(cur):
+            cur[last] = value
+    elif isinstance(cur, dict):
+        cur[last] = value
+
+def replay_vscode_log(lines):
+    """把 chatSessions 的变更日志重放成最终会话对象（即末态的 ``v``）。
+
+    没有初态行（kind=0）就直接返回 None —— 缺失基准的增量没有意义，不能瞎猜。
+    """
+    state = None
+    for obj in lines:
+        if not isinstance(obj, dict): continue
+        kind = obj.get('kind')
+        if kind == VSCODE_OP_INITIAL:
+            v = obj.get('v')
+            state = v if isinstance(v, dict) else None
+            continue
+        if state is None: continue
+        k = obj.get('k')
+        if kind == VSCODE_OP_SET:
+            _log_path_set(state, k, obj.get('v'))
+        elif kind == VSCODE_OP_PUSH:
+            arr = _log_path_get(state, k)
+            if isinstance(arr, list):
+                i = obj.get('i')
+                # Push 语义：i 存在时先删掉 i 之后的所有元素，再追加
+                if isinstance(i, int) and 0 <= i <= len(arr): del arr[i:]
+                extra = obj.get('v')
+                if isinstance(extra, list): arr.extend(extra)
+        elif kind == VSCODE_OP_DELETE:
+            _log_path_set(state, k, None)
+    return state
+
+
+def vscode_reply_text(response):
+    """从 request.response[] 里取 AI 正文，排除思考与工具调用。"""
+    if not isinstance(response, list):
+        return ''
+    out = []
+    for part in response:
+        if isinstance(part, str):
+            out.append(part)          # 少数版本把正文直接写成字符串
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get('kind') is not None:
+            continue                  # 带 kind 的一律是过程
+        value = part.get('value')
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, dict):
+            out.append(str(value.get('value') or ''))
+    return ' '.join(' '.join(out).split())
+
+def extract_vscode_session(v):
+    """把**重放后**的会话对象展平成 ``[(item_id, stamp, role, text), ...]``。
+
+    入参是 :func:`replay_vscode_log` 的结果（也就是末态的 ``v``），不是文件里的原始行。
+    返回列表而不是单个 ``(role, text)``：一个会话里有多轮问答，这是它与其它
+    ``extract_*`` 的唯一区别。
+    """
+    if not isinstance(v, dict):
+        return []
+    session = str(v.get('sessionId') or '')
+    rows = []
+    for i, req in enumerate(v.get('requests') or []):
+        if not isinstance(req, dict):
+            continue
+        rid = str(req.get('requestId') or f'{session}#{i}')
+        stamp = req.get('timestamp') or v.get('creationDate')
+        message = req.get('message')
+        if isinstance(message, dict):
+            prompt = str(message.get('text') or '')
+        elif isinstance(message, str):
+            prompt = message
+        else:
+            prompt = ''
+        prompt = ' '.join(prompt.split())
+        if prompt:
+            rows.append((rid, stamp, 'prompt', prompt))
+        reply = vscode_reply_text(req.get('response'))
+        if reply:
+            rows.append((f'{rid}#reply', stamp, 'result', reply))
+    return rows
+
+# 对话正文里会夹带**真实凭据**：实测本机 WorkBuddy/Hermes 采集结果里就有完整的
+# 飞书机器人 webhook（含 token），DSH 会话日志里也有 `Bearer <token>`。
+# 这些文本要送进第三方 LLM、还可能被上报，所以必须在**进入事件之前**就地脱敏。
+#
+# 放在 collect_one 这一个入口，而不是每个采集器里各写一遍：老采集器漏掉的，
+# 新加的十几个不可能凭空补上。只认**形状明确**的凭据，避免误删正常正文
+# （例如把一句含 "token=" 的技术讨论整段抹掉，比漏脱敏更糟）。
+SECRET_PATTERNS = (
+    # 飞书/钉钉机器人 webhook：URL 末尾那段就是凭证
+    (re.compile(r'(https://open\.feishu\.cn/open-apis/bot/v2/hook/)[\w-]+'), r'\1<redacted>'),
+    (re.compile(r'(https://oapi\.dingtalk\.com/robot/send\?access_token=)[\w-]+'), r'\1<redacted>'),
+    (re.compile(r'(https://hooks\.slack\.com/services/)[\w/-]+'), r'\1<redacted>'),
+    # 带前缀的 API key / token
+    (re.compile(r'\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}'), '<redacted-key>'),
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9]{20,}'), '<redacted-token>'),
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), '<redacted-aws-key>'),
+    (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}'), '<redacted-slack-token>'),
+    # HTTP 头与赋值式：只认字段名紧跟长值的情况
+    (re.compile(r'(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]{20,}'), r'\1 <redacted>'),
+    (re.compile(r'(?i)\b(authorization|api[-_]?key|access[-_]?token|secret[-_]?key|password)\b\s*[:=]\s*["\']?([A-Za-z0-9._~+/=-]{16,})'),
+     r'\1: <redacted>'),
+)
+
+def redact_secrets(text):
+    """把高置信度的凭据形态替换掉。返回替换后的文本（原样返回非字符串入参）。"""
+    if not isinstance(text, str) or not text:
+        return text
+    for pattern, repl in SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
 def make_event(provider, session, item, stamp, kind, role, text, truncated=False):
     """role: prompt | result | deliverable | process"""
     text = ' '.join(str(text or '').split())
@@ -345,6 +548,8 @@ def new_stats():
     return {'prompt': 0, 'result': 0, 'deliverable': 0, 'process': 0, 'truncated': 0, 'chars': 0}
 
 def collect_one(stats, out, provider, session, item, stamp, kind, raw_text, role, text, include_process):
+    # 唯一入口：所有采集器的正文都在这里落地，脱敏放这里才不会有漏网的来源
+    text = redact_secrets(text)
     if role:
         stats[role] += 1
         if len(' '.join(str(text or '').split())) > MESSAGE_CHAR_MAX: stats['truncated'] += 1
@@ -419,6 +624,172 @@ def pi(root, start, end):
         read_jsonl(f, 'pi', start, end, stats, out, include)
     return dedupe(out), stats
 
+def vscode(root, start, end, app_dir, provider):
+    """采集一个 VS Code 系产品的 chatSessions。
+
+    ``app_dir`` 是 Application Support 下的产品目录名；``provider`` 是上报用的来源名。
+    两者分开是为了让「同一份解析逻辑」服务多个 fork，而上报仍能按产品区分。
+    """
+    stats = new_stats(); out = []; include = keep_process()
+    product = root / 'Library/Application Support' / app_dir
+    if not product.is_dir():
+        # 明确记录"这个产品没装"，而不是让 0 条看起来像"当天没工作"
+        stats['dir_missing'] = str(product)
+        return dedupe(out), stats
+    files = sorted(product.glob(VSCODE_CHAT_GLOB)) + sorted(product.glob(VSCODE_EMPTY_WINDOW_GLOB))
+    stats['files'] = len(files)
+    if not files:
+        # 装了却一个会话文件都没有：这**不是**"当天没聊"，而是格式不同或对话不落在本地。
+        # 区分这两者很重要 —— 前者无需处理，后者说明这个源的采集路径选错了。
+        stats['no_sessions'] = str(product)
+    for f in files:
+        try:
+            raw = f.read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        objs = []
+        for line in raw:
+            try: objs.append(json.loads(line))
+            except json.JSONDecodeError: continue
+        # 先重放再抽取：只读首行会拿到被后续 Push 覆盖掉的旧回复（见上方注释里的实测反例）
+        session = replay_vscode_log(objs)
+        if session is None:
+            stats['no_initial'] = stats.get('no_initial', 0) + 1
+            continue
+        sid = str(session.get('sessionId') or f.stem)
+        for item, stamp, role, text in extract_vscode_session(session):
+            if not in_window(stamp, start, end): continue
+            collect_one(stats, out, provider, sid, item, stamp, 'chat', '', role, text, include)
+    return dedupe(out), stats
+
+# ---------------------------------------------------------------- Hermes Agent --
+# Hermes 把会话存进 **SQLite**（不是散落的 JSONL），实测结构：
+#   sessions(id, source, display_name, model, started_at REAL 秒, message_count, …)
+#   messages(id, session_id, role, content TEXT, tool_calls, tool_name,
+#            reasoning, reasoning_content, timestamp REAL 秒, active, compacted, …)
+# 实测 role 只有 user / assistant / tool 三种（3 会话 154 条里 21/75/58）。
+# `content` 是纯文本（assistant 是 Markdown 正文，tool 是 JSON），
+# 所以**只需要按 role 过滤**，不必再解析 content 内部结构。
+HERMES_DB = '.hermes/state.db'
+HERMES_ROLE_TO_KIND = {'user': 'prompt', 'assistant': 'result'}
+
+def hermes(root, start, end):
+    """从 ~/.hermes/state.db 取用户提示词与 AI 最终回复。
+
+    `tool` 角色的 content 是工具返回的 JSON、`reasoning*` 是内部推理 —— 都是过程，
+    不进汇总。`active=0` / `compacted=1` 的行已被压缩或作废，同样跳过。
+    """
+    stats = new_stats(); out = []; include = keep_process()
+    db = root / HERMES_DB
+    if not db.exists():
+        # 只是打不开不足以判断"没用过"，先记下路径让 collect_warnings 决定要不要提示
+        stats['db_missing'] = str(db)
+        return dedupe(out), stats
+    try:
+        con = open_sqlite_readonly(db)
+    except sqlite3.Error:
+        stats['db_missing'] = str(db)
+        return dedupe(out), stats
+    try:
+        # 用 REAL 秒直接与窗口比较：in_window 对 >1e10 的值才按毫秒解释，
+        # 秒级时间戳(约 1.7e9)不会被误判。
+        lo, hi = start.timestamp(), end.timestamp()
+        rows = con.execute(
+            'select id, session_id, role, content, timestamp from messages '
+            'where timestamp >= ? and timestamp < ? and active = 1 and compacted = 0 '
+            'order by timestamp', (lo, hi))
+        for mid, sid, role, content, stamp in rows:
+            kind = HERMES_ROLE_TO_KIND.get(str(role or '').lower())
+            if not kind:
+                if include and role:
+                    collect_one(stats, out, 'hermes', str(sid), str(mid), stamp, str(role),
+                                str(content or ''), 'process', str(content or ''), include)
+                continue
+            text = ' '.join(str(content or '').split())
+            if not text:
+                continue          # 只发起工具调用、没有正文的 assistant 行
+            collect_one(stats, out, 'hermes', str(sid), str(mid), stamp, str(role), '', kind, text, include)
+    finally:
+        con.close()
+    return dedupe(out), stats
+
+
+# ------------------------------------------------------------------- WorkBuddy --
+# `~/.workbuddy-ai/projects/<编码后的 cwd>/<sessionId>.jsonl`，Claude Code 同构的 JSONL：
+# 一行一个事件，`type` 取 message / reasoning / function_call / function_call_result /
+# file-history-snapshot / ai-title。只有 `type=message` 的才进汇总。
+# 实测一条 message 的 `content` 是分片数组，role=user 用 `input_text`、assistant 用 `output_text`。
+WORKBUDDY_ROOT = '.workbuddy-ai'
+WORKBUDDY_CHAT_GLOB = 'projects/*/*.jsonl'
+WORKBUDDY_ROLE_TO_KIND = {'user': 'prompt', 'assistant': 'result'}
+WORKBUDDY_PART_TYPES = ('input_text', 'output_text')
+WORKBUDDY_USER_QUERY = re.compile(r'<user_query>(.*?)</user_query>', re.S)
+WORKBUDDY_INJECTED = re.compile(r'<system-reminder.*?</system-reminder>', re.S)
+
+def workbuddy_prompt_text(text):
+    """从用户分片里取出**真正的问题**。
+
+    实测 19 条用户分片里 17 条以 ``<system-reminder>`` 开头 —— 那是 OS/Shell/工作区/
+    身份文件的注入上下文，单条可到 4000 字；真正的问题在末尾的 ``<user_query>`` 里。
+    整段照收会让日报被系统样板淹没（"重新部署Pig-ui"这种有效信息被埋掉）。
+    另外 2 条是裸文本，去掉注入块后原样使用。
+    """
+    t = str(text or '')
+    m = WORKBUDDY_USER_QUERY.search(t)
+    if m:
+        return ' '.join(m.group(1).split())
+    return ' '.join(WORKBUDDY_INJECTED.sub(' ', t).split())
+
+def workbuddy(root, start, end):
+    """采集 WorkBuddy 的会话（JSONL，逐行事件）。"""
+    stats = new_stats(); out = []; include = keep_process()
+    base = root / WORKBUDDY_ROOT
+    if not base.is_dir():
+        stats['dir_missing'] = str(base)
+        return dedupe(out), stats
+    files = sorted(base.glob(WORKBUDDY_CHAT_GLOB))
+    stats['files'] = len(files)
+    if not files:
+        stats['no_sessions'] = str(base)
+    for f in files:
+        sid = f.stem
+        try:
+            raw = f.read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(raw):
+            if not line.strip(): continue
+            try: obj = json.loads(line)
+            except json.JSONDecodeError: continue
+            if not isinstance(obj, dict) or obj.get('type') != 'message': continue
+            role = str(obj.get('role') or '')
+            kind = WORKBUDDY_ROLE_TO_KIND.get(role)
+            if not kind:
+                continue
+            parts = []
+            for part in (obj.get('content') or []):
+                if not isinstance(part, dict): continue
+                # 只认 input_text/output_text；其它分片类型属于过程
+                if part.get('type') not in WORKBUDDY_PART_TYPES: continue
+                if kind == 'prompt':
+                    text = workbuddy_prompt_text(part.get('text'))
+                else:
+                    text = ' '.join(str(part.get('text') or '').split())
+                if text: parts.append(text)
+            text = ' '.join(parts).strip()
+            if not text: continue
+            stamp = obj.get('timestamp')
+            if not in_window(stamp, start, end): continue
+            collect_one(stats, out, 'workbuddy', str(obj.get('sessionId') or sid),
+                        str(obj.get('id') or i), stamp, 'message', '', kind, text, include)
+    return dedupe(out), stats
+
+
+def _vscode_collector(app_dir, provider):
+    """把 (app_dir, provider) 绑定成一个 collect() 能直接调的采集器。"""
+    return lambda root, start, end: vscode(root, start, end, app_dir, provider)
+
+
 # zstd 不是 macOS 自带命令。**只查 PATH 是不够的**:从 Finder / 登录项启动的 App
 # 拿不到 shell 的 PATH(launchctl getenv PATH 为空),于是 brew(/opt/homebrew/bin)与
 # anaconda(/opt/anaconda3/bin)里的 zstd 全都看不见 —— 表现为"今天没干活"。
@@ -471,10 +842,20 @@ def open_sqlite_readonly(path):
     raise sqlite3.OperationalError(f'unable to open database file: {path} ({last})')
 
 
+# 采集器注册表。新增一个数据源 = 在这里加一项 + 写一个 extract_* + 一条回归测试。
+COLLECTORS = (
+    ('codex', codex),
+    ('pi', pi),
+    ('dsh', dsh),
+    ('hermes', hermes),
+    ('workbuddy', workbuddy),
+) + tuple((name, _vscode_collector(app_dir, name)) for name, app_dir in VSCODE_PRODUCTS)
+
+
 def collect(root, start, end):
     """返回 (events, stats):events 默认只含提示词 / 最终文本 / 交付物。"""
     events = []; stats = {}
-    for name, fn in (('codex', codex), ('pi', pi), ('dsh', dsh)):
+    for name, fn in COLLECTORS:
         # 逐个隔离:某个采集器损坏(库打不开、schema 不符、时间戳溢出)时,
         # 只降级这一个来源并把原因写进 coverage,而不是让当天日报整体生成失败。
         try:
@@ -554,6 +935,11 @@ def collect_warnings(payload, collect_stats):
             db=Path(str(st['db_missing']))
             if db.parent.is_dir(): out.append(f"未找到 {name} 的数据库:{db}")
         if st.get('error'): out.append(f"采集 {name} 失败:{st['error']}")
+    # 「装了却一条没采到」值得单独提示:否则界面看起来正常,而实际这个源根本没进来。
+    # 与 db_missing 同一套判断——**没装的产品不提示**(否则每台机器天天看到 7 条误报)。
+    barren=[n for n,st in (collect_stats or {}).items() if isinstance(st,dict) and st.get('no_sessions')]
+    if barren:
+        out.append(f"以下工具已安装但未采到对话(存储格式可能不同、或对话不在本地):{'、'.join(sorted(barren))}")
     # 去重但保序(同一个 zstd 提示可能来自多个采集器)
     seen=set(); uniq=[]
     for w in out:
